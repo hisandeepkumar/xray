@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+  <title>DICOM to JPEG Converter | X-Ray Image Converter</title>
+  <!-- DICOM parsing library -->
+  <script src="https://unpkg.com/dicom-parser@1.2.11/dist/dicomParser.min.js"></script>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    }
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      padding: 24px;
+      color: #f0f0f0;
+      background: linear-gradient(rgba(0, 0, 0, 0.4), rgba(0, 0, 0, 0.4)), url('images/background.jpg');
+      background-size: cover;
+      background-position: center;
+      background-attachment: fixed;
+    }
+
+    .container {
+      width: 100%;
+      max-width: 780px;
+      background: rgba(255, 255, 255, 0.2);
+      backdrop-filter: blur(16px);
+      border-radius: 20px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2), 0 4px 16px rgba(255, 255, 255, 0.1), inset 0 1px 2px rgba(255, 255, 255, 0.3);
+      overflow: hidden;
+      border: 1px solid rgba(255, 255, 255, 0.3);
+      transition: transform 0.3s ease;
+      padding: 32px;
+    }
+
+    .header {
+      padding: 24px;
+      text-align: center;
+      background: rgba(255, 255, 255, 0.05);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.3);
+      margin-bottom: 24px;
+    }
+
+    .header h1 {
+      font-size: 28px;
+      font-weight: 600;
+      color: #f0f0f0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+    }
+
+    .header h1 i {
+      color: #5b86e5;
+      font-size: 28px;
+    }
+
+    .upload-area {
+      border: 2px dashed rgba(255, 255, 255, 0.4);
+      border-radius: 12px;
+      padding: 40px 20px;
+      text-align: center;
+      background: rgba(255, 255, 255, 0.2);
+      cursor: pointer;
+      transition: all 0.3s ease;
+      position: relative;
+      box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2), inset 0 1px 2px rgba(255, 255, 255, 0.3);
+      margin-bottom: 24px;
+    }
+
+    .upload-area:hover, .upload-area.active {
+      background: rgba(255, 255, 255, 0.25);
+      border-color: #5b86e5;
+      box-shadow: 0 8px 24px rgba(91, 134, 229, 0.3), inset 0 2px 4px rgba(255, 255, 255, 0.3);
+    }
+
+    .upload-area i {
+      font-size: 40px;
+      color: #5b86e5;
+      margin-bottom: 15px;
+      transition: all 0.3s;
+    }
+
+    .upload-area:hover i, .upload-area.active i {
+      transform: scale(1.1);
+    }
+
+    .upload-area h3 {
+      color: #f0f0f0;
+      margin-bottom: 10px;
+      font-size: 1.6rem;
+      font-weight: 500;
+    }
+
+    .upload-area p {
+      color: rgba(255, 255, 255, 0.8);
+      font-size: 1rem;
+    }
+
+    .upload-area input[type="file"] {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      opacity: 0;
+      cursor: pointer;
+    }
+
+    .file-info {
+      color: white;
+      font-size: 1rem;
+      margin: 10px 0;
+      text-align: center;
+      word-break: break-all;
+      padding: 0 10px;
+      display: none;
+      font-weight: bold;
+      background: linear-gradient(90deg, rgba(255,255,255,0) 0%, rgba(255,255,255,0.9) 50%, rgba(255,255,255,0) 100%);
+      background-size: 200% 100%;
+      -webkit-background-clip: text;
+      background-clip: text;
+      -webkit-text-fill-color: transparent;
+      animation: shine 2.5s linear infinite;
+    }
+
+    @keyframes shine {
+      from { background-position: 200% 0; }
+      to { background-position: -200% 0; }
+    }
+
+    .preview-section {
+      margin: 20px 0;
+      background: rgba(0, 0, 0, 0.25);
+      border-radius: 16px;
+      padding: 16px;
+      text-align: center;
+      backdrop-filter: blur(4px);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      display: none;
+    }
+
+    .preview-title {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      font-weight: 500;
+      margin-bottom: 15px;
+      font-size: 1.1rem;
+      color: #e0e0ff;
+    }
+
+    .preview-title i {
+      color: #5b86e5;
+    }
+
+    .preview-canvas-container {
+      background: #0a0c10;
+      border-radius: 12px;
+      display: inline-block;
+      max-width: 100%;
+      box-shadow: 0 8px 20px rgba(0,0,0,0.4);
+    }
+
+    canvas#dicomCanvas {
+      max-width: 100%;
+      height: auto;
+      border-radius: 10px;
+      display: block;
+      margin: 0 auto;
+      cursor: pointer;
+    }
+
+    .dicom-metadata {
+      margin-top: 12px;
+      font-size: 12px;
+      background: rgba(0,0,0,0.4);
+      border-radius: 12px;
+      padding: 10px 12px;
+      text-align: left;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      justify-content: center;
+    }
+
+    .meta-badge {
+      background: rgba(91,134,229,0.3);
+      border-radius: 30px;
+      padding: 4px 12px;
+      font-size: 0.75rem;
+      backdrop-filter: blur(4px);
+    }
+
+    .input-container {
+      margin: 20px 0 10px;
+      text-align: center;
+    }
+
+    .input-container label {
+      color: #f0f0f0;
+      font-size: 1.1rem;
+      font-weight: 500;
+      display: block;
+      margin-bottom: 8px;
+    }
+
+    .input-container input[type="text"] {
+      width: 100%;
+      max-width: 340px;
+      padding: 12px 16px;
+      border: 1px solid rgba(255, 255, 255, 0.4);
+      border-radius: 40px;
+      background: rgba(255, 255, 255, 0.1);
+      color: #f0f0f0;
+      font-size: 0.95rem;
+      outline: none;
+      transition: all 0.3s ease;
+      text-align: center;
+    }
+
+    .input-container input[type="text"]:focus {
+      border-color: #5b86e5;
+      box-shadow: 0 0 12px rgba(91, 134, 229, 0.5);
+    }
+
+    .progress-container {
+      width: 100%;
+      height: 6px;
+      background: rgba(255, 255, 255, 0.1);
+      border-radius: 4px;
+      overflow: hidden;
+      margin-top: 20px;
+      display: none;
+    }
+
+    .progress-bar {
+      width: 0;
+      height: 100%;
+      background: #5b86e5;
+      transition: width 0.3s ease;
+    }
+
+    .btn {
+      background: rgba(255, 255, 255, 0.2);
+      backdrop-filter: blur(12px);
+      color: #f0f0f0;
+      border: 1px solid rgba(255, 255, 255, 0.4);
+      padding: 14px 28px;
+      border-radius: 40px;
+      width: 280px;
+      height: 56px;
+      font-size: 16px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.3s ease;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      box-shadow: 0 8px 20px rgba(91, 134, 229, 0.3), inset 0 1px 2px rgba(255,255,255,0.3);
+      margin: 12px auto 0;
+      white-space: nowrap;
+    }
+
+    .btn::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: -150%;
+      width: 150%;
+      height: 100%;
+      background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.25), transparent);
+      transition: all 0.6s ease;
+    }
+
+    .btn {
+      position: relative;
+      overflow: hidden;
+    }
+
+    .btn:hover::before {
+      left: 150%;
+    }
+
+    .btn:hover {
+      background: rgba(255, 255, 255, 0.3);
+      transform: translateY(-2px);
+      box-shadow: 0 12px 28px rgba(91, 134, 229, 0.5);
+    }
+
+    .btn:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+      transform: none;
+      box-shadow: none;
+    }
+
+    .btn:disabled::before {
+      display: none;
+    }
+
+    .action-buttons {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      justify-content: center;
+      margin: 20px 0 0;
+    }
+
+    .footer {
+      margin-top: 30px;
+      text-align: center;
+      color: rgba(255, 255, 255, 0.7);
+      font-size: 14px;
+      padding: 15px;
+      border-top: 1px solid rgba(255, 255, 255, 0.2);
+    }
+
+    .footer-text {
+      display: inline-block;
+      position: relative;
+    }
+    
+    .footer-text::after {
+      content: '';
+      position: absolute;
+      width: 100%;
+      height: 2px;
+      bottom: -5px;
+      left: 0;
+      background: linear-gradient(90deg, #5b86e5, #36d1dc);
+      transform: scaleX(0);
+      transform-origin: bottom right;
+      transition: transform 0.5s ease;
+      animation: continuousLine 3s infinite;
+    }
+    
+    @keyframes continuousLine {
+      0% { transform: scaleX(0); transform-origin: bottom left; }
+      50% { transform: scaleX(1); transform-origin: bottom left; }
+      51% { transform: scaleX(1); transform-origin: bottom right; }
+      100% { transform: scaleX(0); transform-origin: bottom right; }
+    }
+
+    .error-msg {
+      background: rgba(220, 53, 69, 0.7);
+      border-radius: 30px;
+      padding: 8px 16px;
+      font-size: 0.85rem;
+      margin-top: 12px;
+      text-align: center;
+    }
+
+    @media (max-width: 680px) {
+      .container { padding: 20px; }
+      .btn { width: 220px; height: 50px; font-size: 14px; }
+      .header h1 { font-size: 22px; }
+    }
+  </style>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1><i class="fas fa-x-ray"></i> DICOM → JPEG Converter</h1>
+    <p style="margin-top: 8px; font-size: 0.85rem;">Upload DICOM (X-ray / medical image) → Instant normal image preview & download</p>
+  </div>
+
+  <div class="upload-area" id="uploadArea">
+    <i class="fas fa-cloud-upload-alt"></i>
+    <h3>Upload DICOM File</h3>
+    <p>Click or drag & drop .dcm / .dic file</p>
+    <input type="file" id="dicomUpload" accept=".dcm,.dic,application/dicom" hidden>
+  </div>
+  <p class="file-info" id="fileInfo"></p>
+
+  <!-- Preview section (normal image) -->
+  <div class="preview-section" id="previewSection">
+    <div class="preview-title">
+      <i class="fas fa-image"></i> <span>Normal JPEG Preview</span>
+    </div>
+    <div class="preview-canvas-container">
+      <canvas id="dicomCanvas" style="width:100%; height:auto; max-height: 420px;"></canvas>
+    </div>
+    <div id="dicomMetaInfo" class="dicom-metadata"></div>
+  </div>
+
+  <div class="input-container">
+    <label for="customJpegName"><i class="fas fa-file-signature"></i> Custom Filename (optional)</label>
+    <input type="text" id="customJpegName" placeholder="e.g., xray_chest_result" autocomplete="off">
+    <p style="font-size: 0.75rem; margin-top: 6px;">Leave empty → auto-generated name (DICOM_YYMMDD_HHMMSS)</p>
+  </div>
+
+  <div class="progress-container" id="progressContainer">
+    <div class="progress-bar" id="progressBar"></div>
+  </div>
+
+  <div class="action-buttons">
+    <button class="btn" id="downloadJpegBtn" disabled>
+      <i class="fas fa-download"></i> <span>Save as JPEG</span>
+    </button>
+  </div>
+
+  <div class="footer">
+    <div class="footer-text">Secure • Client-side • DICOM to JPEG | Made with <span style="color: #ff4d4d;">❤️</span> by <a href="https://www.instagram.com/sandeep_yadav_._._" target="_blank" style="color: #5b86e5; text-decoration: none;">Sandeep</a></div>
+  </div>
+</div>
+
+<!-- Floating Back Button (same style) -->
+<button type="button" title="Back" aria-label="Go back"
+  onclick="(function(){ if(window.history.length>1){ history.back(); } else if(document.referrer){ location.href = document.referrer; } else { location.href = '/'; } })();"
+  onkeydown="if(event.key==='Enter' || event.code==='Space'){ event.preventDefault(); (function(){ if(window.history.length>1){ history.back(); } else if(document.referrer){ location.href = document.referrer; } else { location.href = '/'; } })(); }"
+  onmouseenter="this.style.transform='translateY(-2px) scale(1.02)'; this.style.boxShadow='0 6px 18px rgba(0,0,0,0.25)';"
+  onmouseleave="this.style.transform='translateY(0) scale(1)'; this.style.boxShadow='0 4px 12px rgba(0,0,0,0.18)';"
+  style="position:fixed; top:14px; left:14px; z-index:2147483647; width:52px; height:52px; padding:0; border-radius:50%; border:none; background:linear-gradient(180deg,#ffffff,#f2f2f2); box-shadow:0 4px 12px rgba(0,0,0,0.18); display:flex; align-items:center; justify-content:center; cursor:pointer; transition:transform .12s ease, box-shadow .12s ease; backdrop-filter:blur(6px); opacity:0.98;">
+  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+    <path d="M15 18l-6-6 6-6" stroke="#111" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"></path>
+  </svg>
+</button>
+
+<script>
+  (function() {
+    // DOM elements
+    const uploadArea = document.getElementById('uploadArea');
+    const fileInput = document.getElementById('dicomUpload');
+    const fileInfoSpan = document.getElementById('fileInfo');
+    const previewSection = document.getElementById('previewSection');
+    const canvas = document.getElementById('dicomCanvas');
+    const ctx = canvas.getContext('2d');
+    const downloadBtn = document.getElementById('downloadJpegBtn');
+    const customFilenameInput = document.getElementById('customJpegName');
+    const progressContainer = document.getElementById('progressContainer');
+    const progressBar = document.getElementById('progressBar');
+    const metaContainer = document.getElementById('dicomMetaInfo');
+
+    let currentImageBlob = null;     // store rendered image data for download
+    let currentDecodedFileInfo = null;
+    let vibrationInterval = null;
+
+    // Helper: format file size
+    function formatFileSize(bytes) {
+      if (bytes < 1024) return bytes + ' B';
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(2) + ' KB';
+      return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+    }
+
+    // Vibration for fun & effect (matches shine)
+    function startVibration() {
+      if ('vibrate' in navigator) {
+        if (vibrationInterval) clearInterval(vibrationInterval);
+        vibrationInterval = setInterval(() => navigator.vibrate(40), 2000);
+      }
+    }
+    function stopVibration() {
+      if (vibrationInterval) { clearInterval(vibrationInterval); vibrationInterval = null; }
+      if ('vibrate' in navigator) navigator.vibrate(0);
+    }
+
+    function updateProgress(percent) {
+      progressContainer.style.display = 'block';
+      progressBar.style.width = `${percent}%`;
+    }
+
+    function resetUIOnError() {
+      progressContainer.style.display = 'none';
+      progressBar.style.width = '0%';
+      previewSection.style.display = 'none';
+      downloadBtn.disabled = true;
+      currentImageBlob = null;
+      stopVibration();
+    }
+
+    // Auto generate filename with timestamp
+    function generateJpegFilename(originalFileName = 'dicom') {
+      const now = new Date();
+      const day = String(now.getDate()).padStart(2, '0');
+      const months = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+      const month = months[now.getMonth()];
+      const year = now.getFullYear();
+      let hours = now.getHours();
+      const minutes = String(now.getMinutes()).padStart(2, '0');
+      const ampm = hours >= 12 ? 'PM' : 'AM';
+      hours = hours % 12 || 12;
+      const hoursStr = String(hours).padStart(2, '0');
+      let base = originalFileName.replace(/\.dcm$/i, '').replace(/\.dic$/i, '').substring(0, 30);
+      if (!base || base === 'dicom') base = 'converted_image';
+      return `${base}_${day}_${month}_${year}_${hoursStr}_${minutes}${ampm}.jpg`;
+    }
+
+    // Render DICOM pixel data to canvas and provide JPEG blob
+    async function renderDICOMtoImage(dicomArrayBuffer, fileName) {
+      updateProgress(10);
+      let dataset;
+      try {
+        dataset = dicomParser.parseDicom(dicomArrayBuffer);
+        updateProgress(35);
+      } catch (e) {
+        throw new Error(`Invalid DICOM structure: ${e.message}`);
+      }
+
+      // extract required tags
+      const rows = dataset.uint16('x00280010');
+      const cols = dataset.uint16('x00280011');
+      if (!rows || !cols) throw new Error('Missing image dimensions (rows/columns)');
+      
+      const bitsAllocated = dataset.uint16('x00280100') || 16;
+      const pixelRepresentation = dataset.uint16('x00280103') || 0; // 0=unsigned,1=signed
+      const photometric = dataset.string('x00280004') || 'MONOCHROME2';
+      const samplesPerPixel = dataset.uint16('x00280002') || 1;
+      if (samplesPerPixel !== 1) throw new Error('Only grayscale DICOM supported (samples per pixel = 1)');
+
+      // Rescale Slope/Intercept (Modality LUT)
+      let rescaleSlope = dataset.floatString('x00281053');
+      let rescaleIntercept = dataset.floatString('x00281052');
+      if (isNaN(rescaleSlope)) rescaleSlope = 1.0;
+      if (isNaN(rescaleIntercept)) rescaleIntercept = 0.0;
+
+      // get pixel data element (7FE0,0010)
+      const pixelDataElement = dataset.elements.x7fe00010;
+      if (!pixelDataElement) throw new Error('No Pixel Data (7FE0,0010) found in DICOM');
+      
+      const pixelDataOffset = pixelDataElement.dataOffset;
+      const pixelDataLength = pixelDataElement.length;
+      const pixelRawBytes = new Uint8Array(dataset.byteArray.buffer, pixelDataOffset, pixelDataLength);
+      
+      const expectedPixelCount = rows * cols;
+      let pixelValues = [];
+      const bytesPerPixel = bitsAllocated / 8;
+      const expectedBytes = expectedPixelCount * bytesPerPixel;
+      if (pixelDataLength < expectedBytes) throw new Error(`Pixel data incomplete: expected ${expectedBytes} bytes, got ${pixelDataLength}`);
+
+      // create appropriate typed array
+      let rawPixels;
+      if (bitsAllocated === 16) {
+        if (pixelRepresentation === 0) {
+          rawPixels = new Uint16Array(pixelRawBytes.buffer, pixelRawBytes.byteOffset, expectedPixelCount);
+        } else {
+          rawPixels = new Int16Array(pixelRawBytes.buffer, pixelRawBytes.byteOffset, expectedPixelCount);
+        }
+      } else if (bitsAllocated === 8) {
+        rawPixels = new Uint8Array(pixelRawBytes.buffer, pixelRawBytes.byteOffset, expectedPixelCount);
+      } else {
+        throw new Error(`Unsupported bits allocated: ${bitsAllocated} (only 8/16 supported)`);
+      }
+      
+      updateProgress(55);
+      
+      // Apply rescale slope/intercept & convert to floating for contrast stretch
+      const floatVals = new Float32Array(expectedPixelCount);
+      for (let i = 0; i < expectedPixelCount; i++) {
+        let val = rawPixels[i];
+        if (pixelRepresentation === 1 && bitsAllocated === 16) val = val; // Int16 already signed
+        floatVals[i] = val * rescaleSlope + rescaleIntercept;
+      }
+      
+      // Compute min/max for contrast stretch (full dynamic range)
+      let minVal = Infinity, maxVal = -Infinity;
+      for (let i = 0; i < expectedPixelCount; i++) {
+        let v = floatVals[i];
+        if (v < minVal) minVal = v;
+        if (v > maxVal) maxVal = v;
+      }
+      if (minVal === maxVal) { minVal = 0; maxVal = 1; }
+      
+      const range = maxVal - minVal;
+      const imageData = ctx.createImageData(cols, rows);
+      canvas.width = cols;
+      canvas.height = rows;
+      
+      // map each pixel to grayscale 0-255
+      for (let i = 0; i < expectedPixelCount; i++) {
+        let norm = (floatVals[i] - minVal) / range;
+        norm = Math.min(1.0, Math.max(0.0, norm));
+        let gray = Math.floor(norm * 255);
+        // MONOCHROME1: invert (white/black reversal)
+        if (photometric === 'MONOCHROME1') gray = 255 - gray;
+        const idx = i * 4;
+        imageData.data[idx] = gray;     // R
+        imageData.data[idx+1] = gray;   // G
+        imageData.data[idx+2] = gray;   // B
+        imageData.data[idx+3] = 255;    // Alpha
+      }
+      
+      updateProgress(80);
+      ctx.putImageData(imageData, 0, 0);
+      
+      // Extract metadata for display
+      let patientName = dataset.string('x00100010') || 'N/A';
+      let studyDate = dataset.string('x00080020') || 'N/A';
+      let modality = dataset.string('x00080060') || 'OT';
+      metaContainer.innerHTML = `
+        <span class="meta-badge"><i class="fas fa-user"></i> ${patientName.slice(0, 30)}</span>
+        <span class="meta-badge"><i class="fas fa-calendar-alt"></i> ${studyDate}</span>
+        <span class="meta-badge"><i class="fas fa-microscope"></i> ${modality}</span>
+        <span class="meta-badge"><i class="fas fa-arrows-alt"></i> ${cols} x ${rows}</span>
+      `;
+      
+      // convert canvas to JPEG blob for download
+      return new Promise((resolve) => {
+        canvas.toBlob((blob) => {
+          updateProgress(98);
+          resolve(blob);
+        }, 'image/jpeg', 0.92);
+      });
+    }
+
+    // main handler: upload DICOM -> convert to JPEG and show preview
+    async function handleDicomFile(file) {
+      if (!file || (!file.type.includes('dicom') && !file.name.match(/\.(dcm|dic)$/i))) {
+        alert('Please select a valid DICOM file (.dcm or .dic)');
+        return false;
+      }
+      stopVibration();
+      resetUIOnError();
+      fileInfoSpan.style.display = 'block';
+      fileInfoSpan.textContent = `${file.name} (${formatFileSize(file.size)}) - decoding...`;
+      downloadBtn.disabled = true;
+      previewSection.style.display = 'none';
+      updateProgress(0);
+      startVibration(); // start vibe during processing
+      
+      try {
+        const arrayBuffer = await file.arrayBuffer();
+        updateProgress(15);
+        const jpegBlob = await renderDICOMtoImage(arrayBuffer, file.name);
+        if (!jpegBlob) throw new Error('Failed to generate JPEG');
+        currentImageBlob = jpegBlob;
+        previewSection.style.display = 'block';
+        fileInfoSpan.innerHTML = `<i class="fas fa-check-circle"></i> ${file.name} — ✓ Converted to JPEG (ready)`;
+        downloadBtn.disabled = false;
+        updateProgress(100);
+        setTimeout(() => { progressContainer.style.display = 'none'; progressBar.style.width = '0%'; }, 800);
+        if ('vibrate' in navigator) navigator.vibrate(100);
+        
+        // Vibrate for completion
+        return true;
+      } catch (err) {
+        console.error(err);
+        let errorMsg = err.message || 'Unknown conversion error';
+        fileInfoSpan.innerHTML = `<i class="fas fa-exclamation-triangle"></i> Error: ${errorMsg}`;
+        previewSection.style.display = 'none';
+        downloadBtn.disabled = true;
+        currentImageBlob = null;
+        updateProgress(0);
+        progressContainer.style.display = 'none';
+        stopVibration();
+        return false;
+      }
+    }
+    
+    // Download as JPEG using custom or auto filename
+    function downloadJPEG() {
+      if (!currentImageBlob) {
+        alert('No converted image. Please upload a DICOM file first.');
+        return;
+      }
+      let customName = customFilenameInput.value.trim();
+      let finalName;
+      if (customName) {
+        finalName = customName.endsWith('.jpg') || customName.endsWith('.jpeg') ? customName : customName + '.jpg';
+      } else {
+        finalName = generateJpegFilename(currentDecodedFileInfo?.name || 'dicom_image');
+      }
+      const url = URL.createObjectURL(currentImageBlob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = finalName;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      if ('vibrate' in navigator) navigator.vibrate(80);
+    }
+    
+    // ---- UI Event wiring ----
+    function triggerFileSelect() { fileInput.click(); }
+    uploadArea.addEventListener('click', triggerFileSelect);
+    fileInput.addEventListener('change', (e) => {
+      if (e.target.files && e.target.files[0]) {
+        currentDecodedFileInfo = e.target.files[0];
+        handleDicomFile(e.target.files[0]);
+        fileInput.value = ''; // allow re-upload same file
+      }
+    });
+    
+    // Drag and drop events
+    ['dragenter', 'dragover'].forEach(ev => {
+      uploadArea.addEventListener(ev, (e) => {
+        e.preventDefault();
+        uploadArea.classList.add('active');
+      });
+    });
+    ['dragleave', 'drop'].forEach(ev => {
+      uploadArea.addEventListener(ev, (e) => {
+        e.preventDefault();
+        uploadArea.classList.remove('active');
+        if (ev.type === 'drop' && e.dataTransfer.files.length) {
+          const file = e.dataTransfer.files[0];
+          if (file.name.match(/\.(dcm|dic)$/i) || file.type.includes('dicom')) {
+            currentDecodedFileInfo = file;
+            handleDicomFile(file);
+          } else {
+            alert('Please drop a valid DICOM file (.dcm or .dic)');
+          }
+        }
+      });
+    });
+    
+    downloadBtn.addEventListener('click', downloadJPEG);
+    
+    // initial: vibration starts only when user hovers? but same as original logic but we start after file select; cancel on errors
+    // Also keep consistent: vibration only during processing
+    // Extra reset on customname input change effect fine
+  })();
+</script>
+</body>
+</html>

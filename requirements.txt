@@ -1,0 +1,6 @@
+pydicom
+Pillow
+numpy
+requests
+img2pdf
+pyinstaller

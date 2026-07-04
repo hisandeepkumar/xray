@@ -8,12 +8,14 @@ echo Creating a virtual environment...
 python -m venv venv
 call venv\Scripts\activate.bat
 
-REM 2. Upgrade pip and install dependencies
+REM 2. Upgrade pip and install dependencies (including explicit)
 echo Installing dependencies...
 pip install --upgrade pip
 pip install -r requirements.txt
+REM Ensure pylibjpeg and its plugin are installed (sometimes requirements misses)
+pip install pylibjpeg pylibjpeg-libjpeg --upgrade
 
-REM 3. Build with PyInstaller – extra options to handle all required packages
+REM 3. Build with PyInstaller – include all necessary packages
 echo Building .exe with PyInstaller...
 pyinstaller --onefile --windowed ^
     --hidden-import numpy ^

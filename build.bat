@@ -8,14 +8,12 @@ echo Creating a virtual environment...
 python -m venv venv
 call venv\Scripts\activate.bat
 
-REM 2. Upgrade pip and install dependencies (including explicit)
+REM 2. Upgrade pip and install dependencies
 echo Installing dependencies...
 pip install --upgrade pip
 pip install -r requirements.txt
-REM Ensure pylibjpeg and its plugin are installed (sometimes requirements misses)
-pip install pylibjpeg pylibjpeg-libjpeg --upgrade
 
-REM 3. Build with PyInstaller – include all necessary packages
+REM 3. Build with PyInstaller – सभी packages को पूरी तरह collect करें
 echo Building .exe with PyInstaller...
 pyinstaller --onefile --windowed ^
     --hidden-import numpy ^
@@ -27,6 +25,7 @@ pyinstaller --onefile --windowed ^
     --collect-all pydicom ^
     --collect-all pylibjpeg ^
     --collect-all pylibjpeg_libjpeg ^
+    --collect-all img2pdf ^
     --name DICOMtoTelegram ^
     main.py
 

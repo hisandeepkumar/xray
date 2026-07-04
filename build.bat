@@ -13,14 +13,18 @@ echo Installing dependencies...
 pip install --upgrade pip
 pip install -r requirements.txt
 
-REM 3. Build with PyInstaller – extra options to handle NumPy
+REM 3. Build with PyInstaller – extra options to handle all required packages
 echo Building .exe with PyInstaller...
 pyinstaller --onefile --windowed ^
     --hidden-import numpy ^
     --hidden-import numpy._core ^
     --hidden-import numpy._core.multiarray ^
+    --hidden-import pylibjpeg ^
+    --hidden-import pylibjpeg_libjpeg ^
     --collect-all numpy ^
     --collect-all pydicom ^
+    --collect-all pylibjpeg ^
+    --collect-all pylibjpeg_libjpeg ^
     --name DICOMtoTelegram ^
     main.py
 

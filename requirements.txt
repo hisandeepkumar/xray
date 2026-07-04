@@ -4,3 +4,5 @@ numpy==1.23.5
 requests
 img2pdf
 pyinstaller
+pylibjpeg
+pylibjpeg-libjpeg

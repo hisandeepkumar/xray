@@ -1,6 +1,6 @@
 pydicom
 Pillow
-numpy
+numpy==1.23.5
 requests
 img2pdf
 pyinstaller

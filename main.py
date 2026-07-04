@@ -10,8 +10,11 @@ import img2pdf
 import logging
 
 # ---------- Force JPEG Lossless support ----------
-import pylibjpeg
-import pylibjpeg_libjpeg   # यह डिकोडर रजिस्टर करता है
+try:
+    import pylibjpeg
+    import pylibjpeg_libjpeg   # यह डिकोडर रजिस्टर करता है
+except ImportError:
+    logging.warning("pylibjpeg or pylibjpeg_libjpeg not found, JPEG Lossless may fail")
 
 # ---------- Telegram Configuration ----------
 TELEGRAM_BOT_TOKEN = '7941135502:AAHz-KGvAAoZEhPVgfVKw3zFbkaB0_Pi5rM'

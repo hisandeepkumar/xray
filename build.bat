@@ -1,27 +1,35 @@
 @echo off
 echo =================================================
-echo Building DICOM to Telegram executable...
+echo Building DICOM to Telegram executable
 echo =================================================
-echo.
-echo Installing required packages...
+
+REM 1. Create and activate a virtual environment
+echo Creating a virtual environment...
+python -m venv venv
+call venv\Scripts\activate.bat
+
+REM 2. Upgrade pip and install dependencies
+echo Installing dependencies...
+pip install --upgrade pip
 pip install -r requirements.txt
-if errorlevel 1 (
-    echo Failed to install dependencies. Check your internet or pip.
-    pause
-    exit /b 1
-)
-echo.
-echo Creating standalone .exe (this may take a few minutes)...
-pyinstaller --onefile --windowed --name DICOMtoTelegram main.py
-if errorlevel 1 (
-    echo PyInstaller build failed.
-    pause
-    exit /b 1
-)
+
+REM 3. Build with PyInstaller – extra options to handle NumPy
+echo Building .exe with PyInstaller...
+pyinstaller --onefile --windowed ^
+    --hidden-import numpy ^
+    --hidden-import numpy._core ^
+    --hidden-import numpy._core.multiarray ^
+    --collect-all numpy ^
+    --collect-all pydicom ^
+    --name DICOMtoTelegram ^
+    main.py
+
+REM 4. Deactivate venv
+call venv\Scripts\deactivate.bat
+
 echo.
 echo =================================================
-echo Build successful!
-echo The executable is located in the "dist" folder:
-echo   dist\DICOMtoTelegram.exe
+echo Build completed!
+echo Executable: dist\DICOMtoTelegram.exe
 echo =================================================
 pause

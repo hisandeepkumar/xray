@@ -9,6 +9,10 @@ import tempfile
 import img2pdf
 import logging
 
+# ---------- Force JPEG Lossless support ----------
+import pylibjpeg
+import pylibjpeg_libjpeg   # यह डिकोडर रजिस्टर करता है
+
 # ---------- Telegram Configuration ----------
 TELEGRAM_BOT_TOKEN = '7941135502:AAHz-KGvAAoZEhPVgfVKw3zFbkaB0_Pi5rM'
 TELEGRAM_CHAT_IDS = ['878604830', '679625583']   # list of chat IDs

@@ -1,8 +1,4 @@
 pydicom
-Pillow
-numpy==1.23.5
-requests
-img2pdf
+pillow
+reportlab
 pyinstaller
-pylibjpeg
-pylibjpeg-libjpeg

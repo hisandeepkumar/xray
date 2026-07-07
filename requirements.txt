@@ -2,7 +2,6 @@ pydicom==2.4.4
 numpy==1.26.4
 pillow
 reportlab
-pyinstaller
 pylibjpeg
 pylibjpeg-libjpeg
 pylibjpeg-openjpeg

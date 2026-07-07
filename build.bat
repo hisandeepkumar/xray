@@ -1,64 +1,74 @@
 @echo off
-title DICOM to PDF Converter - Setup & Build
+title DICOM to PDF - Setup & Build
+color 0A
+cd /d "%~dp0"
 
 echo =============================================
-echo  Checking for Python...
+echo  STEP 1: Checking for Python...
 echo =============================================
 
+:: Check if python is available
 python --version >nul 2>&1
 if errorlevel 1 (
-    echo Python not found. Installing Python...
-    echo Downloading Python 3.10.11 (64-bit)...
-    powershell -Command "Invoke-WebRequest -Uri https://www.python.org/ftp/python/3.10.11/python-3.10.11-amd64.exe -OutFile python_installer.exe"
-    if exist python_installer.exe (
-        echo Installing Python silently (this may take a few minutes)...
-        start /wait python_installer.exe /quiet InstallAllUsers=1 PrependPath=1 Include_test=0
-        del python_installer.exe
-        echo Python installed successfully.
-    ) else (
-        echo Failed to download Python installer.
-        echo Please install Python manually from python.org (add to PATH).
+    echo Python not found. Trying python launcher (py)...
+    py -3 --version >nul 2>&1
+    if errorlevel 1 (
+        echo.
+        echo [ERROR] Python is NOT installed on this system.
+        echo Please install Python from python.org (Make sure to check "Add to PATH").
+        echo.
         pause
         exit /b
+    ) else (
+        set PYTHON_CMD=py -3
     )
 ) else (
-    echo Python is already installed.
+    set PYTHON_CMD=python
 )
 
-echo =============================================
-echo  Checking pip...
-echo =============================================
-pip --version >nul 2>&1
-if errorlevel 1 (
-    echo pip not found, installing...
-    python -m ensurepip --upgrade
-)
+echo Using command: %PYTHON_CMD%
+%PYTHON_CMD% --version
+echo.
+pause
 
 echo =============================================
-echo  Installing required packages...
+echo  STEP 2: Installing Required Libraries...
 echo =============================================
-pip install pydicom pillow img2pdf pyinstaller numpy
+
+%PYTHON_CMD% -m pip install --upgrade pip
+%PYTHON_CMD% -m pip install pydicom pillow img2pdf pyinstaller numpy
 
 if errorlevel 1 (
-    echo Package installation failed. Check your internet connection.
+    echo.
+    echo [ERROR] Package installation failed. Check your internet.
     pause
     exit /b
 )
 
+echo.
+echo Packages installed successfully.
+pause
+
 echo =============================================
-echo  Building executable with PyInstaller...
+echo  STEP 3: Building EXE file...
 echo =============================================
-pyinstaller --onefile --windowed --name "DICOMtoPDF" dicom_to_pdf_gui.py
+
+%PYTHON_CMD% -m PyInstaller --onefile --windowed --name "DICOMtoPDF" dicom_to_pdf_gui.py
 
 if exist dist\DICOMtoPDF.exe (
+    echo.
     echo =============================================
-    echo  Build successful!
-    echo  Executable is in the "dist" folder.
+    echo  [SUCCESS] EXE created successfully!
+    echo  Location: "%~dp0dist\DICOMtoPDF.exe"
     echo =============================================
 ) else (
+    echo.
     echo =============================================
-    echo  Build failed. Please check errors above.
+    echo  [FAILED] Build failed. Check errors above.
     echo =============================================
 )
 
-pause
+echo.
+echo Press ANY key to close this window...
+pause >nul
+exit

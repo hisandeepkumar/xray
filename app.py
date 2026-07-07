@@ -3,7 +3,7 @@ import sys
 import socket
 import json
 import threading
-from tkinter import Tk, Label, Entry, Button, StringVar, messagebox, ttk, filedialog
+from tkinter import Tk, Label, Entry, Button, StringVar, messagebox, ttk, filedialog, Frame
 import numpy as np
 import pydicom
 import pylibjpeg
@@ -17,12 +17,21 @@ from pynetdicom import AE, evt, storage_sop_classes
 
 CONFIG_FILE = "rad_xr_config.json"
 
+
 class RadXrReceiverApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("RAD-XR - DICOM to PDF & Smart Dispatcher")
-        self.root.geometry("600x650")
-        self.root.resizable(False, False)
+        self.root.title("RAD-XR - Enterprise Workflow Hub")
+        self.root.geometry("850x700")
+        self.root.configure(bg="#1e1e24")
+        
+        # Modern UI Colors
+        self.bg_dark = "#1e1e24"
+        self.bg_card = "#2a2a35"
+        self.text_light = "#f3f4f6"
+        self.accent_cyan = "#06b6d4"
+        self.accent_green = "#10b981"
+        self.accent_red = "#ef4444"
         
         # Default Configurations
         self.config = {
@@ -42,9 +51,14 @@ class RadXrReceiverApp:
         self.server_instance = None
         self.is_listening = False
         
+        # Global Table Items Tracking
+        self.queue_data = {} # key: accession, value: treeview row id
+        
         self.load_configuration()
         
-        # Route Flow based on verification status
+        # Setup Modern Styles for ttk elements
+        self.setup_modern_styles()
+        
         if not self.config.get("password_verified"):
             self.show_password_screen()
         else:
@@ -76,140 +90,176 @@ class RadXrReceiverApp:
         except Exception as e:
             print(f"Error saving config: {e}")
 
-    # ----------------------------------------------------
-    # SCREEN 1: ONE-TIME SECURITY LOCK
-    # ----------------------------------------------------
-    def show_password_screen(self):
-        self.clear_screen()
+    def setup_modern_styles(self):
+        style = ttk.Style()
+        style.theme_use("clam")
         
-        lbl_title = Label(self.root, text="RAD-XR Activation Lock", font=("Arial", 16, "bold"), fg="#007bff")
-        lbl_title.pack(pady=40)
+        # Notebook Style
+        style.configure("TNotebook", background=self.bg_dark, borderwidth=0)
+        style.configure("TNotebook.Tab", background=self.bg_card, foreground="#9ca3af", borderwidth=0, padding=[15, 5], font=("Arial", 10, "bold"))
+        style.map("TNotebook.Tab", background=[("selected", self.accent_cyan)], foreground=[("selected", self.bg_dark)])
         
-        lbl_info = Label(self.root, text="Enter the master password to activate RAD-XR on this PC:", font=("Arial", 10))
-        lbl_info.pack(pady=10)
+        # Treeview (Modern Dark Table Grid)
+        style.configure("Treeview", background=self.bg_card, fieldbackground=self.bg_card, foreground=self.text_light, borderwidth=0, font=("Arial", 10), rowheight=28)
+        style.configure("Treeview.Heading", background="#374151", foreground=self.text_light, borderwidth=0, font=("Arial", 10, "bold"))
+        style.map("Treeview", background=[("selected", "#4b5563")])
         
-        self.pass_var = StringVar()
-        entry_pass = Entry(self.root, textvariable=self.pass_var, show="*", font=("Arial", 12), width=30, justify="center")
-        entry_pass.pack(pady=10)
-        entry_pass.focus()
-        
-        btn_verify = Button(self.root, text="Verify & Activate", font=("Arial", 11, "bold"), bg="#28a745", fg="white", width=18, command=self.verify_master_password)
-        btn_verify.pack(pady=20)
-
-    def verify_master_password(self):
-        if self.pass_var.get() == "Sandeep@123":
-            self.config["password_verified"] = True
-            self.save_configuration()
-            messagebox.showinfo("Success", "RAD-XR successfully activated on this PC Node!")
-            self.show_main_dashboard()
-        else:
-            messagebox.showerror("Error", "Invalid Security Master Password!")
+        # Generic frames
+        style.configure("TFrame", background=self.bg_dark)
 
     def clear_screen(self):
         for widget in self.root.winfo_children():
             widget.destroy()
 
     # ----------------------------------------------------
-    # MAIN RAD-XR DASHBOARD
+    # SCREEN 1: MODERN SECURITY LOCK
+    # ----------------------------------------------------
+    def show_password_screen(self):
+        self.clear_screen()
+        
+        main_card = Frame(self.root, bg=self.bg_card, bd=0)
+        main_card.place(relx=0.5, rely=0.5, anchor="center", width=420, height=350)
+        
+        Label(main_card, text="RAD-XR SYSTEM NODE", font=("Arial", 18, "bold"), fg=self.accent_cyan, bg=self.bg_card).pack(pady=(40, 5))
+        Label(main_card, text="Enterprise Activation Gateway", font=("Arial", 10), fg="#9ca3af", bg=self.bg_card).pack(pady=(0, 25))
+        
+        Label(main_card, text="Node Master Password:", font=("Arial", 10, "bold"), fg=self.text_light, bg=self.bg_card).pack(anchor="w", padx=45, pady=5)
+        
+        self.pass_var = StringVar()
+        entry_pass = Entry(main_card, textvariable=self.pass_var, show="*", font=("Arial", 12), width=28, justify="center", bg=self.bg_dark, fg=self.text_light, bd=1, insertbackground="white")
+        entry_pass.pack(pady=5)
+        entry_pass.focus()
+        
+        btn_verify = Button(main_card, text="Verify Node", font=("Arial", 11, "bold"), bg=self.accent_cyan, fg=self.bg_dark, width=18, activebackground="#0891b2", bd=0, cursor="hand2", command=self.verify_master_password)
+        btn_verify.pack(pady=35)
+
+    def verify_master_password(self):
+        if self.pass_var.get() == "Sandeep@123":
+            self.config["password_verified"] = True
+            self.save_configuration()
+            messagebox.showinfo("Success", "RAD-XR Node Authenticated!")
+            self.show_main_dashboard()
+        else:
+            messagebox.showerror("Error", "Invalid Security Master Password!")
+
+    # ----------------------------------------------------
+    # MAIN ENTERPRISE RAD-XR DASHBOARD
     # ----------------------------------------------------
     def show_main_dashboard(self):
         self.clear_screen()
         
         notebook = ttk.Notebook(self.root)
-        notebook.pack(fill="both", expand=True, padx=10, pady=10)
+        notebook.pack(fill="both", expand=True, padx=15, pady=15)
         
-        frame_receiver = ttk.Frame(notebook)
-        frame_settings = ttk.Frame(notebook)
+        frame_receiver = Frame(notebook, bg=self.bg_dark)
+        frame_settings = Frame(notebook, bg=self.bg_dark)
         
-        notebook.add(frame_receiver, text="RAD-XR Receiver Server")
-        notebook.add(frame_settings, text="Configuration Settings")
+        notebook.add(frame_receiver, text="  Live Monitor  ")
+        notebook.add(frame_settings, text="  Config Control  ")
         
-        # --- TAB 1: RAD-XR RECEIVER UI ---
-        lbl_header = Label(frame_receiver, text="DICOM RECEIVER SETTINGS (RAD-XR)", font=("Arial", 14, "bold"), fg="#17a2b8")
-        lbl_header.pack(pady=15)
+        # --- TAB 1: WORKFLOW MONITOR (UI UPDATED TO MATCH REQUIREMENTS) ---
+        top_ctrl_bar = Frame(frame_receiver, bg=self.bg_dark)
+        top_ctrl_bar.pack(fill="x", pady=15, padx=15)
         
-        # Status Box Indicator
+        Label(top_ctrl_bar, text="RAD-XR PROCESS CONTROL", font=("Arial", 14, "bold"), fg=self.text_light, bg=self.bg_dark).pack(side="left")
+        
         self.status_var = StringVar(value="● Stopped")
-        self.lbl_status_indicator = Label(frame_receiver, textvariable=self.status_var, font=("Arial", 12, "bold"), fg="red")
-        self.lbl_status_indicator.pack(pady=5)
+        self.lbl_status_indicator = Label(top_ctrl_bar, textvariable=self.status_var, font=("Arial", 11, "bold"), fg=self.accent_red, bg=self.bg_dark)
+        self.lbl_status_indicator.pack(side="left", padx=20)
         
-        # Display Specs Grid
-        grid_frame = ttk.Frame(frame_receiver)
-        grid_frame.pack(pady=15, padx=20, fill="x")
+        # Manual Upload Trigger (Dual Input Feature)
+        btn_manual_upload = Button(top_ctrl_bar, text="+ Import DICOM File", font=("Arial", 9, "bold"), bg=self.accent_cyan, fg=self.bg_dark, bd=0, padding=5, cursor="hand2", command=self.manual_file_upload_trigger)
+        btn_manual_upload.pack(side="right", padx=5)
         
-        Label(grid_frame, text="Institute Name:", font=("Arial", 10, "bold")).grid(row=0, column=0, sticky="w", pady=5)
-        self.lbl_inst = Label(grid_frame, text=self.config["institute_name"], font=("Arial", 10))
-        self.lbl_inst.grid(row=0, column=1, sticky="w", pady=5, padx=10)
+        self.btn_toggle_server = Button(top_ctrl_bar, text="Start Server", bg=self.accent_green, fg=self.bg_dark, font=("Arial", 9, "bold"), bd=0, padding=5, width=12, cursor="hand2", command=self.toggle_server_process)
+        self.btn_toggle_server.pack(side="right", padx=5)
+
+        # Main Layout Grid Partition 
+        content_splitter = Frame(frame_receiver, bg=self.bg_dark)
+        content_splitter.pack(fill="both", expand=True, padx=15, pady=5)
         
-        Label(grid_frame, text="AE Title:", font=("Arial", 10, "bold")).grid(row=1, column=0, sticky="w", pady=5)
-        self.lbl_ae = Label(grid_frame, text=self.config["ae_title"], font=("Arial", 10))
-        self.lbl_ae.grid(row=1, column=1, sticky="w", pady=5, padx=10)
+        # Left Panel: Network Configuration Stats View Card
+        net_card = Frame(content_splitter, bg=self.bg_card, width=220)
+        net_card.pack(side="left", fill="y", padx=(0, 10))
+        net_card.pack_propagate(False)
         
-        Label(grid_frame, text="IP Address:", font=("Arial", 10, "bold")).grid(row=2, column=0, sticky="w", pady=5)
-        self.lbl_ip = Label(grid_frame, text=self.config["ip_address"], font=("Arial", 10))
-        self.lbl_ip.grid(row=2, column=1, sticky="w", pady=5, padx=10)
+        Label(net_card, text="NETWORK CONFIG", font=("Arial", 10, "bold"), fg=self.accent_cyan, bg=self.bg_card).pack(pady=15)
         
-        Label(grid_frame, text="Port Number:", font=("Arial", 10, "bold")).grid(row=3, column=0, sticky="w", pady=5)
-        self.lbl_port = Label(grid_frame, text=self.config["port"], font=("Arial", 10))
-        self.lbl_port.grid(row=3, column=1, sticky="w", pady=5, padx=10)
+        def add_stat_lbl(parent, name, val_attr):
+            lbl_n = Label(parent, text=name, font=("Arial", 8, "bold"), fg="#9ca3af", bg=self.bg_card)
+            lbl_n.pack(anchor="w", padx=15, pady=(5, 0))
+            lbl_v = Label(parent, text=self.config[val_attr], font=("Arial", 9), fg=self.text_light, bg=self.bg_card, wraplength=190, justify="left")
+            lbl_v.pack(anchor="w", padx=15, pady=(0, 5))
+            return lbl_v
+
+        self.lbl_inst = add_stat_lbl(net_card, "INSTITUTE NAME", "institute_name")
+        self.lbl_ae = add_stat_lbl(net_card, "AE TITLE", "ae_title")
+        self.lbl_ip = add_stat_lbl(net_card, "IP ADDRESS", "ip_address")
+        self.lbl_port = add_stat_lbl(net_card, "PORT NUMBER", "port")
+        self.lbl_folder = add_stat_lbl(net_card, "RECEIVE DIRECTORY", "receive_folder")
         
-        Label(grid_frame, text="Receive Folder:", font=("Arial", 10, "bold")).grid(row=4, column=0, sticky="w", pady=5)
-        self.lbl_folder = Label(grid_frame, text=self.config["receive_folder"], font=("Arial", 9), wraplength=350, justify="left")
-        self.lbl_folder.grid(row=4, column=1, sticky="w", pady=5, padx=10)
+        Button(net_card, text="Copy Configuration", font=("Arial", 8, "bold"), bg="#4b5563", fg=self.text_light, bd=0, width=20, cursor="hand2", command=self.copy_network_settings).pack(side="bottom", pady=20)
         
-        # Control Buttons
-        btn_frame = ttk.Frame(frame_receiver)
-        btn_frame.pack(pady=20)
+        # Right Panel: Workflow Queue Live Table Grid
+        queue_container = Frame(content_splitter, bg=self.bg_card)
+        queue_container.pack(side="right", fill="both", expand=True)
         
-        self.btn_toggle_server = Button(btn_frame, text="Start Server", bg="#28a745", fg="white", font=("Arial", 10, "bold"), width=15, command=self.toggle_server_process)
-        self.btn_toggle_server.grid(row=0, column=0, padx=10)
+        cols = ("id", "name", "mobile", "status")
+        self.tree = ttk.Treeview(queue_container, columns=cols, show="headings")
+        self.tree.heading("id", text="Patient ID")
+        self.tree.heading("name", text="Patient Name")
+        self.tree.heading("mobile", text="Accession / Mobile")
+        self.tree.heading("status", text="Workflow Dispatch Status")
         
-        btn_copy = Button(btn_frame, text="Copy Settings", bg="#6c757d", fg="white", font=("Arial", 10), width=15, command=self.copy_network_settings)
-        btn_copy.grid(row=0, column=1, padx=10)
+        self.tree.column("id", width=90, anchor="center")
+        self.tree.column("name", width=140, anchor="w")
+        self.tree.column("mobile", width=120, anchor="center")
+        self.tree.column("status", width=110, anchor="center")
         
-        # --- TAB 2: CONFIGURATION UI ---
-        lbl_settings_title = Label(frame_settings, text="RAD-XR SYSTEM CONFIGURATION", font=("Arial", 12, "bold"))
-        lbl_settings_title.pack(pady=15)
+        self.tree.pack(fill="both", expand=True, side="left")
         
-        config_form = ttk.Frame(frame_settings)
-        config_form.pack(padx=20, fill="x", pady=10)
+        # Grid Action Context Integration
+        self.tree.bind("<Double-1>", self.on_grid_row_double_click_resend)
         
-        Label(config_form, text="Institute Name (PDF Header Title):", font=("Arial", 9, "bold")).pack(anchor="w", pady=2)
-        self.ent_inst_name = Entry(config_form, font=("Arial", 10))
-        self.ent_inst_name.pack(fill="x", pady=5)
-        self.ent_inst_name.insert(0, self.config["institute_name"])
+        scrollbar = ttk.Scrollbar(queue_container, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
         
-        Label(config_form, text="WhatsApp Business API Key:", font=("Arial", 9, "bold")).pack(anchor="w", pady=2)
-        self.ent_wa_key = Entry(config_form, font=("Arial", 10), show="*")
-        self.ent_wa_key.pack(fill="x", pady=5)
-        self.ent_wa_key.insert(0, self.config["whatsapp_api_key"])
+        # Core Footer Branding Label
+        Label(frame_receiver, text="MADE WITH LOVE BY SANDEEP", font=("Arial", 9, "bold", "italic"), fg="#6b7280", bg=self.bg_dark).pack(side="bottom", pady=5)
         
-        Label(config_form, text="Storage AE Title:", font=("Arial", 9, "bold")).pack(anchor="w", pady=2)
-        self.ent_ae_title = Entry(config_form, font=("Arial", 10))
-        self.ent_ae_title.pack(fill="x", pady=5)
-        self.ent_ae_title.insert(0, self.config["ae_title"])
+        # --- TAB 2: MANAGEMENT & DATA CONTROL PANEL ---
+        Label(frame_settings, text="SYSTEM INITIALIZATION TARGETS", font=("Arial", 14, "bold"), fg=self.accent_cyan, bg=self.bg_dark).pack(pady=20)
         
-        Label(config_form, text="Local IP Address:", font=("Arial", 9, "bold")).pack(anchor="w", pady=2)
-        self.ent_ip_addr = Entry(config_form, font=("Arial", 10))
-        self.ent_ip_addr.pack(fill="x", pady=5)
-        self.ent_ip_addr.insert(0, self.config["ip_address"])
+        form = Frame(frame_settings, bg=self.bg_card, pading=20)
+        form.pack(padx=30, fill="x", pady=10)
         
-        Label(config_form, text="Listener Port Number:", font=("Arial", 9, "bold")).pack(anchor="w", pady=2)
-        self.ent_port_num = Entry(config_form, font=("Arial", 10))
-        self.ent_port_num.pack(fill="x", pady=5)
-        self.ent_port_num.insert(0, self.config["port"])
+        def make_entry(lbl_txt, attr):
+            f = Frame(form, bg=self.bg_card)
+            f.pack(fill="x", pady=8, padx=20)
+            Label(f, text=lbl_txt, font=("Arial", 9, "bold"), fg=self.text_light, bg=self.bg_card, width=25, anchor="w").pack(side="left")
+            e = Entry(f, font=("Arial", 10), bg=self.bg_dark, fg=self.text_light, bd=1, insertbackground="white")
+            e.pack(side="left", fill="x", expand=True, padx=5)
+            e.insert(0, self.config[attr])
+            return e
+
+        self.ent_inst_name = make_entry("Institute Name (PDF Title):", "institute_name")
+        self.ent_wa_key = make_entry("WhatsApp Cloud API Key:", "whatsapp_api_key")
+        self.ent_ae_title = make_entry("Storage AE Title:", "ae_title")
+        self.ent_ip_addr = make_entry("Host Local IP Address:", "ip_address")
+        self.ent_port_num = make_entry("Server Dynamic Port:", "port")
         
-        # Target Path Picker
-        Label(config_form, text="Receive Folder Directory:", font=("Arial", 9, "bold")).pack(anchor="w", pady=2)
-        path_frame = ttk.Frame(config_form)
-        path_frame.pack(fill="x", pady=2)
-        self.ent_folder_path = Entry(path_frame, font=("Arial", 10), width=45)
-        self.ent_folder_path.pack(side="left", fill="x", expand=True)
+        # Custom Dest Directory Picker
+        f_dir = Frame(form, bg=self.bg_card)
+        f_dir.pack(fill="x", pady=8, padx=20)
+        Label(f_dir, text="Dynamic Cache Folder Path:", font=("Arial", 9, "bold"), fg=self.text_light, bg=self.bg_card, width=25, anchor="w").pack(side="left")
+        self.ent_folder_path = Entry(f_dir, font=("Arial", 10), bg=self.bg_dark, fg=self.text_light, bd=1, insertbackground="white")
+        self.ent_folder_path.pack(side="left", fill="x", expand=True, padx=5)
         self.ent_folder_path.insert(0, self.config["receive_folder"])
-        Button(path_frame, text="...", command=self.pick_destination_directory).pack(side="right", padx=5)
+        Button(f_dir, text="Browse", font=("Arial", 8, "bold"), bg="#4b5563", fg=self.text_light, bd=0, padding=2, command=self.pick_destination_directory).pack(side="left", padx=2)
         
-        btn_save_settings = Button(frame_settings, text="Save RAD-XR Settings", font=("Arial", 11, "bold"), bg="#007bff", fg="white", command=self.apply_and_save_node_settings)
-        btn_save_settings.pack(pady=20)
+        Button(frame_settings, text="Apply Node Topology Changes", font=("Arial", 11, "bold"), bg=self.accent_green, fg=self.bg_dark, width=28, bd=0, padding=8, cursor="hand2", command=self.apply_and_save_node_settings).pack(pady=35)
+        Label(frame_settings, text="MADE WITH LOVE BY SANDEEP", font=("Arial", 9, "bold", "italic"), fg="#6b7280", bg=self.bg_dark).pack(side="bottom", pady=5)
 
     def pick_destination_directory(self):
         selected_dir = filedialog.askdirectory()
@@ -226,25 +276,55 @@ class RadXrReceiverApp:
         self.config["receive_folder"] = self.ent_folder_path.get().strip()
         
         self.save_configuration()
-        messagebox.showinfo("Configuration", "RAD-XR node settings updated! Restart server to apply changes.")
+        messagebox.showinfo("System Config", "RAD-XR Core parameters successfully saved! Please toggle server connection to update.")
         self.show_main_dashboard()
 
     def copy_network_settings(self):
         settings_text = f"AE Title: {self.config['ae_title']}\nIP Address: {self.config['ip_address']}\nPort: {self.config['port']}"
         self.root.clipboard_clear()
         self.root.clipboard_append(settings_text)
-        messagebox.showinfo("Clipboard", "Connectivity details copied!")
+        messagebox.showinfo("Clipboard Sync", "Connectivity details synced to clipboard system!")
 
     # ----------------------------------------------------
-    # DICOM CORE SCP LISTENER & BROADCAST ENGINE
+    # MANUAL DISPATCH ENGINE (DUAL INPUT MODE)
+    # ----------------------------------------------------
+    def manual_file_upload_trigger(self):
+        file_path = filedialog.askopenfilename(filetypes=[("DICOM Files", "*.dcm"), ("All Files", "*.*")])
+        if file_path:
+            # Process inside dynamic worker instance thread to protect UI loops
+            th = threading.Thread(target=self.autonomous_processing_pipeline, args=(file_path, True), daemon=True)
+            th.start()
+
+    def on_grid_row_double_click_resend(self, event):
+        item_id = self.tree.selection()
+        if not item_id:
+            return
+        row_values = self.tree.item(item_id, 'values')
+        status = row_values[3]
+        accession_no = row_values[2]
+        
+        if "Failed" in status:
+            res = messagebox.askyesno("Resend Trigger", f"Do you want to re-dispatch pipeline route execution for Accession No: {accession_no}?")
+            if res:
+                # Find matching backup files in folder path
+                tgt_dcm = os.path.join(self.config["receive_folder"], f"RADXR_{accession_no}.dcm")
+                if os.path.exists(tgt_dcm):
+                    self.tree.item(item_id, values=(row_values[0], row_values[1], accession_no, "⚡ Resending"))
+                    th = threading.Thread(target=self.autonomous_processing_pipeline, args=(tgt_dcm, False), daemon=True)
+                    th.start()
+                else:
+                    messagebox.showerror("Error", "Original raw file not located in path inbox. Cannot rerun logic sequence.")
+
+    # ----------------------------------------------------
+    # SERVER LISTENER STACK
     # ----------------------------------------------------
     def toggle_server_process(self):
         if not self.is_listening:
             os.makedirs(self.config["receive_folder"], exist_ok=True)
             self.is_listening = True
             self.status_var.set("● Listening")
-            self.lbl_status_indicator.config(fg="green")
-            self.btn_toggle_server.config(text="Stop Server", bg="#dc3545")
+            self.lbl_status_indicator.config(fg=self.accent_green)
+            self.btn_toggle_server.config(text="Stop Server", bg=self.accent_red)
             
             self.server_thread = threading.Thread(target=self.run_dicom_scp_listener, daemon=True)
             self.server_thread.start()
@@ -253,16 +333,14 @@ class RadXrReceiverApp:
             if self.server_instance:
                 self.server_instance.shutdown()
             self.status_var.set("● Stopped")
-            self.lbl_status_indicator.config(fg="red")
-            self.btn_toggle_server.config(text="Start Server", bg="#28a745")
+            self.lbl_status_indicator.config(fg=self.accent_red)
+            self.btn_toggle_server.config(text="Start Server", bg=self.accent_green)
 
     def run_dicom_scp_listener(self):
         ae = AE(ae_title=self.config["ae_title"].encode('ascii'))
         for sop_class in storage_sop_classes:
             ae.add_supported_context(sop_class)
-            
         handlers = [(evt.EVT_C_STORE, self.handle_incoming_c_store)]
-        
         try:
             self.server_instance = ae.start_server(
                 (self.config["ip_address"], int(self.config["port"])),
@@ -273,35 +351,40 @@ class RadXrReceiverApp:
                 pass
         except Exception as e:
             self.is_listening = False
-            self.root.after(0, lambda: messagebox.showerror("Network Binding Error", f"Could not bind socket: {str(e)}"))
+            self.root.after(0, lambda: messagebox.showerror("Network Binding Error", f"Socket collapse: {str(e)}"))
             self.root.after(0, self.toggle_server_process)
 
     def handle_incoming_c_store(self, event):
         try:
             dataset = event.dataset
             accession_number = str(dataset.get("AccessionNumber", "UNKNOWN_ACC")).strip()
-            patient_id = str(dataset.get("PatientID", "N/A")).strip()
             
-            filename = f"RADXR_{accession_number}_{patient_id}.dcm"
+            # Save raw file as structured backup string name
+            filename = f"RADXR_{accession_number}.dcm"
             filepath = os.path.join(self.config["receive_folder"], filename)
-            
             event.write_dataset(filepath)
             
-            processing_thread = threading.Thread(target=self.autonomous_processing_pipeline, args=(filepath,), daemon=True)
+            processing_thread = threading.Thread(target=self.autonomous_processing_pipeline, args=(filepath, False), daemon=True)
             processing_thread.start()
-            
             return 0x0000 
         except Exception as e:
             print(f"Error handling store command: {e}")
             return 0xC000 
 
     # ----------------------------------------------------
-    # RAD-XR AUTOMATED SYSTEM PIPELINE
+    # SYSTEM WORKFLOW MANAGEMENT & PIPELINE DISPATCH
     # ----------------------------------------------------
-    def autonomous_processing_pipeline(self, dcm_path):
+    def autonomous_processing_pipeline(self, dcm_path, is_manual_import=False):
+        pdf_output_path = ""
+        accession_no = "UNKNOWN"
         try:
             ds = pydicom.dcmread(dcm_path)
+            patient_id = str(ds.get("PatientID", "N/A")).strip()
+            patient_name = str(ds.get("PatientName", "N/A")).strip()
             accession_no = str(ds.get("AccessionNumber", "NO_ACC")).strip()
+            
+            # Step A: Feed row layout to Monitor Data Grid View
+            self.root.after(0, lambda: self.upsert_grid_record(patient_id, patient_name, accession_no, "⏳ Processing"))
             
             pdf_filename = f"Report_{accession_no}.pdf"
             pdf_output_path = os.path.join(self.config["receive_folder"], pdf_filename)
@@ -321,14 +404,13 @@ class RadXrReceiverApp:
             width, height = letter
 
             metadata = [
-                ("Patient Name", str(ds.get("PatientName", "N/A"))),
-                ("Patient ID", str(ds.get("PatientID", "N/A"))),
+                ("Patient Name", patient_name),
+                ("Patient ID", patient_id),
                 ("Patient Sex", str(ds.get("PatientSex", "N/A"))),
                 ("Birth Date", str(ds.get("PatientBirthDate", "N/A"))),
                 ("Study Date", str(ds.get("StudyDate", "N/A"))),
                 ("Institution", str(ds.get("InstitutionName", "N/A"))),
                 ("Modality", str(ds.get("Modality", "N/A"))),
-                ("Manufacturer", str(ds.get("Manufacturer", "N/A"))),
                 ("Accession No", accession_no)
             ]
             available_metadata = [(k, v) for k, v in metadata if v.strip() and v != "N/A"]
@@ -345,13 +427,12 @@ class RadXrReceiverApp:
                 if image.mode != "RGB":
                     image = image.convert("RGB")
 
-                temp_img_path = f"radxr_temp_frame_{frame_idx}.jpg"
+                temp_img_path = f"workflow_temp_frame_{frame_idx}.jpg"
                 image.save(temp_img_path, quality=100, subsampling=0)
 
-                # Upper Header Dynamic Title (Institute Name)
+                # Render PDF layout elements
                 c.setFont("Helvetica-Bold", 14)
                 c.drawString(40, height - 40, self.config["institute_name"])
-                
                 c.setFont("Helvetica-Oblique", 9)
                 c.drawRightString(width - 40, height - 40, f"Page {frame_idx + 1} of {num_frames}")
                 
@@ -359,7 +440,6 @@ class RadXrReceiverApp:
                 c.setStrokeColorRGB(0.1, 0.5, 0.7) 
                 c.line(40, height - 46, width - 40, height - 46)
 
-                # Metadata layout mapping
                 c.setFont("Helvetica", 10)
                 y_text = height - 65
                 col = 0
@@ -381,7 +461,6 @@ class RadXrReceiverApp:
                 c.line(40, y_text, width - 40, y_text)
                 y_text -= 15
 
-                # Auto Fit Image logic 
                 img_w, img_h = image.size
                 display_width = width - 80
                 display_height = (img_h / img_w) * display_width
@@ -405,54 +484,98 @@ class RadXrReceiverApp:
             c.showPage()
             c.save()
             
-            # --- AUTOMATED DISPATCH SYSTEM ---
-            # 1. Send via Telegram Bot 
-            self.dispatch_to_telegram(pdf_output_path, accession_no)
+            # Step B: Transition Status View to Sending Process
+            self.root.after(0, lambda: self.upsert_grid_record(patient_id, patient_name, accession_no, "📤 Sending"))
             
-            # 2. Send via WhatsApp Business API (Uses Accession No as Phone Number)
+            # Step C: Fire Broadcast Pipelines Async
+            tg_ok = self.dispatch_to_telegram(pdf_output_path, patient_id, patient_name, accession_no)
+            wa_ok = True
+            
             if self.config["whatsapp_api_key"]:
-                self.dispatch_to_whatsapp_business(pdf_output_path, accession_no)
+                wa_ok = self.dispatch_to_whatsapp_business(pdf_output_path, patient_id, patient_name, accession_no)
+
+            # Step D: Auto-Purge Cache Storage Configuration Check (Delete only if completely successful)
+            if tg_ok and wa_ok:
+                self.root.after(0, lambda: self.tree.item(self.queue_data[accession_no], values=(patient_id, patient_name, accession_no, "Sent ✅")))
+                # Safely delete local file cache to maintain empty disk architecture
+                if os.path.exists(pdf_output_path):
+                    os.remove(pdf_output_path)
+                if not is_manual_import and os.path.exists(dcm_path):
+                    os.remove(dcm_path)
+            else:
+                self.root.after(0, lambda: self.tree.item(self.queue_data[accession_no], values=(patient_id, patient_name, accession_no, "Failed ❌ (Double-Click)")))
                 
         except Exception as e:
-            print(f"RAD-XR Pipeline error: {e}")
+            print(f"RAD-XR Engine Failure: {e}")
+            if accession_no in self.queue_data:
+                self.root.after(0, lambda: self.tree.item(self.queue_data[accession_no], values=("N/A", "N/A", accession_no, "Failed ❌")))
 
-    def dispatch_to_telegram(self, file_path, accession_no):
+    def upsert_grid_record(self, p_id, p_name, acc_no, status):
+        if acc_no in self.queue_data:
+            self.tree.item(self.queue_data[acc_no], values=(p_id, p_name, acc_no, status))
+        else:
+            row_id = self.tree.insert("", "end", values=(p_id, p_name, acc_no, status))
+            self.queue_data[acc_no] = row_id
+
+    def build_beautiful_caption_string(self, p_id, p_name, acc_no):
+        return (
+            f"🏥 *{self.config['institute_name']}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 *Patient Name:* {p_name}\n"
+            f"🆔 *Patient ID:* {p_id}\n"
+            f"🔢 *Accession No:* {acc_no}\n\n"
+            f"⚡ *Radiation Safety Notice:*\n"
+            f"_This diagnostic study was carefully optimized using low-dose protocols to "
+            f"deliver high-fidelity diagnostic accuracy while strictly adhering to ALARA "
+            f"(As Low As Reasonably Achievable) protection principles._\n\n"
+            f"❤️ *Made with love by Sandeep*"
+        )
+
+    def dispatch_to_telegram(self, file_path, p_id, p_name, acc_no):
         url = f"https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}/sendDocument"
         try:
+            caption_text = self.build_beautiful_caption_string(p_id, p_name, acc_no)
+            # Markdown parsing conversions for standard bot integration
+            caption_text = caption_text.replace("Report_", "")
+            
             with open(file_path, "rb") as document:
                 payload = {
                     "chat_id": self.TELEGRAM_CHAT_ID,
-                    "caption": f"✅ RAD-XR: New DICOM Report Generated\n🔹 Accession No: {accession_no}"
+                    "caption": caption_text,
+                    "parse_mode": "Markdown"
                 }
                 files = {"document": document}
-                requests.post(url, data=payload, files=files, timeout=20)
+                res = requests.post(url, data=payload, files=files, timeout=25)
+                return res.status_code == 200
         except Exception as e:
-            print(f"Failed to send via Telegram: {e}")
+            print(f"Telegram API Exception: {e}")
+            return False
 
-    def dispatch_to_whatsapp_business(self, file_path, phone_number):
-        target_phone = "".join(filter(str.isdigit, phone_number))
+    def dispatch_to_whatsapp_business(self, file_path, p_id, p_name, acc_no):
+        target_phone = "".join(filter(str.isdigit, acc_no))
         if len(target_phone) < 10:
-            print(f"WhatsApp Dispatch Cancelled: Accession '{phone_number}' is not a valid number.")
-            return
+            print(f"Aborting WhatsApp dispatch: '{acc_no}' lacks valid digits length parameters.")
+            return False
 
         if len(target_phone) == 10:
             target_phone = "91" + target_phone
 
-        headers = {
-            "Authorization": f"Bearer {self.config['whatsapp_api_key']}",
-        }
-        
+        headers = {"Authorization": f"Bearer {self.config['whatsapp_api_key']}"}
         upload_url = "https://graph.facebook.com/v18.0/me/media" 
+        
         try:
+            caption_text = self.build_beautiful_caption_string(p_id, p_name, acc_no)
+            # Remove asterisks for clean standard text inside WhatsApp rendering layers
+            clean_caption = caption_text.replace("*", "").replace("_", "")
+            
             with open(file_path, "rb") as f:
                 files = {
                     "file": (os.path.basename(file_path), f, "application/pdf"),
                     "messaging_product": (None, "whatsapp")
                 }
-                res = requests.post(upload_url, headers=headers, files=files, timeout=20)
+                res = requests.post(upload_url, headers=headers, files=files, timeout=25)
                 if res.status_code == 200:
                     media_id = res.json().get("id")
-                    
                     msg_url = "https://graph.facebook.com/v18.0/me/messages"
                     payload = {
                         "messaging_product": "whatsapp",
@@ -461,12 +584,15 @@ class RadXrReceiverApp:
                         "document": {
                             "id": media_id,
                             "filename": os.path.basename(file_path),
-                            "caption": f"Your medical report from {self.config['institute_name']}"
+                            "caption": clean_caption
                         }
                     }
-                    requests.post(msg_url, headers=headers, json=payload, timeout=20)
+                    msg_res = requests.post(msg_url, headers=headers, json=payload, timeout=25)
+                    return msg_res.status_code == 200
+            return False
         except Exception as e:
-            print(f"Failed to send via WhatsApp: {e}")
+            print(f"WhatsApp API Exception: {e}")
+            return False
 
 
 if __name__ == "__main__":

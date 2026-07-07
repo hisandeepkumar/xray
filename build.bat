@@ -1,40 +1,64 @@
 @echo off
-echo =================================================
-echo Building DICOM to Telegram executable
-echo =================================================
+title DICOM to PDF Converter - Setup & Build
 
-REM 1. Create and activate a virtual environment
-echo Creating a virtual environment...
-python -m venv venv
-call venv\Scripts\activate.bat
+echo =============================================
+echo  Checking for Python...
+echo =============================================
 
-REM 2. Upgrade pip and install dependencies
-echo Installing dependencies...
-pip install --upgrade pip
-pip install -r requirements.txt
+python --version >nul 2>&1
+if errorlevel 1 (
+    echo Python not found. Installing Python...
+    echo Downloading Python 3.10.11 (64-bit)...
+    powershell -Command "Invoke-WebRequest -Uri https://www.python.org/ftp/python/3.10.11/python-3.10.11-amd64.exe -OutFile python_installer.exe"
+    if exist python_installer.exe (
+        echo Installing Python silently (this may take a few minutes)...
+        start /wait python_installer.exe /quiet InstallAllUsers=1 PrependPath=1 Include_test=0
+        del python_installer.exe
+        echo Python installed successfully.
+    ) else (
+        echo Failed to download Python installer.
+        echo Please install Python manually from python.org (add to PATH).
+        pause
+        exit /b
+    )
+) else (
+    echo Python is already installed.
+)
 
-REM 3. Build with PyInstaller – सभी packages को पूरी तरह collect करें
-echo Building .exe with PyInstaller...
-pyinstaller --onefile --windowed ^
-    --hidden-import numpy ^
-    --hidden-import numpy._core ^
-    --hidden-import numpy._core.multiarray ^
-    --hidden-import pylibjpeg ^
-    --hidden-import pylibjpeg_libjpeg ^
-    --collect-all numpy ^
-    --collect-all pydicom ^
-    --collect-all pylibjpeg ^
-    --collect-all pylibjpeg_libjpeg ^
-    --collect-all img2pdf ^
-    --name DICOMtoTelegram ^
-    main.py
+echo =============================================
+echo  Checking pip...
+echo =============================================
+pip --version >nul 2>&1
+if errorlevel 1 (
+    echo pip not found, installing...
+    python -m ensurepip --upgrade
+)
 
-REM 4. Deactivate venv
-call venv\Scripts\deactivate.bat
+echo =============================================
+echo  Installing required packages...
+echo =============================================
+pip install pydicom pillow img2pdf pyinstaller numpy
 
-echo.
-echo =================================================
-echo Build completed!
-echo Executable: dist\DICOMtoTelegram.exe
-echo =================================================
+if errorlevel 1 (
+    echo Package installation failed. Check your internet connection.
+    pause
+    exit /b
+)
+
+echo =============================================
+echo  Building executable with PyInstaller...
+echo =============================================
+pyinstaller --onefile --windowed --name "DICOMtoPDF" dicom_to_pdf_gui.py
+
+if exist dist\DICOMtoPDF.exe (
+    echo =============================================
+    echo  Build successful!
+    echo  Executable is in the "dist" folder.
+    echo =============================================
+) else (
+    echo =============================================
+    echo  Build failed. Please check errors above.
+    echo =============================================
+)
+
 pause

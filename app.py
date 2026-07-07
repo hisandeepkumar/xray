@@ -7,7 +7,6 @@ import time
 from tkinter import Tk, Label, Entry, Button, StringVar, messagebox, ttk, filedialog, Frame
 import numpy as np
 import pydicom
-import pylibjpeg
 from PIL import Image
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
@@ -47,7 +46,7 @@ class RadXrReceiverApp:
         
         self.server_instance = None
         self.is_listening = False
-        self.bot_running = False
+        self.bot_running = True
         self.queue_data = {} 
         self.last_update_id = 0
         
@@ -91,7 +90,7 @@ class RadXrReceiverApp:
         style = ttk.Style()
         style.theme_use("clam")
         style.configure("TNotebook", background=self.bg_dark, borderwidth=0)
-        style.configure("TNotebook.Tab", background=self.bg_card, foreground="#9ca3af", borderwidth=0, padding=[15, 5], font=("Arial", 10, "bold"))
+        style.configure("TNotebook.Tab", background=self.bg_card, foreground="#9ca3af", borderwidth=0, font=("Arial", 10, "bold"))
         style.map("TNotebook.Tab", background=[("selected", self.accent_cyan)], foreground=[("selected", self.bg_dark)])
         
         style.configure("Treeview", background=self.bg_card, fieldbackground=self.bg_card, foreground=self.text_light, borderwidth=0, font=("Arial", 10), rowheight=28)
@@ -225,28 +224,25 @@ class RadXrReceiverApp:
         self.ent_ip_addr = make_entry("Host Local IP Address:", "ip_address")
         self.ent_port_num = make_entry("Server Dynamic Port:", "port")
         
-        # Inbox picker
         f_dir1 = Frame(form, bg=self.bg_card)
         f_dir1.pack(fill="x", pady=6, padx=20)
         Label(f_dir1, text="Dynamic Cache Folder (Inbox):", font=("Arial", 9, "bold"), fg=self.text_light, bg=self.bg_card, width=25, anchor="w").pack(side="left")
         self.ent_folder_path = Entry(f_dir1, font=("Arial", 10), bg=self.bg_dark, fg=self.text_light, bd=1, insertbackground="white")
         self.ent_folder_path.pack(side="left", fill="x", expand=True, padx=5)
         self.ent_folder_path.insert(0, self.config["receive_folder"])
-        Button(f_dir1, text="Browse", font=("Arial", 8, "bold"), bg="#4b5563", fg=self.text_light, bd=0, padx=5, pady=2, command=lambda: self.pick_directory("receive_folder", self.ent_folder_path)).pack(side="left", padx=2)
+        Button(f_dir1, text="Browse", font=("Arial", 8, "bold"), bg="#4b5563", fg=self.text_light, bd=0, command=lambda: self.pick_directory("receive_folder", self.ent_folder_path)).pack(side="left", padx=2)
         
-        # Archive picker
         f_dir2 = Frame(form, bg=self.bg_card)
         f_dir2.pack(fill="x", pady=6, padx=20)
         Label(f_dir2, text="Local Archive Directory (Bot):", font=("Arial", 9, "bold"), fg=self.text_light, bg=self.bg_card, width=25, anchor="w").pack(side="left")
         self.ent_archive_path = Entry(f_dir2, font=("Arial", 10), bg=self.bg_dark, fg=self.text_light, bd=1, insertbackground="white")
         self.ent_archive_path.pack(side="left", fill="x", expand=True, padx=5)
         self.ent_archive_path.insert(0, self.config.get("archive_folder", "D:\\RAD-XR\\Archive"))
-        Button(f_dir2, text="Browse", font=("Arial", 8, "bold"), bg="#4b5563", fg=self.text_light, bd=0, padx=5, pady=2, command=lambda: self.pick_directory("archive_folder", self.ent_archive_path)).pack(side="left", padx=2)
+        Button(f_dir2, text="Browse", font=("Arial", 8, "bold"), bg="#4b5563", fg=self.text_light, bd=0, command=lambda: self.pick_directory("archive_folder", self.ent_archive_path)).pack(side="left", padx=2)
         
-        Button(frame_settings, text="Apply Node Topology Changes", font=("Arial", 11, "bold"), bg=self.accent_green, fg=self.bg_dark, width=28, bd=0, padx=10, pady=8, cursor="hand2", command=self.apply_and_save_node_settings).pack(pady=15)
+        Button(frame_settings, text="Apply Node Topology Changes", font=("Arial", 11, "bold"), bg=self.accent_green, fg=self.bg_dark, width=28, bd=0, cursor="hand2", command=self.apply_and_save_node_settings).pack(pady=15)
         Label(frame_settings, text="MADE WITH LOVE BY SANDEEP", font=("Arial", 9, "bold", "italic"), fg="#6b7280", bg=self.bg_dark).pack(side="bottom", pady=5)
 
-    # NEW: Sync feature to automatically load all archive files into Dashboard on startup/refresh
     def sync_archive_folder_to_dashboard(self):
         archive_dir = self.config.get("archive_folder", "D:\\RAD-XR\\Archive")
         if not os.path.exists(archive_dir):
@@ -262,7 +258,6 @@ class RadXrReceiverApp:
                         patient_name = str(ds.get("PatientName", "N/A")).strip()
                         accession_no = str(ds.get("AccessionNumber", "NO_ACC")).strip()
                         
-                        # Add cleanly to the grid view
                         self.root.after(0, lambda p=patient_id, n=patient_name, a=accession_no: self.upsert_grid_record(p, n, a, "Archive Saved 📁"))
                     except Exception:
                         continue
@@ -288,12 +283,6 @@ class RadXrReceiverApp:
         self.show_main_dashboard()
         self.sync_archive_folder_to_dashboard()
 
-    def copy_network_settings(self):
-        settings_text = f"AE Title: {self.config['ae_title']}\nIP Address: {self.config['ip_address']}\nPort: {self.config['port']}"
-        self.root.clipboard_clear()
-        self.root.clipboard_append(settings_text)
-        messagebox.showinfo("Clipboard Sync", "Connectivity details copied!")
-
     def manual_file_upload_trigger(self):
         file_path = filedialog.askopenfilename(filetypes=[("DICOM Files", "*.dcm"), ("All Files", "*.*")])
         if file_path:
@@ -311,10 +300,8 @@ class RadXrReceiverApp:
         if "Failed" in status:
             res = messagebox.askyesno("Resend Trigger", f"Do you want to re-dispatch pipeline for Accession: {accession_no}?")
             if res:
-                # Check Archive directory first, then Inbox
                 tgt_dcm = os.path.join(self.config["archive_folder"], f"RADXR_{accession_no}.dcm")
                 if not os.path.exists(tgt_dcm):
-                    # fallback to general lookups
                     for f in os.listdir(self.config["archive_folder"]):
                         if f.lower().endswith(".dcm"):
                             p = os.path.join(self.config["archive_folder"], f)
@@ -499,16 +486,17 @@ class RadXrReceiverApp:
         pdf_output_path = ""
         accession_no = "UNKNOWN"
         try:
-            pdf_filename = f"Report_{int(time.time())}.pdf"
-            pdf_output_path = os.path.join(self.config["receive_folder"], pdf_filename)
+            # Custom Temp PDF construction
+            temp_pdf = os.path.join(self.config["receive_folder"], f"Report_{int(time.time())}.pdf")
+            patient_id, patient_name, accession_no = self.generate_pdf_report_from_dicom(dcm_path, temp_pdf)
             
-            patient_id, patient_name, accession_no = self.generate_pdf_report_from_dicom(dcm_path, pdf_output_path)
+            # Format update: [Patient Name]'s report.pdf
+            clean_pname = "".join(x for x in patient_name if x.isalnum() or x in " -_")
+            pdf_output_path = os.path.join(self.config["receive_folder"], f"{clean_pname}'s report.pdf")
             
-            final_pdf_path = os.path.join(self.config["receive_folder"], f"Report_{accession_no}.pdf")
-            if os.path.exists(final_pdf_path):
-                os.remove(final_pdf_path)
-            os.rename(pdf_output_path, final_pdf_path)
-            pdf_output_path = final_pdf_path
+            if os.path.exists(pdf_output_path):
+                os.remove(pdf_output_path)
+            os.rename(temp_pdf, pdf_output_path)
 
             self.root.after(0, lambda: self.upsert_grid_record(patient_id, patient_name, accession_no, "⏳ Processing"))
             self.root.after(0, lambda: self.upsert_grid_record(patient_id, patient_name, accession_no, "📤 Sending"))
@@ -519,25 +507,23 @@ class RadXrReceiverApp:
                 wa_ok = self.dispatch_to_whatsapp_business(pdf_output_path, patient_id, patient_name, accession_no)
 
             if tg_ok and wa_ok:
-                # CRITICAL FIX: File is only deleted if it belongs to the Inbox cache folder!
                 in_archive = os.path.normpath(dcm_path).startswith(os.path.normpath(self.config["archive_folder"]))
-                
                 status_txt = "Archive Saved 📁" if in_archive else "Sent & Cleaned ✅"
-                self.root.after(0, lambda: self.tree.item(self.queue_data[accession_no], values=(patient_id, patient_name, accession_no, status_txt)))
+                
+                self.root.after(0, lambda: self.upsert_grid_record(patient_id, patient_name, accession_no, status_txt))
                 
                 if os.path.exists(pdf_output_path):
                     os.remove(pdf_output_path)
                     
-                # DO NOT delete if the source file is located in the archive path
                 if not in_archive and not is_manual_import and os.path.exists(dcm_path):
                     os.remove(dcm_path)
             else:
-                self.root.after(0, lambda: self.tree.item(self.queue_data[accession_no], values=(patient_id, patient_name, accession_no, "Failed ❌ (Double-Click)")))
+                self.root.after(0, lambda: self.upsert_grid_record(patient_id, patient_name, accession_no, "Failed ❌ (Double-Click)"))
                 
         except Exception as e:
-            self.root.after(0, lambda: messagebox.showerror("Pipeline Error", f"कन्वर्ट करने में दिक्कत आई:\n{str(e)}"))
+            self.root.after(0, lambda: messagebox.showerror("Pipeline Error", f"फाइल कन्वर्ट करने में दिक्कत आई:\n{str(e)}"))
             if accession_no in self.queue_data:
-                self.root.after(0, lambda: self.tree.item(self.queue_data[accession_no], values=("N/A", "N/A", accession_no, "Failed ❌")))
+                self.root.after(0, lambda: self.upsert_grid_record("N/A", "N/A", accession_no, "Failed ❌"))
 
     def upsert_grid_record(self, p_id, p_name, acc_no, status):
         if acc_no in self.queue_data:
@@ -553,10 +539,6 @@ class RadXrReceiverApp:
             f"👤 *Patient Name:* {p_name}\n"
             f"🆔 *Patient ID:* {p_id}\n"
             f"🔢 *Accession No:* {acc_no}\n\n"
-            f"⚡ *Radiation Safety Notice:*\n"
-            f"_This diagnostic study was carefully optimized using low-dose protocols to "
-            f"deliver high-fidelity diagnostic accuracy while strictly adhering to ALARA "
-            f"(As Low As Reasonably Achievable) protection principles._\n\n"
             f"❤️ *Made with love by Sandeep*"
         )
 
@@ -570,7 +552,7 @@ class RadXrReceiverApp:
                     "caption": caption_text,
                     "parse_mode": "Markdown"
                 }
-                files = {"document": document}
+                files = {"document": (os.path.basename(file_path), document, "application/pdf")}
                 res = requests.post(url, data=payload, files=files, timeout=25)
                 return res.status_code == 200
         except Exception:
@@ -613,10 +595,12 @@ class RadXrReceiverApp:
         except Exception:
             return False
 
+    def start_telegram_bot_polling(self):
+        t = threading.Thread(target=self.telegram_bot_polling_worker, daemon=True)
+        t.start()
+
     def telegram_bot_polling_worker(self):
         base_url = f"https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}"
-        print("Telegram Fetch Query Engine Online...")
-        
         while self.bot_running:
             try:
                 url = f"{base_url}/getUpdates?offset={self.last_update_id + 1}&timeout=10"
@@ -646,17 +630,24 @@ class RadXrReceiverApp:
                             lines = [line.strip() for line in text.split("\n") if line.strip()]
                             if len(lines) >= 2:
                                 query_id = lines[0]
-                                query_name = lines[1].lower() # Lowercase to force clean comparisons
+                                query_name = lines[1].lower()
                                 
                                 requests.post(f"{base_url}/sendMessage", json={"chat_id": chat_id, "text": "🔍 Matching record files in local Archive directory, Please wait..."})
                                 
                                 matched_file = self.scan_archive_for_patient_match(query_id, query_name)
                                 if matched_file:
-                                    bot_pdf_filename = f"Bot_Request_{int(time.time())}.pdf"
-                                    bot_pdf_path = os.path.join(self.config["receive_folder"], bot_pdf_filename)
                                     try:
+                                        ds_test = pydicom.dcmread(matched_file, stop_before_pixels=True)
+                                        p_name_real = str(ds_test.get("PatientName", "Report")).strip()
+                                        clean_pname = "".join(x for x in p_name_real if x.isalnum() or x in " -_")
+                                        
+                                        bot_pdf_path = os.path.join(self.config["receive_folder"], f"{clean_pname}'s report.pdf")
+                                        
                                         p_id, p_name, acc_no = self.generate_pdf_report_from_dicom(matched_file, bot_pdf_path)
                                         self.dispatch_to_telegram(bot_pdf_path, p_id, p_name, acc_no, chat_id)
+                                        
+                                        # Force ensure it stays gracefully on Live Monitor with Archive Save tag
+                                        self.root.after(0, lambda pi=p_id, pn=p_name, ac=acc_no: self.upsert_grid_record(pi, pn, ac, "Archive Saved 📁"))
                                     except Exception as ex:
                                         requests.post(f"{base_url}/sendMessage", json={"chat_id": chat_id, "text": f"❌ File processing failed structural rules: {str(ex)}"})
                                     finally:
@@ -664,26 +655,23 @@ class RadXrReceiverApp:
                                             os.remove(bot_pdf_path)
                                 else:
                                     requests.post(f"{base_url}/sendMessage", json={"chat_id": chat_id, "text": f"❌ No matching records located for ID: `{query_id}` with Name containing: `{query_name}`." , "parse_mode": "Markdown"})
-            except Exception as e:
-                print(f"Polling warning context loop: {e}")
-            time.sleep(2)
+            except Exception:
+                pass
+            time.sleep(1)
 
-    # RE-ENGINEERED SEARCH MODULE: Dynamic structural header scans
     def scan_archive_for_patient_match(self, q_id, q_name):
         archive_dir = self.config.get("archive_folder", "D:\\RAD-XR\\Archive")
         if not os.path.exists(archive_dir):
             return None
             
-        # Scans all files irrespective of their filenames (e.g., file.dcm, xyz.dcm, etc.)
         for file in os.listdir(archive_dir):
             if file.lower().endswith(".dcm"):
                 full_path = os.path.join(archive_dir, file)
                 try:
                     ds = pydicom.dcmread(full_path, stop_before_pixels=True)
                     p_id = str(ds.get("PatientID", "")).strip()
-                    p_name = str(ds.get("PatientName", "")).strip().lower() # Case-insensitive mapping
+                    p_name = str(ds.get("PatientName", "")).strip().lower()
                     
-                    # Exact ID match + Substring Name match (e.g. "sandeep" matches "Sandeep Kumar" or "SANDEEP")
                     if p_id == q_id and q_name in p_name:
                         return full_path
                 except Exception:

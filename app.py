@@ -1,6 +1,9 @@
 import os
 import sys
 from tkinter import Tk, filedialog, messagebox, ttk
+
+# PyInstaller को मजबूर करने के लिए Force Import
+import numpy as np 
 import pydicom
 from PIL import Image
 from reportlab.lib.pagesizes import letter
@@ -92,6 +95,12 @@ class DicomToPdfApp:
 
             # Extract Pixel Data and convert to Image
             pixel_array = ds.pixel_array
+            
+            # NumPy array को सही फॉर्मेट में सुनिश्चित करना
+            if pixel_array.dtype != np.uint8:
+                # Image को 8-bit में स्केल करना ताकि PIL समझ सके
+                pixel_array = ((pixel_array - pixel_array.min()) / (pixel_array.max() - pixel_array.min()) * 255).astype(np.uint8)
+            
             image = Image.fromarray(pixel_array)
 
             # Handle grayscale conversion if needed

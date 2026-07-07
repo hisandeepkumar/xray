@@ -1,37 +1,33 @@
 @echo off
-title DICOM to PDF Builder
+title RAD-XR Enterprise Builder
 echo ===================================================
-echo  DICOM to PDF - EXE installer Script
+echo  RAD-XR - DICOM Router Engine Compiler
 echo ===================================================
 echo.
 
 :: Step 1: Install Python Dependencies
-echo [1/3] Dependencies install ho rahi hain...
-pip install -r requirements.txt
+echo [1/3] Refreshing project network dependencies...
+pip install -r requirements.txt --force-reinstall
 if %errorlevel% neq 0 (
     echo.
-    echo ERROR: Python ya pip sahi se installed nahi hai ya internet disconnect hai.
+    echo ERROR: Dependency resolution failed.
     pause
     exit /b
 )
-echo Dependencies successfully install ho gayi hain.
+echo Dependencies successfully loaded.
 echo.
 
-:: Step 2: Build EXE using PyInstaller
-echo [2/3] Software ki .exe file banayi ja rahi hai...
-pyinstaller --noconsole --onefile app.py
+:: Step 2: Build Server EXE with RAD-XR Name
+echo [2/3] Compiling Binary package as RAD-XR.exe...
+pyinstaller --noconsole --onefile --name="RAD-XR" --collect-all numpy --collect-all pynetdicom --hidden-import=numpy --hidden-import=pynetdicom --hidden-import=pydicom.encoders.gdcm --hidden-import=pydicom.encoders.pylibjpeg --hidden-import=pylibjpeg --hidden-import=openjpeg app.py
 if %errorlevel% neq 0 (
     echo.
-    echo ERROR: Build process fail ho gaya.
+    echo ERROR: PyInstaller compilation crashed.
     pause
     exit /b
 )
 echo.
 
-:: Step 3: Cleanup and Finish
-echo [3/3] Build poora hua! Apni exe file check karein.
-echo Inside your folder:
-echo - 'dist' folder ke andar aapko 'app.exe' mil jayegi.
-echo - Aap 'build' folder aur 'app.spec' file ko delete kar sakte hain.
-echo.
+:: Step 3: Finished
+echo [3/3] RAD-XR System Engine Generated! Check 'dist' directory.
 pause

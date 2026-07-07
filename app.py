@@ -2,10 +2,9 @@ import os
 import sys
 from tkinter import Tk, filedialog, messagebox, ttk
 
-# Force Import for PyInstaller to bundle libraries properly
+# Force Import for PyInstaller
 import numpy as np
 import pydicom
-# Yeh import compression plugins ko trigger karne ke liye zaroori hai
 import pylibjpeg 
 from PIL import Image
 from reportlab.lib.pagesizes import letter
@@ -17,7 +16,7 @@ class DicomToPdfApp:
     def __init__(self, root):
         self.root = root
         self.root.title("DICOM to PDF Converter")
-        self.root.geometry("500x300")
+        self.root.geometry("550x320")
         self.root.resizable(False, False)
 
         # UI Styling
@@ -41,23 +40,23 @@ class DicomToPdfApp:
         frame.pack(pady=10, padx=20, fill="x")
 
         self.file_label = ttk.Label(
-            frame, text="Koi DICOM file chuni nahi gayi hai", wraplength=350
+            frame, text="No DICOM file selected", wraplength=380, font=("Arial", 10)
         )
         self.file_label.pack(side="left", padx=5)
 
         browse_btn = ttk.Button(
-            frame, text="File Chunen (Browse)", command=self.browse_file
+            frame, text="Browse File", command=self.browse_file
         )
         browse_btn.pack(side="right", padx=5)
 
         # Convert Button
         self.convert_btn = ttk.Button(
             self.root,
-            text="PDF mein Convert Karen",
+            text="Convert to PDF",
             command=self.convert_dicom_to_pdf,
             state="disabled",
         )
-        self.convert_btn.pack(pady=30, ipadx=10, ipady=5)
+        self.convert_btn.pack(pady=25, ipadx=15, ipady=5)
 
         # Footer / Status
         self.status_label = ttk.Label(
@@ -73,9 +72,7 @@ class DicomToPdfApp:
             self.dicom_path = file_path
             self.file_label.config(text=os.path.basename(file_path))
             self.convert_btn.config(state="normal")
-            self.status_label.config(
-                text="File load ho gayi hai. Convert button par click karen."
-            )
+            self.status_label.config(text="File loaded successfully. Click 'Convert to PDF'.")
 
     def convert_dicom_to_pdf(self):
         if not self.dicom_path:
@@ -89,18 +86,16 @@ class DicomToPdfApp:
             return
 
         try:
-            self.status_label.config(text="Convert ho raha hai... Kripya ruken.")
+            self.status_label.config(text="Converting... Please wait.")
             self.root.update()
 
             # 1. Read DICOM file
             ds = pydicom.dcmread(self.dicom_path)
 
             # 2. Extract Pixel Data Safely
-            # Koi bhi compressed format (JPEG Lossless etc.) ho, ye automatically decode karega
             pixel_array = ds.pixel_array
 
-            # 3. Medical Image Scaling (12/16-bit to 8-bit conversion)
-            # Iske bina image blank ya black aati hai
+            # 3. Medical Image Scaling (Keep original data resolution intact)
             if pixel_array.dtype != np.uint8:
                 p_min = pixel_array.min()
                 p_max = pixel_array.max()
@@ -109,43 +104,85 @@ class DicomToPdfApp:
                 else:
                     pixel_array = pixel_array.astype(np.uint8)
 
-            # 4. Create PIL Image
+            # 4. Create PIL Image (Maintains original pixel dimensions)
             image = Image.fromarray(pixel_array)
             if image.mode != "RGB":
                 image = image.convert("RGB")
 
-            # Temporary image path to dump raw image
-            temp_img_path = "temp_dicom_processed.jpg"
-            image.save(temp_img_path, quality=95)
+            # Save temporary file with full quality
+            temp_img_path = "temp_dicom_highres.jpg"
+            image.save(temp_img_path, quality=100, subsampling=0)
 
-            # 5. Create PDF using ReportLab
+            # 5. Initialize PDF Canvas
             c = canvas.Canvas(output_pdf_path, pagesize=letter)
             width, height = letter
 
-            # Patient Metadata info top par draw karein
-            c.setFont("Helvetica-Bold", 12)
-            patient_name = str(ds.get("PatientName", "Unknown Patient"))
-            c.drawString(50, height - 50, f"Patient Name: {patient_name}")
-            
-            # Ek separator line draw karte hain metadata ke niche
-            c.setLineWidth(1)
-            c.setStrokeColorRGB(0.8, 0.8, 0.8)
-            c.line(50, height - 65, width - 50, height - 65)
+            # 6. Extract Metadata dynamically
+            metadata = [
+                ("Patient Name", str(ds.get("PatientName", "N/A"))),
+                ("Patient ID", str(ds.get("PatientID", "N/A"))),
+                ("Patient Sex", str(ds.get("PatientSex", "N/A"))),
+                ("Birth Date", str(ds.get("PatientBirthDate", "N/A"))),
+                ("Study Date", str(ds.get("StudyDate", "N/A"))),
+                ("Institution", str(ds.get("InstitutionName", "N/A"))),
+                ("Modality", str(ds.get("Modality", "N/A"))),
+                ("Manufacturer", str(ds.get("Manufacturer", "N/A")))
+            ]
 
-            # 6. Draw Image on PDF (Centered & Well Proportioned)
-            # Image ko stretch hone se bachane ke liye width auto-scale hogi
+            # Filter out N/A entries to keep it clean
+            available_metadata = [(k, v) for k, v in metadata if v.strip() and v != "N/A"]
+
+            # 7. Draw Metadata Table on PDF
+            c.setFont("Helvetica-Bold", 14)
+            c.drawString(40, height - 40, "DICOM MEDICAL REPORT")
+            
+            c.setLineWidth(1)
+            c.setStrokeColorRGB(0.7, 0.7, 0.7)
+            c.line(40, height - 48, width - 40, height - 48)
+
+            c.setFont("Helvetica", 10)
+            y_text = height - 65
+            
+            # Print metadata in a 2-column layout to save vertical space
+            col = 0
+            for label, value in available_metadata:
+                x_pos = 40 if col == 0 else width / 2 + 10
+                c.setFont("Helvetica-Bold", 9)
+                c.drawString(x_pos, y_text, f"{label}: ")
+                c.setFont("Helvetica", 9)
+                c.drawString(x_pos + 80, y_text, value)
+                
+                if col == 1:
+                    y_text -= 15
+                    col = 0
+                else:
+                    col = 1
+            
+            if col == 1: # Adjust line if odd number of metadata items
+                y_text -= 15
+
+            # Another separator line before the image
+            c.setLineWidth(0.5)
+            c.line(40, y_text, width - 40, y_text)
+            y_text -= 15
+
+            # 8. Draw Image on PDF (Max Fit, No Aspect Ratio Distortion)
             img_w, img_h = image.size
-            display_width = width - 100 # Margins chhodkar
+            
+            # Margin left/right 40pt -> Available width = page width - 80
+            display_width = width - 80 
             display_height = (img_h / img_w) * display_width
 
-            # Agar image height page se badi ho rahi hai toh use constrain karein
-            if display_height > (height - 150):
-                display_height = height - 150
+            # If height overflows the remaining page area, scale down based on height
+            max_available_height = y_text - 40
+            if display_height > max_available_height:
+                display_height = max_available_height
                 display_width = (img_w / img_h) * display_height
 
-            # Centering calculation
+            # Horizontal Centering calculation
             x_pos = (width - display_width) / 2
-            y_pos = (height - display_height) / 2 - 20
+            # Vertical alignment inside the remaining space
+            y_pos = y_text - display_height
 
             c.drawImage(temp_img_path, x_pos, y_pos, width=display_width, height=display_height)
             
@@ -156,12 +193,12 @@ class DicomToPdfApp:
             if os.path.exists(temp_img_path):
                 os.remove(temp_img_path)
 
-            self.status_label.config(text="Safaltapoorvak convert ho gaya!")
-            messagebox.showinfo("Success", f"PDF safaltapoorvak yahan save ho gayi:\n{output_pdf_path}")
+            self.status_label.config(text="Converted successfully!")
+            messagebox.showinfo("Success", f"PDF successfully saved at:\n{output_pdf_path}")
 
         except Exception as e:
-            self.status_label.config(text="Error aaya hai.")
-            messagebox.showerror("Error", f"File convert karne mein dikkat aayi:\n{str(e)}")
+            self.status_label.config(text="Error occurred.")
+            messagebox.showerror("Error", f"Failed to convert file:\n{str(e)}")
 
 
 if __name__ == "__main__":

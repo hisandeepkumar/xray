@@ -1,74 +1,37 @@
 @echo off
-title DICOM to PDF - Setup & Build
-color 0A
-cd /d "%~dp0"
-
-echo =============================================
-echo  STEP 1: Checking for Python...
-echo =============================================
-
-:: Check if python is available
-python --version >nul 2>&1
-if errorlevel 1 (
-    echo Python not found. Trying python launcher (py)...
-    py -3 --version >nul 2>&1
-    if errorlevel 1 (
-        echo.
-        echo [ERROR] Python is NOT installed on this system.
-        echo Please install Python from python.org (Make sure to check "Add to PATH").
-        echo.
-        pause
-        exit /b
-    ) else (
-        set PYTHON_CMD=py -3
-    )
-) else (
-    set PYTHON_CMD=python
-)
-
-echo Using command: %PYTHON_CMD%
-%PYTHON_CMD% --version
+title DICOM to PDF Builder
+echo ===================================================
+echo  DICOM to PDF - EXE installer Script
+echo ===================================================
 echo.
-pause
 
-echo =============================================
-echo  STEP 2: Installing Required Libraries...
-echo =============================================
-
-%PYTHON_CMD% -m pip install --upgrade pip
-%PYTHON_CMD% -m pip install pydicom pillow img2pdf pyinstaller numpy
-
-if errorlevel 1 (
+:: Step 1: Install Python Dependencies
+echo [1/3] Dependencies install ho rahi hain...
+pip install -r requirements.txt
+if %errorlevel% neq 0 (
     echo.
-    echo [ERROR] Package installation failed. Check your internet.
+    echo ERROR: Python ya pip sahi se installed nahi hai ya internet disconnect hai.
     pause
     exit /b
 )
-
+echo Dependencies successfully install ho gayi hain.
 echo.
-echo Packages installed successfully.
-pause
 
-echo =============================================
-echo  STEP 3: Building EXE file...
-echo =============================================
-
-%PYTHON_CMD% -m PyInstaller --onefile --windowed --name "DICOMtoPDF" dicom_to_pdf_gui.py
-
-if exist dist\DICOMtoPDF.exe (
+:: Step 2: Build EXE using PyInstaller
+echo [2/3] Software ki .exe file banayi ja rahi hai...
+pyinstaller --noconsole --onefile app.py
+if %errorlevel% neq 0 (
     echo.
-    echo =============================================
-    echo  [SUCCESS] EXE created successfully!
-    echo  Location: "%~dp0dist\DICOMtoPDF.exe"
-    echo =============================================
-) else (
-    echo.
-    echo =============================================
-    echo  [FAILED] Build failed. Check errors above.
-    echo =============================================
+    echo ERROR: Build process fail ho gaya.
+    pause
+    exit /b
 )
-
 echo.
-echo Press ANY key to close this window...
-pause >nul
-exit
+
+:: Step 3: Cleanup and Finish
+echo [3/3] Build poora hua! Apni exe file check karein.
+echo Inside your folder:
+echo - 'dist' folder ke andar aapko 'app.exe' mil jayegi.
+echo - Aap 'build' folder aur 'app.spec' file ko delete kar sakte hain.
+echo.
+pause

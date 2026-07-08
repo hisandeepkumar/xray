@@ -341,13 +341,22 @@ class RadXrReceiverApp:
             self.lbl_status_indicator.config(fg=self.accent_red)
             self.btn_toggle_server.config(text="Start Server", bg=self.accent_green)
 
+    # CRITICAL FIX: Enhanced C-ECHO Verification Bindings
     def run_dicom_scp_listener(self):
         ae = AE(ae_title=self.config["ae_title"].encode('ascii'))
+        
+        # Explicit Verification (C-ECHO) context add kiya hai
+        ae.add_supported_context(sop_class.VerificationSOPClass)
+        
         for uid in sop_class.uid_to_class_name.keys():
             if len(uid) < 45: 
                 ae.add_supported_context(uid)
                 
-        handlers = [(evt.EVT_C_STORE, self.handle_incoming_c_store)]
+        # Modality connection parameters handler link
+        handlers = [
+            (evt.EVT_C_STORE, self.handle_incoming_c_store),
+            (evt.EVT_C_ECHO, self.handle_incoming_c_echo)
+        ]
         try:
             self.server_instance = ae.start_server(
                 (self.config["ip_address"], int(self.config["port"])),
@@ -360,6 +369,10 @@ class RadXrReceiverApp:
             self.is_listening = False
             self.root.after(0, lambda: messagebox.showerror("Network Binding Error", f"Socket collapse: {str(e)}"))
             self.root.after(0, self.toggle_server_process)
+
+    # C-ECHO Verification success handling
+    def handle_incoming_c_echo(self, event):
+        return 0x0000
 
     def handle_incoming_c_store(self, event):
         try:
@@ -486,11 +499,9 @@ class RadXrReceiverApp:
         pdf_output_path = ""
         accession_no = "UNKNOWN"
         try:
-            # Custom Temp PDF construction
             temp_pdf = os.path.join(self.config["receive_folder"], f"Report_{int(time.time())}.pdf")
             patient_id, patient_name, accession_no = self.generate_pdf_report_from_dicom(dcm_path, temp_pdf)
             
-            # Format update: [Patient Name]'s report.pdf
             clean_pname = "".join(x for x in patient_name if x.isalnum() or x in " -_")
             pdf_output_path = os.path.join(self.config["receive_folder"], f"{clean_pname}'s report.pdf")
             
@@ -646,7 +657,6 @@ class RadXrReceiverApp:
                                         p_id, p_name, acc_no = self.generate_pdf_report_from_dicom(matched_file, bot_pdf_path)
                                         self.dispatch_to_telegram(bot_pdf_path, p_id, p_name, acc_no, chat_id)
                                         
-                                        # Force ensure it stays gracefully on Live Monitor with Archive Save tag
                                         self.root.after(0, lambda pi=p_id, pn=p_name, ac=acc_no: self.upsert_grid_record(pi, pn, ac, "Archive Saved 📁"))
                                     except Exception as ex:
                                         requests.post(f"{base_url}/sendMessage", json={"chat_id": chat_id, "text": f"❌ File processing failed structural rules: {str(ex)}"})

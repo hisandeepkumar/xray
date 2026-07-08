@@ -341,23 +341,25 @@ class RadXrReceiverApp:
             self.lbl_status_indicator.config(fg=self.accent_red)
             self.btn_toggle_server.config(text="Start Server", bg=self.accent_green)
 
-    # CRITICAL FIX: Enhanced C-ECHO Verification Bindings
+    # ULTIMATE FIX: Requester AE Title strict rule bypassed 
     def run_dicom_scp_listener(self):
-        ae = AE(ae_title=self.config["ae_title"].encode('ascii'))
+        # Yahan ae_title ko blank/any reject filter bypass mode me set kiya hai
+        ae = AE()
         
-        # Explicit Verification (C-ECHO) context add kiya hai
+        # Explicit Verification (C-ECHO) context binding
         ae.add_supported_context(sop_class.VerificationSOPClass)
         
+        # Baki saare standard storage classes add kiye
         for uid in sop_class.uid_to_class_name.keys():
             if len(uid) < 45: 
                 ae.add_supported_context(uid)
                 
-        # Modality connection parameters handler link
         handlers = [
             (evt.EVT_C_STORE, self.handle_incoming_c_store),
             (evt.EVT_C_ECHO, self.handle_incoming_c_echo)
         ]
         try:
+            # Sabse jaruri parameter: require_calling_aet='' or start server bypass logic
             self.server_instance = ae.start_server(
                 (self.config["ip_address"], int(self.config["port"])),
                 block=False,
@@ -370,8 +372,8 @@ class RadXrReceiverApp:
             self.root.after(0, lambda: messagebox.showerror("Network Binding Error", f"Socket collapse: {str(e)}"))
             self.root.after(0, self.toggle_server_process)
 
-    # C-ECHO Verification success handling
     def handle_incoming_c_echo(self, event):
+        # Force reply standard Success status (0x0000) back to Modality
         return 0x0000
 
     def handle_incoming_c_store(self, event):

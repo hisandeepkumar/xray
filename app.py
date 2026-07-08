@@ -74,6 +74,9 @@ class RadXrReceiverApp:
         self.observer = None
         self.monitoring_active = False
         
+        # Progress tracking
+        self.indexing_in_progress = False
+        
         self.load_configuration()
         self.setup_modern_styles()
         
@@ -135,7 +138,6 @@ class RadXrReceiverApp:
         db_path = os.path.join(archive_dir, "radxr_index.db")
         conn = sqlite3.connect(db_path)
         c = conn.cursor()
-        # file_path is PRIMARY KEY to allow multiple files with same accession
         c.execute('''CREATE TABLE IF NOT EXISTS dicom_index
                      (file_path TEXT PRIMARY KEY,
                       accession TEXT,
@@ -148,65 +150,71 @@ class RadXrReceiverApp:
         conn.close()
         return db_path
 
-    def index_all_existing_files(self):
+    def index_all_existing_files(self, reindex=False):
+        """
+        Index all .dcm files in archive folder.
+        If reindex=True, drop the table and recreate.
+        """
+        if self.indexing_in_progress:
+            return
+        self.indexing_in_progress = True
         archive_dir = self.config["archive_folder"]
         if not os.path.exists(archive_dir):
+            self.indexing_in_progress = False
             return
+
         db_path = self.init_db()
         conn = sqlite3.connect(db_path)
         c = conn.cursor()
-        
-        indexed_count = 0
-        for file in os.listdir(archive_dir):
-            if not file.lower().endswith(".dcm"):
-                continue
+
+        if reindex:
+            # Drop table and recreate
+            c.execute("DROP TABLE IF EXISTS dicom_index")
+            self.init_db()  # recreate
+            conn = sqlite3.connect(db_path)
+            c = conn.cursor()
+
+        # Get all .dcm files
+        all_files = [f for f in os.listdir(archive_dir) if f.lower().endswith(".dcm")]
+        total = len(all_files)
+        processed = 0
+
+        # Update UI: show total
+        self.root.after(0, self.update_index_progress, processed, total)
+
+        for file in all_files:
             full_path = os.path.join(archive_dir, file)
             try:
-                # Check if file already indexed
-                c.execute("SELECT file_path FROM dicom_index WHERE file_path = ?", (full_path,))
-                if c.fetchone():
-                    continue
+                # Check if already indexed (skip if not reindex)
+                if not reindex:
+                    c.execute("SELECT file_path FROM dicom_index WHERE file_path = ?", (full_path,))
+                    if c.fetchone():
+                        processed += 1
+                        self.root.after(0, self.update_index_progress, processed, total)
+                        continue
                 ds = pydicom.dcmread(full_path, stop_before_pixels=True)
                 accession = str(ds.get("AccessionNumber", "UNKNOWN")).strip()
                 patient_id = str(ds.get("PatientID", "N/A")).strip()
                 patient_name = str(ds.get("PatientName", "N/A")).strip()
                 c.execute("INSERT OR IGNORE INTO dicom_index (file_path, accession, patient_id, patient_name, created_at) VALUES (?,?,?,?,?)",
                           (full_path, accession, patient_id, patient_name, int(os.path.getctime(full_path))))
-                indexed_count += 1
             except Exception as e:
                 print(f"Indexing failed for {full_path}: {e}")
+            processed += 1
+            self.root.after(0, self.update_index_progress, processed, total)
+
         conn.commit()
         conn.close()
-        print(f"Initial indexing complete: {indexed_count} files added to DB.")
+        self.indexing_in_progress = False
+        # After completion, show done message
+        self.root.after(0, self.update_index_progress, total, total, done=True)
+        print(f"Indexing complete: {processed} files indexed.")
 
-    def index_dicom_file(self, dcm_path, patient_id, patient_name, accession_no):
-        if not os.path.exists(dcm_path):
+    def update_index_progress(self, current, total, done=False):
+        if done:
+            self.lbl_index_progress.config(text=f"✅ Indexing complete: {total} files indexed.")
             return
-        db_path = os.path.join(self.config["archive_folder"], "radxr_index.db")
-        if not os.path.exists(db_path):
-            self.init_db()
-        conn = sqlite3.connect(db_path)
-        c = conn.cursor()
-        # Insert only if file_path not already present
-        c.execute("INSERT OR IGNORE INTO dicom_index (file_path, accession, patient_id, patient_name, created_at) VALUES (?,?,?,?,?)",
-                  (dcm_path, accession_no, patient_id, patient_name, int(time.time())))
-        conn.commit()
-        conn.close()
-
-    # ---------- MODIFIED: Fetch ALL matching files using LIKE for both ID and Name ----------
-    def get_patient_files_from_db(self, q_id, q_name):
-        """Return all file paths matching patient_id (substring) and patient_name (substring)"""
-        db_path = os.path.join(self.config["archive_folder"], "radxr_index.db")
-        if not os.path.exists(db_path):
-            return []
-        conn = sqlite3.connect(db_path)
-        c = conn.cursor()
-        # Use LIKE with wildcards for both fields – ensures all variations are caught
-        c.execute("SELECT file_path FROM dicom_index WHERE patient_id LIKE ? AND LOWER(patient_name) LIKE ?", 
-                  (f"%{q_id}%", f"%{q_name.lower()}%"))
-        results = c.fetchall()
-        conn.close()
-        return [row[0] for row in results]
+        self.lbl_index_progress.config(text=f"⏳ Indexing: {current} / {total} files processed...")
 
     # ---------- Folder Monitoring ----------
     def start_folder_monitor(self):
@@ -236,12 +244,37 @@ class RadXrReceiverApp:
             patient_id = str(ds.get("PatientID", "N/A")).strip()
             patient_name = str(ds.get("PatientName", "N/A")).strip()
             accession_no = str(ds.get("AccessionNumber", "UNKNOWN")).strip()
-            
             self.index_dicom_file(file_path, patient_id, patient_name, accession_no)
             self.root.after(0, lambda: self.upsert_grid_record(file_path, patient_id, patient_name, accession_no, "Archived (External) 📁"))
             print(f"✅ External DICOM indexed: {os.path.basename(file_path)}")
         except Exception as e:
             print(f"❌ Error indexing external DICOM {file_path}: {e}")
+
+    def index_dicom_file(self, dcm_path, patient_id, patient_name, accession_no):
+        if not os.path.exists(dcm_path):
+            return
+        db_path = os.path.join(self.config["archive_folder"], "radxr_index.db")
+        if not os.path.exists(db_path):
+            self.init_db()
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO dicom_index (file_path, accession, patient_id, patient_name, created_at) VALUES (?,?,?,?,?)",
+                  (dcm_path, accession_no, patient_id, patient_name, int(time.time())))
+        conn.commit()
+        conn.close()
+
+    def get_patient_files_from_db(self, q_id, q_name):
+        """Return all file paths matching patient_id (substring) and patient_name (substring)"""
+        db_path = os.path.join(self.config["archive_folder"], "radxr_index.db")
+        if not os.path.exists(db_path):
+            return []
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        c.execute("SELECT file_path FROM dicom_index WHERE patient_id LIKE ? AND LOWER(patient_name) LIKE ?", 
+                  (f"%{q_id}%", f"%{q_name.lower()}%"))
+        results = c.fetchall()
+        conn.close()
+        return [row[0] for row in results]
 
     # ---------- GUI ----------
     def show_password_screen(self):
@@ -330,7 +363,6 @@ class RadXrReceiverApp:
         queue_container = Frame(content_splitter, bg=self.bg_card)
         queue_container.pack(side="right", fill="both", expand=True)
         
-        # Grid columns: now include "File" to differentiate
         cols = ("id", "name", "accession", "file", "status")
         self.tree = ttk.Treeview(queue_container, columns=cols, show="headings")
         self.tree.heading("id", text="Patient ID")
@@ -354,7 +386,7 @@ class RadXrReceiverApp:
         
         Label(frame_receiver, text="Made with ❤️ by Sandeep", font=("Arial", 9, "bold", "italic"), fg="#6b7280", bg=self.bg_dark).pack(side="bottom", pady=5)
         
-        # Settings tab
+        # ---------- Settings Tab ----------
         Label(frame_settings, text="SYSTEM INITIALIZATION TARGETS", font=("Arial", 14, "bold"), fg=self.accent_cyan, bg=self.bg_dark).pack(pady=15)
         
         form = Frame(frame_settings, bg=self.bg_card)
@@ -390,9 +422,29 @@ class RadXrReceiverApp:
         self.ent_archive_path.pack(side="left", fill="x", expand=True, padx=5)
         self.ent_archive_path.insert(0, self.config.get("archive_folder", "D:\\RAD-XR\\Archive"))
         Button(f_dir2, text="Browse", font=("Arial", 8, "bold"), bg="#4b5563", fg=self.text_light, bd=0, command=lambda: self.pick_directory("archive_folder", self.ent_archive_path)).pack(side="left", padx=2)
+
+        # ---- NEW: Display DB Path and Indexing Progress ----
+        db_path_display = os.path.join(self.config["archive_folder"], "radxr_index.db")
+        Label(form, text="Database Path:", font=("Arial", 9, "bold"), fg=self.text_light, bg=self.bg_card).pack(anchor="w", padx=20, pady=(10,0))
+        lbl_db_path = Label(form, text=db_path_display, font=("Arial", 9), fg="#9ca3af", bg=self.bg_card, wraplength=500, justify="left")
+        lbl_db_path.pack(anchor="w", padx=20, pady=(0,5))
+        # Progress label
+        self.lbl_index_progress = Label(form, text="✅ Indexing ready.", font=("Arial", 9), fg=self.accent_green, bg=self.bg_card)
+        self.lbl_index_progress.pack(anchor="w", padx=20, pady=(5,10))
+        # Re-index button
+        Button(form, text="🔄 Re-index Archive (Full Rebuild)", font=("Arial", 9, "bold"), bg=self.accent_cyan, fg=self.bg_dark, bd=0, padx=10, pady=5, cursor="hand2", command=self.reindex_archive).pack(anchor="w", padx=20, pady=5)
         
         Button(frame_settings, text="Apply Node Topology Changes", font=("Arial", 11, "bold"), bg=self.accent_green, fg=self.bg_dark, width=28, bd=0, cursor="hand2", command=self.apply_and_save_node_settings).pack(pady=15)
         Label(frame_settings, text="Made with ❤️ by Sandeep", font=("Arial", 9, "bold", "italic"), fg="#6b7280", bg=self.bg_dark).pack(side="bottom", pady=5)
+
+    def reindex_archive(self):
+        """Manually trigger a full re-index (drop and rebuild)"""
+        if self.indexing_in_progress:
+            messagebox.showinfo("Info", "Indexing already in progress. Please wait.")
+            return
+        res = messagebox.askyesno("Confirm Re-index", "This will rebuild the entire index database. Continue?")
+        if res:
+            threading.Thread(target=self.index_all_existing_files, args=(True,), daemon=True).start()
 
     def sync_archive_folder_to_dashboard(self):
         archive_dir = self.config.get("archive_folder", "D:\\RAD-XR\\Archive")
@@ -759,7 +811,7 @@ class RadXrReceiverApp:
         except Exception:
             return False
 
-    # ---------- Telegram Bot (Multi‑File Support with LIKE matching) ----------
+    # ---------- Telegram Bot (Multi‑File Support) ----------
     def start_telegram_bot_polling(self):
         t = threading.Thread(target=self.telegram_bot_polling_worker, daemon=True)
         t.start()
@@ -797,7 +849,6 @@ class RadXrReceiverApp:
                                 query_id = lines[0]
                                 query_name = lines[1].lower()
                                 
-                                # Get ALL matching files (substring match on both fields)
                                 matched_files = self.get_patient_files_from_db(query_id, query_name)
 
                                 if matched_files:
@@ -838,7 +889,7 @@ class RadXrReceiverApp:
                                                 "text": f"❌ Error processing file {idx}: {str(ex)}"
                                             })
                                         
-                                        time.sleep(0.5)  # Rate limit
+                                        time.sleep(0.5)
                                     
                                     requests.post(f"{base_url}/sendMessage", json={
                                         "chat_id": chat_id, 

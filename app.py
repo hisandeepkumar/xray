@@ -200,19 +200,29 @@ class RadXrReceiverApp:
         conn.commit()
         conn.close()
 
-    def scan_archive_for_patient_match(self, q_id, q_name):
-        """Database से मिलान करें – O(1) Query"""
+    # ---------- नया फंक्शन: सभी मैचिंग फ़ाइलें DB से लाना (बिना LIMIT 1) ----------
+    def get_patient_files_from_db(self, q_id, q_name):
+        """
+        Patient ID और Name के आधार पर Archive DB से सभी मैचिंग DICOM files की
+        पूरी लिस्ट (file paths) return करेगा।
+        अब 'LIMIT 1' नहीं है, इसलिए एक Patient की सारी फ़ाइलें मिलेंगी।
+        """
         db_path = os.path.join(self.config["archive_folder"], "radxr_index.db")
         if not os.path.exists(db_path):
-            return None
+            return []  # अगर DB नहीं है तो खाली लिस्ट
+        
         conn = sqlite3.connect(db_path)
         c = conn.cursor()
-        # patient_id exact match और patient_name में substring (lowercase) match
-        c.execute("SELECT file_path FROM dicom_index WHERE patient_id = ? AND LOWER(patient_name) LIKE ? LIMIT 1",
+        
+        # ध्यान दें: LIMIT 1 हटा दिया गया है
+        c.execute("SELECT file_path FROM dicom_index WHERE patient_id = ? AND LOWER(patient_name) LIKE ?", 
                   (q_id, f"%{q_name.lower()}%"))
-        result = c.fetchone()
+        
+        results = c.fetchall()  # सारी rows fetch करें
         conn.close()
-        return result[0] if result else None
+        
+        # List comprehension से सिर्फ file_paths निकालें
+        return [row[0] for row in results]
 
     # ---------- Folder Monitoring Functions (Watchdog) ----------
     def start_folder_monitor(self):
@@ -414,7 +424,7 @@ class RadXrReceiverApp:
         Label(frame_settings, text="MADE WITH LOVE BY SANDEEP", font=("Arial", 9, "bold", "italic"), fg="#6b7280", bg=self.bg_dark).pack(side="bottom", pady=5)
 
     def sync_archive_folder_to_dashboard(self):
-        """Archive की फ़ाइलों को डैशबोर्ड पर दिखाएँ (पुराना तरीका) – अब बस डिस्प्ले के लिए"""
+        """Archive की फ़ाइलों को डैशबोर्ड पर दिखाएँ"""
         archive_dir = self.config.get("archive_folder", "D:\\RAD-XR\\Archive")
         if not os.path.exists(archive_dir):
             return
@@ -560,7 +570,7 @@ class RadXrReceiverApp:
         except Exception:
             return 0xC000 
 
-    # PDF Generation (same as before)
+    # PDF Generation
     def generate_pdf_report_from_dicom(self, dcm_path, output_pdf_path):
         ds = pydicom.dcmread(dcm_path)
         try:
@@ -800,7 +810,7 @@ class RadXrReceiverApp:
         except Exception:
             return False
 
-    # ---------- Telegram Bot ----------
+    # ---------- Telegram Bot (Multi-File Support) ----------
     def start_telegram_bot_polling(self):
         t = threading.Thread(target=self.telegram_bot_polling_worker, daemon=True)
         t.start()
@@ -838,27 +848,75 @@ class RadXrReceiverApp:
                                 query_id = lines[0]
                                 query_name = lines[1].lower()
                                 
-                                requests.post(f"{base_url}/sendMessage", json={"chat_id": chat_id, "text": "🔍 Searching archive index... (Lightning fast)"})
-                                
-                                matched_file = self.scan_archive_for_patient_match(query_id, query_name)
-                                if matched_file:
-                                    try:
-                                        ds_test = pydicom.dcmread(matched_file, stop_before_pixels=True)
-                                        p_name_real = str(ds_test.get("PatientName", "Report")).strip()
-                                        clean_pname = "".join(x for x in p_name_real if x.isalnum() or x in " -_")
-                                        bot_pdf_path = os.path.join(self.config["receive_folder"], f"{clean_pname}'s report.pdf")
+                                # --- NEW: Database से सभी मैचिंग फ़ाइलों की लिस्ट लें ---
+                                matched_files = self.get_patient_files_from_db(query_id, query_name)
+
+                                if matched_files:
+                                    total_files = len(matched_files)
+                                    
+                                    # यूज़र को बताएँ कि कितनी फ़ाइलें मिली हैं
+                                    requests.post(f"{base_url}/sendMessage", json={
+                                        "chat_id": chat_id, 
+                                        "text": f"🔍 आपके Patient ID के लिए **{total_files}** DICOM फ़ाइलें मिलीं। PDF बन रही हैं...",
+                                        "parse_mode": "Markdown"
+                                    })
+                                    
+                                    # हर फ़ाइल के लिए Loop चलाएँ
+                                    for idx, file_path in enumerate(matched_files, 1):
+                                        try:
+                                            # प्रोग्रेस दिखाएँ
+                                            requests.post(f"{base_url}/sendMessage", json={
+                                                "chat_id": chat_id, 
+                                                "text": f"📄 PDF {idx} / {total_files} बन रही है..."
+                                            })
+                                            
+                                            # DICOM से मेटाडेटा पढ़ें
+                                            ds_test = pydicom.dcmread(file_path, stop_before_pixels=True)
+                                            p_name_real = str(ds_test.get("PatientName", "Report")).strip()
+                                            clean_pname = "".join(x for x in p_name_real if x.isalnum() or x in " -_")
+                                            
+                                            # हर PDF का unique नाम रखें (ताकि आपस में overwrite न हों)
+                                            bot_pdf_path = os.path.join(
+                                                self.config["receive_folder"], 
+                                                f"{clean_pname}_{idx}_{int(time.time())}.pdf"
+                                            )
+                                            
+                                            # PDF Generate करें
+                                            p_id, p_name, acc_no = self.generate_pdf_report_from_dicom(file_path, bot_pdf_path)
+                                            
+                                            # Telegram पर भेजें
+                                            self.dispatch_to_telegram(bot_pdf_path, p_id, p_name, acc_no, chat_id)
+                                            
+                                            # Dashboard (GUI) पर Status Update करें
+                                            self.root.after(0, lambda pi=p_id, pn=p_name, ac=acc_no: 
+                                                            self.upsert_grid_record(pi, pn, ac, "📤 Sent via Bot (Multi)"))
+                                            
+                                            # Temporary PDF को डिलीट करें
+                                            if os.path.exists(bot_pdf_path):
+                                                os.remove(bot_pdf_path)
+                                                
+                                        except Exception as ex:
+                                            requests.post(f"{base_url}/sendMessage", json={
+                                                "chat_id": chat_id, 
+                                                "text": f"❌ फ़ाइल {idx} प्रोसेस करते समय error: {str(ex)}"
+                                            })
                                         
-                                        p_id, p_name, acc_no = self.generate_pdf_report_from_dicom(matched_file, bot_pdf_path)
-                                        self.dispatch_to_telegram(bot_pdf_path, p_id, p_name, acc_no, chat_id)
-                                        
-                                        self.root.after(0, lambda pi=p_id, pn=p_name, ac=acc_no: self.upsert_grid_record(pi, pn, ac, "Archive Saved 📁"))
-                                    except Exception as ex:
-                                        requests.post(f"{base_url}/sendMessage", json={"chat_id": chat_id, "text": f"❌ File processing failed: {str(ex)}"})
-                                    finally:
-                                        if os.path.exists(bot_pdf_path):
-                                            os.remove(bot_pdf_path)
+                                        # Telegram के Rate Limit (30 msg/sec) को ध्यान में रखते हुए थोड़ा wait करें
+                                        time.sleep(0.5)
+                                    
+                                    # सभी PDF भेजने के बाद Completion Message
+                                    requests.post(f"{base_url}/sendMessage", json={
+                                        "chat_id": chat_id, 
+                                        "text": f"✅ आपकी सभी {total_files} PDF(s) सफलतापूर्वक भेज दी गईं!"
+                                    })
+
                                 else:
-                                    requests.post(f"{base_url}/sendMessage", json={"chat_id": chat_id, "text": f"❌ No matching records located for ID: `{query_id}` with Name containing: `{query_name}`.", "parse_mode": "Markdown"})
+                                    # अगर कोई फ़ाइल न मिले
+                                    requests.post(f"{base_url}/sendMessage", json={
+                                        "chat_id": chat_id, 
+                                        "text": f"❌ Patient ID: `{query_id}` और Name: `{query_name}` के लिए कोई रिकॉर्ड नहीं मिला।",
+                                        "parse_mode": "Markdown"
+                                    })
             except Exception as e:
                 print(f"Bot polling error: {e}")
             time.sleep(1)

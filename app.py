@@ -136,12 +136,12 @@ class RadXrReceiverApp:
         for widget in self.root.winfo_children():
             widget.destroy()
 
-    # ---------- Logging ----------
+    # ---------- Logging with Immediate Flush ----------
     def log_message(self, msg):
-        """Append a message to the console log and print to stdout."""
+        """Append a message to the console log and print to stdout with flush."""
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         full_msg = f"[{timestamp}] {msg}"
-        print(full_msg)  # still print to terminal
+        print(full_msg, flush=True)  # Force flush to terminal
         if self.log_widget:
             self.log_widget.insert(END, full_msg + "\n")
             self.log_widget.see(END)
@@ -589,7 +589,7 @@ class RadXrReceiverApp:
                 else:
                     messagebox.showerror("Error", "File no longer exists.")
 
-    # ---------- SERVER START – WITH DEBUG LOGGING & AE SANITIZATION ----------
+    # ---------- SERVER START – WITH TIMEOUT AND FLUSH ----------
     def toggle_server_process(self):
         if not self.is_listening:
             port = int(self.config["port"])
@@ -626,12 +626,12 @@ class RadXrReceiverApp:
 
     def run_dicom_scp_listener(self):
         ae = AE()
-        # Sanitize AE title: replace hyphens/underscores with spaces, keep alnum/spaces
+        # Sanitize AE title
         raw_ae = self.config["ae_title"]
-        # Keep only alphanumeric, spaces, and underscores
         sanitized = ''.join(c if c.isalnum() or c in ' _' else '_' for c in raw_ae)
         ae.ae_title = sanitized
         self.log_message(f"   Sanitized AE Title: '{ae.ae_title}'")
+        
         # Add contexts
         ae.add_supported_context(sop_class.VerificationSOPClass)
         for uid in sop_class.uid_to_class_name.keys():
@@ -643,21 +643,24 @@ class RadXrReceiverApp:
             (evt.EVT_C_ECHO, self.handle_incoming_c_echo)
         ]
 
+        # Log BEFORE calling start_server
+        self.log_message("⏳ Attempting to bind to 0.0.0.0:" + self.config["port"])
+        # Flush log immediately
+        sys.stdout.flush()
+
         try:
-            self.log_message("⏳ Attempting to bind to 0.0.0.0:" + self.config["port"])
-            # Start server – this should return quickly with block=False
+            # This call may block if firewall or permission issue.
             self.server_instance = ae.start_server(
                 ("0.0.0.0", int(self.config["port"])),
                 block=False,
                 evt_handlers=handlers
             )
-            self.log_message("✅ start_server() returned successfully.")
+            self.log_message("✅ start_server() returned successfully (immediate).")
             
-            # Wait a moment for the OS to bind
-            self.log_message("⏳ Waiting 2 seconds for binding to complete...")
+            # Now verify the port is open with a timeout
+            self.log_message("⏳ Waiting 2 seconds for OS to bind...")
             time.sleep(2)
             
-            # Verify the port is actually listening
             self.log_message("🔍 Verifying port is open...")
             test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             test_sock.settimeout(3)
@@ -666,17 +669,16 @@ class RadXrReceiverApp:
                 test_sock.close()
                 self.root.after(0, self._server_started_successfully)
                 self.log_message(f"✅ DICOM server is LISTENING on port {self.config['port']}")
-                # Keep the thread alive while listening flag is True
                 while self.is_listening:
                     time.sleep(0.5)
             except Exception as conn_err:
-                # Connection refused – server not listening
                 self.log_message(f"❌ Verification connection failed: {conn_err}")
                 self.root.after(0, self._server_failed_to_start, f"Port {self.config['port']} is NOT open. Error: {conn_err}")
                 return
         except Exception as e:
+            # If start_server throws an exception, we catch it here.
+            self.log_message(f"❌ Server start exception (immediate): {e}")
             self.root.after(0, self._server_failed_to_start, str(e))
-            self.log_message(f"❌ Server start exception: {e}")
 
     def _server_started_successfully(self):
         self.status_var.set("● Listening")

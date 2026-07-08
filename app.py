@@ -634,7 +634,7 @@ class RadXrReceiverApp:
         
         try:
             # 1. Verification (C-ECHO) support
-            ae.add_supported_context(sop_class.VerificationSOPClass)
+            ae.add_supported_context("1.2.840.10008.1.1")  # Verification SOP Class UID
             
             # 2. Sirf zaroori common Storage SOP Classes ko add karein jo RAD-XR ke liye chahiye
             # (Isse pynetdicom crash nahi hoga aur server turant start ho jayega)

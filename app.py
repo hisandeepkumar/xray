@@ -4,6 +4,8 @@ import socket
 import json
 import threading
 import time
+import shutil
+import sqlite3
 from tkinter import Tk, Label, Entry, Button, StringVar, messagebox, ttk, filedialog, Frame
 import numpy as np
 import pydicom
@@ -14,7 +16,29 @@ import requests
 
 from pynetdicom import AE, evt, sop_class
 
+# Watchdog Libraries for Folder Monitoring
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+
 CONFIG_FILE = "rad_xr_config.json"
+
+class DicomArchiveHandler(FileSystemEventHandler):
+    """Archive Folder में नई DICOM आने पर इसे पकड़ने के लिए Handler"""
+    def __init__(self, app_instance):
+        self.app = app_instance
+
+    def on_created(self, event):
+        # जब कोई नई फ़ाइल बने (Create हो)
+        if not event.is_directory and event.src_path.lower().endswith('.dcm'):
+            # थोड़ा सा wait करें ताकि फ़ाइल पूरी तरह Write हो जाए
+            time.sleep(0.5)
+            threading.Thread(target=self.app.handle_new_external_dicom, args=(event.src_path,), daemon=True).start()
+
+    def on_moved(self, event):
+        # जब कोई फ़ाइल कहीं से Move करके इस फोल्डर में आए
+        if not event.is_directory and event.dest_path.lower().endswith('.dcm'):
+            time.sleep(0.5)
+            threading.Thread(target=self.app.handle_new_external_dicom, args=(event.dest_path,), daemon=True).start()
 
 class RadXrReceiverApp:
     def __init__(self, root):
@@ -50,6 +74,10 @@ class RadXrReceiverApp:
         self.queue_data = {} 
         self.last_update_id = 0
         
+        # Folder Watcher के लिए
+        self.observer = None
+        self.monitoring_active = False
+        
         self.load_configuration()
         self.setup_modern_styles()
         
@@ -57,7 +85,11 @@ class RadXrReceiverApp:
             self.show_password_screen()
         else:
             self.show_main_dashboard()
+            # सारी मौजूदा फ़ाइलों को इंडेक्स करें (बैकग्राउंड में)
+            threading.Thread(target=self.index_all_existing_files, daemon=True).start()
             self.sync_archive_folder_to_dashboard()
+            # Archive Folder पर नज़र रखना शुरू करें
+            self.start_folder_monitor()
             self.start_telegram_bot_polling()
 
     def get_local_ip(self):
@@ -102,6 +134,138 @@ class RadXrReceiverApp:
         for widget in self.root.winfo_children():
             widget.destroy()
 
+    # ---------- SQLite Database Functions ----------
+    def init_db(self):
+        """Archive folder में SQLite DB बनाएँ / कनेक्ट करें"""
+        archive_dir = self.config["archive_folder"]
+        os.makedirs(archive_dir, exist_ok=True)
+        db_path = os.path.join(archive_dir, "radxr_index.db")
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS dicom_index
+                     (accession TEXT PRIMARY KEY,
+                      patient_id TEXT,
+                      patient_name TEXT,
+                      file_path TEXT UNIQUE,
+                      created_at INTEGER)''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_patient_name ON dicom_index (patient_name)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_patient_id ON dicom_index (patient_id)')
+        conn.commit()
+        conn.close()
+        return db_path
+
+    def index_all_existing_files(self):
+        """Archive folder की सभी .dcm फ़ाइलों को DB में डालें (पहली बार)"""
+        archive_dir = self.config["archive_folder"]
+        if not os.path.exists(archive_dir):
+            return
+        db_path = self.init_db()
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        
+        indexed_count = 0
+        for file in os.listdir(archive_dir):
+            if not file.lower().endswith(".dcm"):
+                continue
+            full_path = os.path.join(archive_dir, file)
+            try:
+                # पहले check करें कि यह file_path DB में पहले से तो नहीं
+                c.execute("SELECT accession FROM dicom_index WHERE file_path = ?", (full_path,))
+                if c.fetchone():
+                    continue
+                ds = pydicom.dcmread(full_path, stop_before_pixels=True)
+                accession = str(ds.get("AccessionNumber", "UNKNOWN")).strip()
+                patient_id = str(ds.get("PatientID", "N/A")).strip()
+                patient_name = str(ds.get("PatientName", "N/A")).strip()
+                c.execute("INSERT OR REPLACE INTO dicom_index (accession, patient_id, patient_name, file_path, created_at) VALUES (?,?,?,?,?)",
+                          (accession, patient_id, patient_name, full_path, int(os.path.getctime(full_path))))
+                indexed_count += 1
+            except Exception as e:
+                print(f"Indexing failed for {full_path}: {e}")
+        conn.commit()
+        conn.close()
+        print(f"Initial indexing complete: {indexed_count} files added to DB.")
+
+    def index_dicom_file(self, dcm_path, patient_id, patient_name, accession_no):
+        """किसी एक DICOM file का record DB में डालें/अपडेट करें"""
+        if not os.path.exists(dcm_path):
+            return
+        db_path = os.path.join(self.config["archive_folder"], "radxr_index.db")
+        if not os.path.exists(db_path):
+            self.init_db()
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        c.execute("INSERT OR REPLACE INTO dicom_index (accession, patient_id, patient_name, file_path, created_at) VALUES (?,?,?,?,?)",
+                  (accession_no, patient_id, patient_name, dcm_path, int(time.time())))
+        conn.commit()
+        conn.close()
+
+    def scan_archive_for_patient_match(self, q_id, q_name):
+        """Database से मिलान करें – O(1) Query"""
+        db_path = os.path.join(self.config["archive_folder"], "radxr_index.db")
+        if not os.path.exists(db_path):
+            return None
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        # patient_id exact match और patient_name में substring (lowercase) match
+        c.execute("SELECT file_path FROM dicom_index WHERE patient_id = ? AND LOWER(patient_name) LIKE ? LIMIT 1",
+                  (q_id, f"%{q_name.lower()}%"))
+        result = c.fetchone()
+        conn.close()
+        return result[0] if result else None
+
+    # ---------- Folder Monitoring Functions (Watchdog) ----------
+    def start_folder_monitor(self):
+        """Archive Folder पर नज़र रखना शुरू करें"""
+        archive_dir = self.config["archive_folder"]
+        os.makedirs(archive_dir, exist_ok=True)
+        
+        # अगर पहले से चल रहा है तो पहले बंद करें
+        if self.observer and self.monitoring_active:
+            self.stop_folder_monitor()
+            
+        self.observer = Observer()
+        event_handler = DicomArchiveHandler(self)
+        self.observer.schedule(event_handler, path=archive_dir, recursive=False)
+        self.observer.start()
+        self.monitoring_active = True
+        print(f"📁 Watching Archive folder: {archive_dir}")
+
+    def stop_folder_monitor(self):
+        """Folder Watch बंद करें"""
+        if self.observer:
+            self.observer.stop()
+            self.observer.join()
+            self.monitoring_active = False
+            print("📁 Folder monitoring stopped.")
+
+    def handle_new_external_dicom(self, file_path):
+        """
+        जब बाहरी App (या कोई और) Archive folder में नई DICOM डाले,
+        तो यह फंक्शन उसे Index करेगा और Dashboard पर दिखाएगा।
+        """
+        try:
+            # फ़ाइल मौजूद है या नहीं
+            if not os.path.exists(file_path):
+                return
+            
+            # DICOM पढ़ें (सिर्फ मेटाडेटा)
+            ds = pydicom.dcmread(file_path, stop_before_pixels=True)
+            patient_id = str(ds.get("PatientID", "N/A")).strip()
+            patient_name = str(ds.get("PatientName", "N/A")).strip()
+            accession_no = str(ds.get("AccessionNumber", "UNKNOWN")).strip()
+            
+            # Database में Index करें
+            self.index_dicom_file(file_path, patient_id, patient_name, accession_no)
+            
+            # Dashboard (Treeview) पर दिखाएँ
+            self.root.after(0, lambda: self.upsert_grid_record(patient_id, patient_name, accession_no, "Archived (External) 📁"))
+            print(f"✅ External DICOM indexed: {accession_no} - {patient_name}")
+            
+        except Exception as e:
+            print(f"❌ Error indexing external DICOM {file_path}: {e}")
+
+    # ---------- GUI Functions ----------
     def show_password_screen(self):
         self.clear_screen()
         main_card = Frame(self.root, bg=self.bg_card, bd=0)
@@ -125,7 +289,9 @@ class RadXrReceiverApp:
             self.save_configuration()
             messagebox.showinfo("Success", "RAD-XR Node Authenticated!")
             self.show_main_dashboard()
+            threading.Thread(target=self.index_all_existing_files, daemon=True).start()
             self.sync_archive_folder_to_dashboard()
+            self.start_folder_monitor()
             self.start_telegram_bot_polling()
         else:
             messagebox.showerror("Error", "Invalid Security Master Password!")
@@ -177,6 +343,10 @@ class RadXrReceiverApp:
         self.lbl_port = add_stat_lbl(net_card, "PORT NUMBER", "port")
         self.lbl_folder = add_stat_lbl(net_card, "INBOX DIRECTORY", "receive_folder")
         self.lbl_archive = add_stat_lbl(net_card, "ARCHIVE SYSTEM", "archive_folder")
+        
+        # Status for Watcher
+        Label(net_card, text="📁 FOLDER WATCH", font=("Arial", 8, "bold"), fg=self.accent_green if self.monitoring_active else self.accent_red, bg=self.bg_card).pack(anchor="w", padx=15, pady=(10,0))
+        Label(net_card, text="ACTIVE" if self.monitoring_active else "INACTIVE", font=("Arial", 9, "bold"), fg=self.accent_green if self.monitoring_active else self.accent_red, bg=self.bg_card).pack(anchor="w", padx=15, pady=(0, 10))
         
         Button(net_card, text="Refresh Dashboard", font=("Arial", 8, "bold"), bg="#4b5563", fg=self.text_light, bd=0, width=20, cursor="hand2", command=self.sync_archive_folder_to_dashboard).pack(side="bottom", pady=20)
         
@@ -244,6 +414,7 @@ class RadXrReceiverApp:
         Label(frame_settings, text="MADE WITH LOVE BY SANDEEP", font=("Arial", 9, "bold", "italic"), fg="#6b7280", bg=self.bg_dark).pack(side="bottom", pady=5)
 
     def sync_archive_folder_to_dashboard(self):
+        """Archive की फ़ाइलों को डैशबोर्ड पर दिखाएँ (पुराना तरीका) – अब बस डिस्प्ले के लिए"""
         archive_dir = self.config.get("archive_folder", "D:\\RAD-XR\\Archive")
         if not os.path.exists(archive_dir):
             return
@@ -270,6 +441,9 @@ class RadXrReceiverApp:
             entry_widget.insert(0, os.path.normpath(selected_dir))
 
     def apply_and_save_node_settings(self):
+        # पुराना Archive folder बंद करें
+        self.stop_folder_monitor()
+        
         self.config["institute_name"] = self.ent_inst_name.get().strip().upper()
         self.config["whatsapp_api_key"] = self.ent_wa_key.get().strip()
         self.config["ae_title"] = self.ent_ae_title.get().strip()
@@ -282,6 +456,8 @@ class RadXrReceiverApp:
         messagebox.showinfo("System Config", "RAD-XR Core configurations updated successfully!")
         self.show_main_dashboard()
         self.sync_archive_folder_to_dashboard()
+        threading.Thread(target=self.index_all_existing_files, daemon=True).start()
+        self.start_folder_monitor()  # नए Archive folder पर Watch शुरू करें
 
     def manual_file_upload_trigger(self):
         file_path = filedialog.askopenfilename(filetypes=[("DICOM Files", "*.dcm"), ("All Files", "*.*")])
@@ -341,15 +517,10 @@ class RadXrReceiverApp:
             self.lbl_status_indicator.config(fg=self.accent_red)
             self.btn_toggle_server.config(text="Start Server", bg=self.accent_green)
 
-    # ULTIMATE FIX: Requester AE Title strict rule bypassed 
+    # DICOM SCP Listener
     def run_dicom_scp_listener(self):
-        # Yahan ae_title ko blank/any reject filter bypass mode me set kiya hai
         ae = AE()
-        
-        # Explicit Verification (C-ECHO) context binding
         ae.add_supported_context(sop_class.VerificationSOPClass)
-        
-        # Baki saare standard storage classes add kiye
         for uid in sop_class.uid_to_class_name.keys():
             if len(uid) < 45: 
                 ae.add_supported_context(uid)
@@ -359,21 +530,19 @@ class RadXrReceiverApp:
             (evt.EVT_C_ECHO, self.handle_incoming_c_echo)
         ]
         try:
-            # Sabse jaruri parameter: require_calling_aet='' or start server bypass logic
             self.server_instance = ae.start_server(
                 (self.config["ip_address"], int(self.config["port"])),
                 block=False,
                 evt_handlers=handlers
             )
             while self.is_listening:
-                pass
+                time.sleep(0.1)
         except Exception as e:
             self.is_listening = False
             self.root.after(0, lambda: messagebox.showerror("Network Binding Error", f"Socket collapse: {str(e)}"))
             self.root.after(0, self.toggle_server_process)
 
     def handle_incoming_c_echo(self, event):
-        # Force reply standard Success status (0x0000) back to Modality
         return 0x0000
 
     def handle_incoming_c_store(self, event):
@@ -391,6 +560,7 @@ class RadXrReceiverApp:
         except Exception:
             return 0xC000 
 
+    # PDF Generation (same as before)
     def generate_pdf_report_from_dicom(self, dcm_path, output_pdf_path):
         ds = pydicom.dcmread(dcm_path)
         try:
@@ -497,12 +667,36 @@ class RadXrReceiverApp:
         c.save()
         return patient_id, patient_name, accession_no
 
+    # ---------- Main Processing Pipeline ----------
     def autonomous_processing_pipeline(self, dcm_path, is_manual_import=False):
+        """
+        DICOM को प्रोसेस करें, Archive में Copy करें, Index करें, PDF भेजें।
+        """
         pdf_output_path = ""
         accession_no = "UNKNOWN"
         try:
+            # DICOM पढ़ें
+            ds = pydicom.dcmread(dcm_path)
+            patient_id = str(ds.get("PatientID", "N/A")).strip()
+            patient_name = str(ds.get("PatientName", "N/A")).strip()
+            accession_no = str(ds.get("AccessionNumber", "UNKNOWN")).strip()
+
+            # 1. फ़ाइल को Archive folder में कॉपी करें (अगर पहले से नहीं है)
+            archive_dir = self.config["archive_folder"]
+            os.makedirs(archive_dir, exist_ok=True)
+            archive_dest = os.path.join(archive_dir, os.path.basename(dcm_path))
+            if os.path.normpath(dcm_path) != os.path.normpath(archive_dest):
+                shutil.copy2(dcm_path, archive_dest)
+                dcm_path_for_index = archive_dest
+            else:
+                dcm_path_for_index = dcm_path
+
+            # 2. डेटाबेस में Index करें
+            self.index_dicom_file(dcm_path_for_index, patient_id, patient_name, accession_no)
+
+            # 3. PDF बनाएँ
             temp_pdf = os.path.join(self.config["receive_folder"], f"Report_{int(time.time())}.pdf")
-            patient_id, patient_name, accession_no = self.generate_pdf_report_from_dicom(dcm_path, temp_pdf)
+            self.generate_pdf_report_from_dicom(dcm_path_for_index, temp_pdf)
             
             clean_pname = "".join(x for x in patient_name if x.isalnum() or x in " -_")
             pdf_output_path = os.path.join(self.config["receive_folder"], f"{clean_pname}'s report.pdf")
@@ -511,30 +705,28 @@ class RadXrReceiverApp:
                 os.remove(pdf_output_path)
             os.rename(temp_pdf, pdf_output_path)
 
+            # UI Update
             self.root.after(0, lambda: self.upsert_grid_record(patient_id, patient_name, accession_no, "⏳ Processing"))
             self.root.after(0, lambda: self.upsert_grid_record(patient_id, patient_name, accession_no, "📤 Sending"))
             
+            # 4. Telegram & WhatsApp भेजें
             tg_ok = self.dispatch_to_telegram(pdf_output_path, patient_id, patient_name, accession_no, self.TELEGRAM_CHAT_ID)
             wa_ok = True
             if self.config["whatsapp_api_key"]:
                 wa_ok = self.dispatch_to_whatsapp_business(pdf_output_path, patient_id, patient_name, accession_no)
 
+            # 5. परिणाम
             if tg_ok and wa_ok:
-                in_archive = os.path.normpath(dcm_path).startswith(os.path.normpath(self.config["archive_folder"]))
-                status_txt = "Archive Saved 📁" if in_archive else "Sent & Cleaned ✅"
-                
-                self.root.after(0, lambda: self.upsert_grid_record(patient_id, patient_name, accession_no, status_txt))
-                
+                self.root.after(0, lambda: self.upsert_grid_record(patient_id, patient_name, accession_no, "Sent & Archived ✅"))
                 if os.path.exists(pdf_output_path):
                     os.remove(pdf_output_path)
-                    
-                if not in_archive and not is_manual_import and os.path.exists(dcm_path):
+                if not is_manual_import and os.path.exists(dcm_path) and os.path.normpath(dcm_path) != os.path.normpath(archive_dest):
                     os.remove(dcm_path)
             else:
                 self.root.after(0, lambda: self.upsert_grid_record(patient_id, patient_name, accession_no, "Failed ❌ (Double-Click)"))
                 
         except Exception as e:
-            self.root.after(0, lambda: messagebox.showerror("Pipeline Error", f"फाइल कन्वर्ट करने में दिक्कत आई:\n{str(e)}"))
+            self.root.after(0, lambda: messagebox.showerror("Pipeline Error", f"Error: {str(e)}"))
             if accession_no in self.queue_data:
                 self.root.after(0, lambda: self.upsert_grid_record("N/A", "N/A", accession_no, "Failed ❌"))
 
@@ -608,6 +800,7 @@ class RadXrReceiverApp:
         except Exception:
             return False
 
+    # ---------- Telegram Bot ----------
     def start_telegram_bot_polling(self):
         t = threading.Thread(target=self.telegram_bot_polling_worker, daemon=True)
         t.start()
@@ -645,7 +838,7 @@ class RadXrReceiverApp:
                                 query_id = lines[0]
                                 query_name = lines[1].lower()
                                 
-                                requests.post(f"{base_url}/sendMessage", json={"chat_id": chat_id, "text": "🔍 Matching record files in local Archive directory, Please wait..."})
+                                requests.post(f"{base_url}/sendMessage", json={"chat_id": chat_id, "text": "🔍 Searching archive index... (Lightning fast)"})
                                 
                                 matched_file = self.scan_archive_for_patient_match(query_id, query_name)
                                 if matched_file:
@@ -653,7 +846,6 @@ class RadXrReceiverApp:
                                         ds_test = pydicom.dcmread(matched_file, stop_before_pixels=True)
                                         p_name_real = str(ds_test.get("PatientName", "Report")).strip()
                                         clean_pname = "".join(x for x in p_name_real if x.isalnum() or x in " -_")
-                                        
                                         bot_pdf_path = os.path.join(self.config["receive_folder"], f"{clean_pname}'s report.pdf")
                                         
                                         p_id, p_name, acc_no = self.generate_pdf_report_from_dicom(matched_file, bot_pdf_path)
@@ -661,34 +853,15 @@ class RadXrReceiverApp:
                                         
                                         self.root.after(0, lambda pi=p_id, pn=p_name, ac=acc_no: self.upsert_grid_record(pi, pn, ac, "Archive Saved 📁"))
                                     except Exception as ex:
-                                        requests.post(f"{base_url}/sendMessage", json={"chat_id": chat_id, "text": f"❌ File processing failed structural rules: {str(ex)}"})
+                                        requests.post(f"{base_url}/sendMessage", json={"chat_id": chat_id, "text": f"❌ File processing failed: {str(ex)}"})
                                     finally:
                                         if os.path.exists(bot_pdf_path):
                                             os.remove(bot_pdf_path)
                                 else:
-                                    requests.post(f"{base_url}/sendMessage", json={"chat_id": chat_id, "text": f"❌ No matching records located for ID: `{query_id}` with Name containing: `{query_name}`." , "parse_mode": "Markdown"})
-            except Exception:
-                pass
+                                    requests.post(f"{base_url}/sendMessage", json={"chat_id": chat_id, "text": f"❌ No matching records located for ID: `{query_id}` with Name containing: `{query_name}`.", "parse_mode": "Markdown"})
+            except Exception as e:
+                print(f"Bot polling error: {e}")
             time.sleep(1)
-
-    def scan_archive_for_patient_match(self, q_id, q_name):
-        archive_dir = self.config.get("archive_folder", "D:\\RAD-XR\\Archive")
-        if not os.path.exists(archive_dir):
-            return None
-            
-        for file in os.listdir(archive_dir):
-            if file.lower().endswith(".dcm"):
-                full_path = os.path.join(archive_dir, file)
-                try:
-                    ds = pydicom.dcmread(full_path, stop_before_pixels=True)
-                    p_id = str(ds.get("PatientID", "")).strip()
-                    p_name = str(ds.get("PatientName", "")).strip().lower()
-                    
-                    if p_id == q_id and q_name in p_name:
-                        return full_path
-                except Exception:
-                    continue
-        return None
 
 if __name__ == "__main__":
     root = Tk()

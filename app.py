@@ -76,6 +76,8 @@ class RadXrReceiverApp:
         
         # Progress tracking
         self.indexing_in_progress = False
+        self.lbl_index_progress_monitor = None  # Will be set in UI
+        self.lbl_index_progress_config = None
         
         self.load_configuration()
         self.setup_modern_styles()
@@ -151,10 +153,6 @@ class RadXrReceiverApp:
         return db_path
 
     def index_all_existing_files(self, reindex=False):
-        """
-        Index all .dcm files in archive folder.
-        If reindex=True, drop the table and recreate.
-        """
         if self.indexing_in_progress:
             return
         self.indexing_in_progress = True
@@ -168,24 +166,21 @@ class RadXrReceiverApp:
         c = conn.cursor()
 
         if reindex:
-            # Drop table and recreate
             c.execute("DROP TABLE IF EXISTS dicom_index")
             self.init_db()  # recreate
             conn = sqlite3.connect(db_path)
             c = conn.cursor()
 
-        # Get all .dcm files
         all_files = [f for f in os.listdir(archive_dir) if f.lower().endswith(".dcm")]
         total = len(all_files)
         processed = 0
 
-        # Update UI: show total
+        # Update UI progress (both monitor and config labels)
         self.root.after(0, self.update_index_progress, processed, total)
 
         for file in all_files:
             full_path = os.path.join(archive_dir, file)
             try:
-                # Check if already indexed (skip if not reindex)
                 if not reindex:
                     c.execute("SELECT file_path FROM dicom_index WHERE file_path = ?", (full_path,))
                     if c.fetchone():
@@ -206,15 +201,20 @@ class RadXrReceiverApp:
         conn.commit()
         conn.close()
         self.indexing_in_progress = False
-        # After completion, show done message
         self.root.after(0, self.update_index_progress, total, total, done=True)
         print(f"Indexing complete: {processed} files indexed.")
 
     def update_index_progress(self, current, total, done=False):
+        """Update progress labels on both tabs"""
         if done:
-            self.lbl_index_progress.config(text=f"✅ Indexing complete: {total} files indexed.")
-            return
-        self.lbl_index_progress.config(text=f"⏳ Indexing: {current} / {total} files processed...")
+            text = f"✅ Indexing complete: {total} files indexed."
+        else:
+            text = f"⏳ Indexing: {current} / {total} files processed..."
+        # Update monitor label if exists
+        if self.lbl_index_progress_monitor:
+            self.lbl_index_progress_monitor.config(text=text)
+        if self.lbl_index_progress_config:
+            self.lbl_index_progress_config.config(text=text)
 
     # ---------- Folder Monitoring ----------
     def start_folder_monitor(self):
@@ -264,7 +264,6 @@ class RadXrReceiverApp:
         conn.close()
 
     def get_patient_files_from_db(self, q_id, q_name):
-        """Return all file paths matching patient_id (substring) and patient_name (substring)"""
         db_path = os.path.join(self.config["archive_folder"], "radxr_index.db")
         if not os.path.exists(db_path):
             return []
@@ -318,6 +317,7 @@ class RadXrReceiverApp:
         notebook.add(frame_receiver, text="  Live Monitor  ")
         notebook.add(frame_settings, text="  Config Control  ")
         
+        # ----- Live Monitor Tab -----
         top_ctrl_bar = Frame(frame_receiver, bg=self.bg_dark)
         top_ctrl_bar.pack(fill="x", pady=15, padx=15)
         
@@ -384,9 +384,14 @@ class RadXrReceiverApp:
         self.tree.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
         
-        Label(frame_receiver, text="Made with ❤️ by Sandeep", font=("Arial", 9, "bold", "italic"), fg="#6b7280", bg=self.bg_dark).pack(side="bottom", pady=5)
+        # ---- Live Monitor progress label (bottom) ----
+        progress_frame = Frame(frame_receiver, bg=self.bg_dark)
+        progress_frame.pack(fill="x", padx=15, pady=5)
+        self.lbl_index_progress_monitor = Label(progress_frame, text="✅ Indexing ready.", font=("Arial", 9), fg=self.accent_green, bg=self.bg_dark)
+        self.lbl_index_progress_monitor.pack(side="left")
+        Label(progress_frame, text="Made with ❤️ by Sandeep", font=("Arial", 9, "bold", "italic"), fg="#6b7280", bg=self.bg_dark).pack(side="right")
         
-        # ---------- Settings Tab ----------
+        # ----- Config Control Tab -----
         Label(frame_settings, text="SYSTEM INITIALIZATION TARGETS", font=("Arial", 14, "bold"), fg=self.accent_cyan, bg=self.bg_dark).pack(pady=15)
         
         form = Frame(frame_settings, bg=self.bg_card)
@@ -423,22 +428,31 @@ class RadXrReceiverApp:
         self.ent_archive_path.insert(0, self.config.get("archive_folder", "D:\\RAD-XR\\Archive"))
         Button(f_dir2, text="Browse", font=("Arial", 8, "bold"), bg="#4b5563", fg=self.text_light, bd=0, command=lambda: self.pick_directory("archive_folder", self.ent_archive_path)).pack(side="left", padx=2)
 
-        # ---- NEW: Display DB Path and Indexing Progress ----
-        db_path_display = os.path.join(self.config["archive_folder"], "radxr_index.db")
-        Label(form, text="Database Path:", font=("Arial", 9, "bold"), fg=self.text_light, bg=self.bg_card).pack(anchor="w", padx=20, pady=(10,0))
-        lbl_db_path = Label(form, text=db_path_display, font=("Arial", 9), fg="#9ca3af", bg=self.bg_card, wraplength=500, justify="left")
-        lbl_db_path.pack(anchor="w", padx=20, pady=(0,5))
-        # Progress label
-        self.lbl_index_progress = Label(form, text="✅ Indexing ready.", font=("Arial", 9), fg=self.accent_green, bg=self.bg_card)
-        self.lbl_index_progress.pack(anchor="w", padx=20, pady=(5,10))
+        # ---- Database path display with copy button ----
+        db_path = os.path.join(self.config["archive_folder"], "radxr_index.db")
+        db_frame = Frame(form, bg=self.bg_card)
+        db_frame.pack(fill="x", pady=5, padx=20)
+        Label(db_frame, text="Database Path:", font=("Arial", 9, "bold"), fg=self.text_light, bg=self.bg_card).pack(anchor="w")
+        lbl_db_path = Label(db_frame, text=db_path, font=("Arial", 9), fg="#9ca3af", bg=self.bg_card, wraplength=500, justify="left")
+        lbl_db_path.pack(anchor="w", side="left")
+        Button(db_frame, text="📋 Copy Path", font=("Arial", 8, "bold"), bg="#4b5563", fg=self.text_light, bd=0, padx=5, pady=2, cursor="hand2",
+               command=lambda: self.copy_to_clipboard(db_path)).pack(side="left", padx=10)
+
+        # Progress label (config tab)
+        self.lbl_index_progress_config = Label(form, text="✅ Indexing ready.", font=("Arial", 9), fg=self.accent_green, bg=self.bg_card)
+        self.lbl_index_progress_config.pack(anchor="w", padx=20, pady=(5,10))
         # Re-index button
         Button(form, text="🔄 Re-index Archive (Full Rebuild)", font=("Arial", 9, "bold"), bg=self.accent_cyan, fg=self.bg_dark, bd=0, padx=10, pady=5, cursor="hand2", command=self.reindex_archive).pack(anchor="w", padx=20, pady=5)
         
         Button(frame_settings, text="Apply Node Topology Changes", font=("Arial", 11, "bold"), bg=self.accent_green, fg=self.bg_dark, width=28, bd=0, cursor="hand2", command=self.apply_and_save_node_settings).pack(pady=15)
         Label(frame_settings, text="Made with ❤️ by Sandeep", font=("Arial", 9, "bold", "italic"), fg="#6b7280", bg=self.bg_dark).pack(side="bottom", pady=5)
 
+    def copy_to_clipboard(self, text):
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        messagebox.showinfo("Copied", f"Path copied to clipboard:\n{text}")
+
     def reindex_archive(self):
-        """Manually trigger a full re-index (drop and rebuild)"""
         if self.indexing_in_progress:
             messagebox.showinfo("Info", "Indexing already in progress. Please wait.")
             return
@@ -527,6 +541,15 @@ class RadXrReceiverApp:
 
     def toggle_server_process(self):
         if not self.is_listening:
+            # Check if port is free
+            port = int(self.config["port"])
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            result = sock.connect_ex(('0.0.0.0', port))
+            sock.close()
+            if result == 0:
+                messagebox.showerror("Port Error", f"Port {port} is already in use. Please close other applications or change the port.")
+                return
+
             os.makedirs(self.config["receive_folder"], exist_ok=True)
             os.makedirs(self.config["archive_folder"], exist_ok=True)
             self.is_listening = True
@@ -554,17 +577,23 @@ class RadXrReceiverApp:
             (evt.EVT_C_ECHO, self.handle_incoming_c_echo)
         ]
         try:
+            # Bind to all interfaces (0.0.0.0) and use the configured port
             self.server_instance = ae.start_server(
-                (self.config["ip_address"], int(self.config["port"])),
+                ("0.0.0.0", int(self.config["port"])),
                 block=False,
                 evt_handlers=handlers
             )
+            # Update UI with actual listening IP
+            local_ip = self.get_local_ip()
+            self.root.after(0, lambda: self.lbl_ip.config(text=local_ip))
+            print(f"✅ DICOM Server listening on {local_ip}:{self.config['port']} (AE: {self.config['ae_title']})")
             while self.is_listening:
                 time.sleep(0.1)
         except Exception as e:
             self.is_listening = False
-            self.root.after(0, lambda: messagebox.showerror("Network Binding Error", f"Socket collapse: {str(e)}"))
-            self.root.after(0, self.toggle_server_process)
+            self.root.after(0, lambda: messagebox.showerror("Server Error", f"Failed to start DICOM server:\n{str(e)}\n\nMake sure port {self.config['port']} is free and you have admin rights."))
+            self.root.after(0, self.toggle_server_process)  # Turn off
+            print(f"❌ DICOM Server error: {e}")
 
     def handle_incoming_c_echo(self, event):
         return 0x0000

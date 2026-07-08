@@ -624,9 +624,11 @@ class RadXrReceiverApp:
             self.btn_toggle_server.config(text="Start Server", bg=self.accent_green)
             self.log_message("⏹️ Server stopped by user.")
 
-    def run_dicom_scp_listener(self):
+     def run_dicom_scp_listener(self):
         ae = AE()
-        ae.ae_title = self.config["ae_title"]
+        # Use a simple AE title without hyphen to avoid potential issues
+        ae.ae_title = self.config["ae_title"].replace("-", "_")  # e.g., RAD_XR
+        self.log_message(f"   AE Title (sanitized): {ae.ae_title}")
         # Add contexts
         ae.add_supported_context(sop_class.VerificationSOPClass)
         for uid in sop_class.uid_to_class_name.keys():
@@ -640,14 +642,20 @@ class RadXrReceiverApp:
 
         try:
             self.log_message("⏳ Attempting to bind to 0.0.0.0:" + self.config["port"])
+            # Start server – this should return quickly with block=False
             self.server_instance = ae.start_server(
                 ("0.0.0.0", int(self.config["port"])),
                 block=False,
                 evt_handlers=handlers
             )
-            # Wait a moment then verify
+            self.log_message("✅ start_server() returned successfully.")
+            
+            # Wait a moment for the OS to bind
+            self.log_message("⏳ Waiting 2 seconds for binding to complete...")
             time.sleep(2)
-            # Verify the port is listening
+            
+            # Verify the port is actually listening
+            self.log_message("🔍 Verifying port is open...")
             test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             test_sock.settimeout(3)
             try:
@@ -655,11 +663,13 @@ class RadXrReceiverApp:
                 test_sock.close()
                 self.root.after(0, self._server_started_successfully)
                 self.log_message(f"✅ DICOM server is LISTENING on port {self.config['port']}")
+                # Keep the thread alive while listening flag is True
                 while self.is_listening:
                     time.sleep(0.5)
             except Exception as conn_err:
+                # Connection refused – server not listening
+                self.log_message(f"❌ Verification connection failed: {conn_err}")
                 self.root.after(0, self._server_failed_to_start, f"Port {self.config['port']} is NOT open. Error: {conn_err}")
-                self.log_message(f"❌ Verification failed: {conn_err}")
                 return
         except Exception as e:
             self.root.after(0, self._server_failed_to_start, str(e))

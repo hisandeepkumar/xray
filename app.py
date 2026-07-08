@@ -144,7 +144,7 @@ class RadXrReceiverApp:
         print(full_msg)  # still print to terminal
         if self.log_widget:
             self.log_widget.insert(END, full_msg + "\n")
-            self.log_widget.see(END)  # auto-scroll
+            self.log_widget.see(END)
             self.root.update_idletasks()
 
     # ---------- SQLite Database Functions ----------
@@ -589,7 +589,7 @@ class RadXrReceiverApp:
                 else:
                     messagebox.showerror("Error", "File no longer exists.")
 
-    # ---------- SERVER START – WITH DETAILED LOGGING ----------
+    # ---------- SERVER START – WITH DEBUG LOGGING & AE SANITIZATION ----------
     def toggle_server_process(self):
         if not self.is_listening:
             port = int(self.config["port"])
@@ -624,11 +624,14 @@ class RadXrReceiverApp:
             self.btn_toggle_server.config(text="Start Server", bg=self.accent_green)
             self.log_message("⏹️ Server stopped by user.")
 
-     def run_dicom_scp_listener(self):
+    def run_dicom_scp_listener(self):
         ae = AE()
-        # Use a simple AE title without hyphen to avoid potential issues
-        ae.ae_title = self.config["ae_title"].replace("-", "_")  # e.g., RAD_XR
-        self.log_message(f"   AE Title (sanitized): {ae.ae_title}")
+        # Sanitize AE title: replace hyphens/underscores with spaces, keep alnum/spaces
+        raw_ae = self.config["ae_title"]
+        # Keep only alphanumeric, spaces, and underscores
+        sanitized = ''.join(c if c.isalnum() or c in ' _' else '_' for c in raw_ae)
+        ae.ae_title = sanitized
+        self.log_message(f"   Sanitized AE Title: '{ae.ae_title}'")
         # Add contexts
         ae.add_supported_context(sop_class.VerificationSOPClass)
         for uid in sop_class.uid_to_class_name.keys():
@@ -708,7 +711,7 @@ class RadXrReceiverApp:
             self.log_message(f"❌ C-STORE error: {e}")
             return 0xC000
 
-    # PDF Generation (unchanged)
+    # PDF Generation
     def generate_pdf_report_from_dicom(self, dcm_path, output_pdf_path):
         ds = pydicom.dcmread(dcm_path)
         try:

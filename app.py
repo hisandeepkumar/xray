@@ -6,7 +6,7 @@ import threading
 import time
 import shutil
 import sqlite3
-from tkinter import Tk, Label, Entry, Button, StringVar, messagebox, ttk, filedialog, Frame
+from tkinter import Tk, Label, Entry, Button, StringVar, messagebox, ttk, filedialog, Frame, Text, Scrollbar, END
 import numpy as np
 import pydicom
 from PIL import Image
@@ -79,6 +79,9 @@ class RadXrReceiverApp:
         self.lbl_index_progress_monitor = None
         self.lbl_index_progress_config = None
         
+        # Log console
+        self.log_widget = None
+        
         self.load_configuration()
         self.setup_modern_styles()
         
@@ -115,7 +118,7 @@ class RadXrReceiverApp:
             with open(CONFIG_FILE, "w") as f:
                 json.dump(self.config, f, indent=4)
         except Exception as e:
-            print(f"Error saving config: {e}")
+            self.log_message(f"Error saving config: {e}")
 
     def setup_modern_styles(self):
         style = ttk.Style()
@@ -132,6 +135,17 @@ class RadXrReceiverApp:
     def clear_screen(self):
         for widget in self.root.winfo_children():
             widget.destroy()
+
+    # ---------- Logging ----------
+    def log_message(self, msg):
+        """Append a message to the console log and print to stdout."""
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        full_msg = f"[{timestamp}] {msg}"
+        print(full_msg)  # still print to terminal
+        if self.log_widget:
+            self.log_widget.insert(END, full_msg + "\n")
+            self.log_widget.see(END)  # auto-scroll
+            self.root.update_idletasks()
 
     # ---------- SQLite Database Functions ----------
     def init_db(self):
@@ -154,10 +168,13 @@ class RadXrReceiverApp:
 
     def index_all_existing_files(self, reindex=False):
         if self.indexing_in_progress:
+            self.log_message("Indexing already in progress. Skipping.")
             return
         self.indexing_in_progress = True
+        self.log_message("Starting indexing of archive folder...")
         archive_dir = self.config["archive_folder"]
         if not os.path.exists(archive_dir):
+            self.log_message(f"Archive folder {archive_dir} does not exist.")
             self.indexing_in_progress = False
             return
 
@@ -166,8 +183,9 @@ class RadXrReceiverApp:
         c = conn.cursor()
 
         if reindex:
+            self.log_message("Re-indexing: dropping existing table...")
             c.execute("DROP TABLE IF EXISTS dicom_index")
-            self.init_db()  # recreate
+            self.init_db()
             conn = sqlite3.connect(db_path)
             c = conn.cursor()
 
@@ -193,7 +211,7 @@ class RadXrReceiverApp:
                 c.execute("INSERT OR IGNORE INTO dicom_index (file_path, accession, patient_id, patient_name, created_at) VALUES (?,?,?,?,?)",
                           (full_path, accession, patient_id, patient_name, int(os.path.getctime(full_path))))
             except Exception as e:
-                print(f"Indexing failed for {full_path}: {e}")
+                self.log_message(f"❌ Indexing failed for {full_path}: {e}")
             processed += 1
             self.root.after(0, self.update_index_progress, processed, total)
 
@@ -201,7 +219,7 @@ class RadXrReceiverApp:
         conn.close()
         self.indexing_in_progress = False
         self.root.after(0, self.update_index_progress, total, total, done=True)
-        print(f"Indexing complete: {processed} files indexed.")
+        self.log_message(f"✅ Indexing complete: {processed} files indexed.")
 
     def update_index_progress(self, current, total, done=False):
         if done:
@@ -224,14 +242,14 @@ class RadXrReceiverApp:
         self.observer.schedule(event_handler, path=archive_dir, recursive=False)
         self.observer.start()
         self.monitoring_active = True
-        print(f"📁 Watching Archive folder: {archive_dir}")
+        self.log_message(f"📁 Watching Archive folder: {archive_dir}")
 
     def stop_folder_monitor(self):
         if self.observer:
             self.observer.stop()
             self.observer.join()
             self.monitoring_active = False
-            print("📁 Folder monitoring stopped.")
+            self.log_message("📁 Folder monitoring stopped.")
 
     def handle_new_external_dicom(self, file_path):
         try:
@@ -243,9 +261,9 @@ class RadXrReceiverApp:
             accession_no = str(ds.get("AccessionNumber", "UNKNOWN")).strip()
             self.index_dicom_file(file_path, patient_id, patient_name, accession_no)
             self.root.after(0, lambda: self.upsert_grid_record(file_path, patient_id, patient_name, accession_no, "Archived (External) 📁"))
-            print(f"✅ External DICOM indexed: {os.path.basename(file_path)}")
+            self.log_message(f"✅ External DICOM indexed: {os.path.basename(file_path)}")
         except Exception as e:
-            print(f"❌ Error indexing external DICOM {file_path}: {e}")
+            self.log_message(f"❌ Error indexing external DICOM {file_path}: {e}")
 
     def index_dicom_file(self, dcm_path, patient_id, patient_name, accession_no):
         if not os.path.exists(dcm_path):
@@ -333,6 +351,7 @@ class RadXrReceiverApp:
         content_splitter = Frame(frame_receiver, bg=self.bg_dark)
         content_splitter.pack(fill="both", expand=True, padx=15, pady=5)
         
+        # Left panel: network config
         net_card = Frame(content_splitter, bg=self.bg_card, width=220)
         net_card.pack(side="left", fill="y", padx=(0, 10))
         net_card.pack_propagate(False)
@@ -357,8 +376,12 @@ class RadXrReceiverApp:
         
         Button(net_card, text="Refresh Dashboard", font=("Arial", 8, "bold"), bg="#4b5563", fg=self.text_light, bd=0, width=20, cursor="hand2", command=self.sync_archive_folder_to_dashboard).pack(side="bottom", pady=20)
         
-        queue_container = Frame(content_splitter, bg=self.bg_card)
-        queue_container.pack(side="right", fill="both", expand=True)
+        # Right panel: grid + console
+        right_panel = Frame(content_splitter, bg=self.bg_card)
+        right_panel.pack(side="right", fill="both", expand=True)
+        
+        queue_container = Frame(right_panel, bg=self.bg_card)
+        queue_container.pack(fill="both", expand=True)
         
         cols = ("id", "name", "accession", "file", "status")
         self.tree = ttk.Treeview(queue_container, columns=cols, show="headings")
@@ -381,7 +404,26 @@ class RadXrReceiverApp:
         self.tree.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
         
-        # ---- Live Monitor progress label (bottom) ----
+        # ---- Console Log Frame ----
+        log_frame = Frame(right_panel, bg=self.bg_dark, height=120)
+        log_frame.pack(fill="x", pady=(5,0))
+        log_frame.pack_propagate(False)
+        
+        log_header = Frame(log_frame, bg=self.bg_dark)
+        log_header.pack(fill="x")
+        Label(log_header, text="📋 Console Log", font=("Arial", 9, "bold"), fg=self.accent_cyan, bg=self.bg_dark).pack(side="left")
+        Button(log_header, text="📋 Copy Log", font=("Arial", 8, "bold"), bg="#4b5563", fg=self.text_light, bd=0, padx=5, pady=2, cursor="hand2", command=self.copy_log).pack(side="right", padx=2)
+        Button(log_header, text="🗑️ Clear Log", font=("Arial", 8, "bold"), bg="#4b5563", fg=self.text_light, bd=0, padx=5, pady=2, cursor="hand2", command=self.clear_log).pack(side="right", padx=2)
+        
+        log_text_frame = Frame(log_frame, bg=self.bg_dark)
+        log_text_frame.pack(fill="both", expand=True)
+        self.log_widget = Text(log_text_frame, bg=self.bg_dark, fg=self.text_light, font=("Courier", 8), wrap="word", height=5)
+        self.log_widget.pack(side="left", fill="both", expand=True)
+        log_scroll = Scrollbar(log_text_frame, command=self.log_widget.yview)
+        log_scroll.pack(side="right", fill="y")
+        self.log_widget.config(yscrollcommand=log_scroll.set)
+        
+        # ---- Progress label (bottom) ----
         progress_frame = Frame(frame_receiver, bg=self.bg_dark)
         progress_frame.pack(fill="x", padx=15, pady=5)
         self.lbl_index_progress_monitor = Label(progress_frame, text="✅ Indexing ready.", font=("Arial", 9), fg=self.accent_green, bg=self.bg_dark)
@@ -443,6 +485,17 @@ class RadXrReceiverApp:
         
         Button(frame_settings, text="Apply Node Topology Changes", font=("Arial", 11, "bold"), bg=self.accent_green, fg=self.bg_dark, width=28, bd=0, cursor="hand2", command=self.apply_and_save_node_settings).pack(pady=15)
         Label(frame_settings, text="Made with ❤️ by Sandeep", font=("Arial", 9, "bold", "italic"), fg="#6b7280", bg=self.bg_dark).pack(side="bottom", pady=5)
+
+    def copy_log(self):
+        if self.log_widget:
+            content = self.log_widget.get("1.0", END)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(content)
+            messagebox.showinfo("Copied", "Console log copied to clipboard.")
+
+    def clear_log(self):
+        if self.log_widget:
+            self.log_widget.delete("1.0", END)
 
     def copy_to_clipboard(self, text):
         self.root.clipboard_clear()
@@ -536,7 +589,7 @@ class RadXrReceiverApp:
                 else:
                     messagebox.showerror("Error", "File no longer exists.")
 
-    # ---------- SERVER START – FIXED WITH PORT CHECK ----------
+    # ---------- SERVER START – WITH DETAILED LOGGING ----------
     def toggle_server_process(self):
         if not self.is_listening:
             port = int(self.config["port"])
@@ -545,6 +598,7 @@ class RadXrReceiverApp:
             result = test_sock.connect_ex(('0.0.0.0', port))
             test_sock.close()
             if result == 0:
+                self.log_message(f"❌ Port {port} is already in use.")
                 messagebox.showerror("Port Error", f"Port {port} is already in use. Please close other applications or change the port.")
                 return
 
@@ -554,6 +608,11 @@ class RadXrReceiverApp:
             self.status_var.set("● Starting...")
             self.lbl_status_indicator.config(fg=self.accent_cyan)
             self.btn_toggle_server.config(text="Starting...", bg="#4b5563")
+            self.log_message("🚀 Starting DICOM server...")
+            self.log_message(f"   AE Title: {self.config['ae_title']}")
+            self.log_message(f"   Port: {port}")
+            self.log_message(f"   Inbox: {self.config['receive_folder']}")
+            self.log_message(f"   Archive: {self.config['archive_folder']}")
             self.server_thread = threading.Thread(target=self.run_dicom_scp_listener, daemon=True)
             self.server_thread.start()
         else:
@@ -563,15 +622,15 @@ class RadXrReceiverApp:
             self.status_var.set("● Stopped")
             self.lbl_status_indicator.config(fg=self.accent_red)
             self.btn_toggle_server.config(text="Start Server", bg=self.accent_green)
+            self.log_message("⏹️ Server stopped by user.")
 
     def run_dicom_scp_listener(self):
         ae = AE()
-        ae.ae_title = self.config["ae_title"]  # Set AE title explicitly
-        # Add necessary contexts
+        ae.ae_title = self.config["ae_title"]
+        # Add contexts
         ae.add_supported_context(sop_class.VerificationSOPClass)
-        # Add all standard storage classes
         for uid in sop_class.uid_to_class_name.keys():
-            if len(uid) < 45:  # filter out meta UIDs
+            if len(uid) < 45:
                 ae.add_supported_context(uid)
 
         handlers = [
@@ -580,49 +639,48 @@ class RadXrReceiverApp:
         ]
 
         try:
-            print(f"🚀 Attempting to start DICOM server on 0.0.0.0:{self.config['port']} with AE {self.config['ae_title']}")
+            self.log_message("⏳ Attempting to bind to 0.0.0.0:" + self.config["port"])
             self.server_instance = ae.start_server(
                 ("0.0.0.0", int(self.config["port"])),
                 block=False,
                 evt_handlers=handlers
             )
-            # Wait a moment for the server to bind
+            # Wait a moment then verify
             time.sleep(2)
-            # Verify that the port is actually listening
+            # Verify the port is listening
             test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            test_sock.settimeout(1)
+            test_sock.settimeout(3)
             try:
                 test_sock.connect(('127.0.0.1', int(self.config["port"])))
                 test_sock.close()
-                # Success – update GUI
                 self.root.after(0, self._server_started_successfully)
-                print(f"✅ DICOM server is listening on port {self.config['port']}")
-                # Keep the thread alive while listening flag is True
+                self.log_message(f"✅ DICOM server is LISTENING on port {self.config['port']}")
                 while self.is_listening:
                     time.sleep(0.5)
             except Exception as conn_err:
-                # Connection refused – server not listening
-                self.root.after(0, self._server_failed_to_start, f"Port {self.config['port']} is not open after start. Check firewall/permissions.")
+                self.root.after(0, self._server_failed_to_start, f"Port {self.config['port']} is NOT open. Error: {conn_err}")
+                self.log_message(f"❌ Verification failed: {conn_err}")
                 return
         except Exception as e:
             self.root.after(0, self._server_failed_to_start, str(e))
-            print(f"❌ Server start error: {e}")
+            self.log_message(f"❌ Server start exception: {e}")
 
     def _server_started_successfully(self):
         self.status_var.set("● Listening")
         self.lbl_status_indicator.config(fg=self.accent_green)
         self.btn_toggle_server.config(text="Stop Server", bg=self.accent_red)
+        self.log_message("🎉 Server is now active and accepting connections.")
 
     def _server_failed_to_start(self, error_msg):
         self.is_listening = False
         self.status_var.set("● Stopped")
         self.lbl_status_indicator.config(fg=self.accent_red)
         self.btn_toggle_server.config(text="Start Server", bg=self.accent_green)
-        messagebox.showerror("Server Error", f"Failed to start DICOM server:\n{error_msg}\n\nCheck if port {self.config['port']} is free and you have administrator rights.")
-        print(f"❌ Server failed: {error_msg}")
+        self.log_message(f"❌ Server failed: {error_msg}")
+        messagebox.showerror("Server Error", f"Failed to start DICOM server:\n{error_msg}\n\nCheck the console log for details.\nPort: {self.config['port']}")
 
     def handle_incoming_c_echo(self, event):
-        print("✅ Received C-ECHO request – responding")
+        self.log_message(f"✅ C-ECHO received from {event.assoc.requestor.ae_title}")
         return 0x0000
 
     def handle_incoming_c_store(self, event):
@@ -632,15 +690,15 @@ class RadXrReceiverApp:
             filename = f"RADXR_{accession_number}.dcm"
             filepath = os.path.join(self.config["receive_folder"], filename)
             event.write_dataset(filepath)
-            print(f"📥 Received C-STORE for accession {accession_number}")
+            self.log_message(f"📥 C-STORE received for Accession: {accession_number} from {event.assoc.requestor.ae_title}")
             processing_thread = threading.Thread(target=self.autonomous_processing_pipeline, args=(filepath, False), daemon=True)
             processing_thread.start()
             return 0x0000 
         except Exception as e:
-            print(f"❌ C-STORE error: {e}")
+            self.log_message(f"❌ C-STORE error: {e}")
             return 0xC000
 
-    # PDF Generation
+    # PDF Generation (unchanged)
     def generate_pdf_report_from_dicom(self, dcm_path, output_pdf_path):
         ds = pydicom.dcmread(dcm_path)
         try:
@@ -795,6 +853,7 @@ class RadXrReceiverApp:
                 
         except Exception as e:
             self.root.after(0, lambda: messagebox.showerror("Pipeline Error", f"Error: {str(e)}"))
+            self.log_message(f"❌ Pipeline error: {e}")
             if 'file_key' in locals():
                 self.root.after(0, lambda: self.upsert_grid_record(file_key, "N/A", "N/A", "UNKNOWN", "Failed ❌"))
 
@@ -946,6 +1005,7 @@ class RadXrReceiverApp:
                                                 "chat_id": chat_id, 
                                                 "text": f"❌ Error processing file {idx}: {str(ex)}"
                                             })
+                                            self.log_message(f"❌ Bot error: {ex}")
                                         
                                         time.sleep(0.5)
                                     
@@ -961,7 +1021,7 @@ class RadXrReceiverApp:
                                         "parse_mode": "Markdown"
                                     })
             except Exception as e:
-                print(f"Bot polling error: {e}")
+                self.log_message(f"Bot polling error: {e}")
             time.sleep(1)
 
 if __name__ == "__main__":

@@ -76,7 +76,7 @@ class RadXrReceiverApp:
         
         # Progress tracking
         self.indexing_in_progress = False
-        self.lbl_index_progress_monitor = None  # Will be set in UI
+        self.lbl_index_progress_monitor = None
         self.lbl_index_progress_config = None
         
         self.load_configuration()
@@ -175,7 +175,6 @@ class RadXrReceiverApp:
         total = len(all_files)
         processed = 0
 
-        # Update UI progress (both monitor and config labels)
         self.root.after(0, self.update_index_progress, processed, total)
 
         for file in all_files:
@@ -205,12 +204,10 @@ class RadXrReceiverApp:
         print(f"Indexing complete: {processed} files indexed.")
 
     def update_index_progress(self, current, total, done=False):
-        """Update progress labels on both tabs"""
         if done:
             text = f"✅ Indexing complete: {total} files indexed."
         else:
             text = f"⏳ Indexing: {current} / {total} files processed..."
-        # Update monitor label if exists
         if self.lbl_index_progress_monitor:
             self.lbl_index_progress_monitor.config(text=text)
         if self.lbl_index_progress_config:
@@ -539,13 +536,14 @@ class RadXrReceiverApp:
                 else:
                     messagebox.showerror("Error", "File no longer exists.")
 
+    # ---------- SERVER START – FIXED WITH PORT CHECK ----------
     def toggle_server_process(self):
         if not self.is_listening:
-            # Check if port is free
             port = int(self.config["port"])
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            result = sock.connect_ex(('0.0.0.0', port))
-            sock.close()
+            # Check if port is already in use
+            test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            result = test_sock.connect_ex(('0.0.0.0', port))
+            test_sock.close()
             if result == 0:
                 messagebox.showerror("Port Error", f"Port {port} is already in use. Please close other applications or change the port.")
                 return
@@ -553,9 +551,9 @@ class RadXrReceiverApp:
             os.makedirs(self.config["receive_folder"], exist_ok=True)
             os.makedirs(self.config["archive_folder"], exist_ok=True)
             self.is_listening = True
-            self.status_var.set("● Listening")
-            self.lbl_status_indicator.config(fg=self.accent_green)
-            self.btn_toggle_server.config(text="Stop Server", bg=self.accent_red)
+            self.status_var.set("● Starting...")
+            self.lbl_status_indicator.config(fg=self.accent_cyan)
+            self.btn_toggle_server.config(text="Starting...", bg="#4b5563")
             self.server_thread = threading.Thread(target=self.run_dicom_scp_listener, daemon=True)
             self.server_thread.start()
         else:
@@ -568,34 +566,63 @@ class RadXrReceiverApp:
 
     def run_dicom_scp_listener(self):
         ae = AE()
+        ae.ae_title = self.config["ae_title"]  # Set AE title explicitly
+        # Add necessary contexts
         ae.add_supported_context(sop_class.VerificationSOPClass)
+        # Add all standard storage classes
         for uid in sop_class.uid_to_class_name.keys():
-            if len(uid) < 45: 
+            if len(uid) < 45:  # filter out meta UIDs
                 ae.add_supported_context(uid)
+
         handlers = [
             (evt.EVT_C_STORE, self.handle_incoming_c_store),
             (evt.EVT_C_ECHO, self.handle_incoming_c_echo)
         ]
+
         try:
-            # Bind to all interfaces (0.0.0.0) and use the configured port
+            print(f"🚀 Attempting to start DICOM server on 0.0.0.0:{self.config['port']} with AE {self.config['ae_title']}")
             self.server_instance = ae.start_server(
                 ("0.0.0.0", int(self.config["port"])),
                 block=False,
                 evt_handlers=handlers
             )
-            # Update UI with actual listening IP
-            local_ip = self.get_local_ip()
-            self.root.after(0, lambda: self.lbl_ip.config(text=local_ip))
-            print(f"✅ DICOM Server listening on {local_ip}:{self.config['port']} (AE: {self.config['ae_title']})")
-            while self.is_listening:
-                time.sleep(0.1)
+            # Wait a moment for the server to bind
+            time.sleep(2)
+            # Verify that the port is actually listening
+            test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            test_sock.settimeout(1)
+            try:
+                test_sock.connect(('127.0.0.1', int(self.config["port"])))
+                test_sock.close()
+                # Success – update GUI
+                self.root.after(0, self._server_started_successfully)
+                print(f"✅ DICOM server is listening on port {self.config['port']}")
+                # Keep the thread alive while listening flag is True
+                while self.is_listening:
+                    time.sleep(0.5)
+            except Exception as conn_err:
+                # Connection refused – server not listening
+                self.root.after(0, self._server_failed_to_start, f"Port {self.config['port']} is not open after start. Check firewall/permissions.")
+                return
         except Exception as e:
-            self.is_listening = False
-            self.root.after(0, lambda: messagebox.showerror("Server Error", f"Failed to start DICOM server:\n{str(e)}\n\nMake sure port {self.config['port']} is free and you have admin rights."))
-            self.root.after(0, self.toggle_server_process)  # Turn off
-            print(f"❌ DICOM Server error: {e}")
+            self.root.after(0, self._server_failed_to_start, str(e))
+            print(f"❌ Server start error: {e}")
+
+    def _server_started_successfully(self):
+        self.status_var.set("● Listening")
+        self.lbl_status_indicator.config(fg=self.accent_green)
+        self.btn_toggle_server.config(text="Stop Server", bg=self.accent_red)
+
+    def _server_failed_to_start(self, error_msg):
+        self.is_listening = False
+        self.status_var.set("● Stopped")
+        self.lbl_status_indicator.config(fg=self.accent_red)
+        self.btn_toggle_server.config(text="Start Server", bg=self.accent_green)
+        messagebox.showerror("Server Error", f"Failed to start DICOM server:\n{error_msg}\n\nCheck if port {self.config['port']} is free and you have administrator rights.")
+        print(f"❌ Server failed: {error_msg}")
 
     def handle_incoming_c_echo(self, event):
+        print("✅ Received C-ECHO request – responding")
         return 0x0000
 
     def handle_incoming_c_store(self, event):
@@ -605,11 +632,13 @@ class RadXrReceiverApp:
             filename = f"RADXR_{accession_number}.dcm"
             filepath = os.path.join(self.config["receive_folder"], filename)
             event.write_dataset(filepath)
+            print(f"📥 Received C-STORE for accession {accession_number}")
             processing_thread = threading.Thread(target=self.autonomous_processing_pipeline, args=(filepath, False), daemon=True)
             processing_thread.start()
             return 0x0000 
-        except Exception:
-            return 0xC000 
+        except Exception as e:
+            print(f"❌ C-STORE error: {e}")
+            return 0xC000
 
     # PDF Generation
     def generate_pdf_report_from_dicom(self, dcm_path, output_pdf_path):

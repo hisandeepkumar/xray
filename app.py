@@ -29,7 +29,7 @@ class DicomArchiveHandler(FileSystemEventHandler):
 
     def on_created(self, event):
         if not event.is_directory and event.src_path.lower().endswith('.dcm'):
-            time.sleep(0.5)  # Wait for file to be fully written
+            time.sleep(0.5)
             threading.Thread(target=self.app.handle_new_external_dicom, args=(event.src_path,), daemon=True).start()
 
     def on_moved(self, event):
@@ -71,7 +71,6 @@ class RadXrReceiverApp:
         self.queue_data = {}      # file_path -> row_id
         self.last_update_id = 0
         
-        # Folder Watcher
         self.observer = None
         self.monitoring_active = False
         
@@ -129,14 +128,14 @@ class RadXrReceiverApp:
         for widget in self.root.winfo_children():
             widget.destroy()
 
-    # ---------- SQLite Database Functions (file_path as PRIMARY KEY) ----------
+    # ---------- SQLite Database Functions ----------
     def init_db(self):
         archive_dir = self.config["archive_folder"]
         os.makedirs(archive_dir, exist_ok=True)
         db_path = os.path.join(archive_dir, "radxr_index.db")
         conn = sqlite3.connect(db_path)
         c = conn.cursor()
-        # file_path is now PRIMARY KEY to allow multiple files with same accession
+        # file_path is PRIMARY KEY to allow multiple files with same accession
         c.execute('''CREATE TABLE IF NOT EXISTS dicom_index
                      (file_path TEXT PRIMARY KEY,
                       accession TEXT,
@@ -188,21 +187,23 @@ class RadXrReceiverApp:
             self.init_db()
         conn = sqlite3.connect(db_path)
         c = conn.cursor()
-        # Insert or ignore – if file_path already exists, do nothing (keep the old one)
+        # Insert only if file_path not already present
         c.execute("INSERT OR IGNORE INTO dicom_index (file_path, accession, patient_id, patient_name, created_at) VALUES (?,?,?,?,?)",
                   (dcm_path, accession_no, patient_id, patient_name, int(time.time())))
         conn.commit()
         conn.close()
 
+    # ---------- MODIFIED: Fetch ALL matching files using LIKE for both ID and Name ----------
     def get_patient_files_from_db(self, q_id, q_name):
-        """Return all file paths matching patient_id and patient_name (substring match)"""
+        """Return all file paths matching patient_id (substring) and patient_name (substring)"""
         db_path = os.path.join(self.config["archive_folder"], "radxr_index.db")
         if not os.path.exists(db_path):
             return []
         conn = sqlite3.connect(db_path)
         c = conn.cursor()
-        c.execute("SELECT file_path FROM dicom_index WHERE patient_id = ? AND LOWER(patient_name) LIKE ?", 
-                  (q_id, f"%{q_name.lower()}%"))
+        # Use LIKE with wildcards for both fields – ensures all variations are caught
+        c.execute("SELECT file_path FROM dicom_index WHERE patient_id LIKE ? AND LOWER(patient_name) LIKE ?", 
+                  (f"%{q_id}%", f"%{q_name.lower()}%"))
         results = c.fetchall()
         conn.close()
         return [row[0] for row in results]
@@ -237,7 +238,6 @@ class RadXrReceiverApp:
             accession_no = str(ds.get("AccessionNumber", "UNKNOWN")).strip()
             
             self.index_dicom_file(file_path, patient_id, patient_name, accession_no)
-            # Update dashboard with file_path as unique key
             self.root.after(0, lambda: self.upsert_grid_record(file_path, patient_id, patient_name, accession_no, "Archived (External) 📁"))
             print(f"✅ External DICOM indexed: {os.path.basename(file_path)}")
         except Exception as e:
@@ -352,7 +352,6 @@ class RadXrReceiverApp:
         self.tree.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
         
-        # Footer
         Label(frame_receiver, text="Made with ❤️ by Sandeep", font=("Arial", 9, "bold", "italic"), fg="#6b7280", bg=self.bg_dark).pack(side="bottom", pady=5)
         
         # Settings tab
@@ -448,19 +447,15 @@ class RadXrReceiverApp:
         if not item_id:
             return
         row_values = self.tree.item(item_id, 'values')
-        status = row_values[4]  # status column
+        status = row_values[4]
         accession_no = row_values[2]
         file_name = row_values[3]
-        # Find the full path from database or file system
-        # We can use the stored file_path from our mapping
-        # Since we store file_path -> row_id, we can reverse lookup
         file_path = None
         for fpath, rid in self.queue_data.items():
             if rid == item_id:
                 file_path = fpath
                 break
         if not file_path:
-            # Fallback: search in archive
             full_archive = os.path.join(self.config["archive_folder"], file_name)
             if os.path.exists(full_archive):
                 file_path = full_archive
@@ -651,7 +646,6 @@ class RadXrReceiverApp:
             patient_name = str(ds.get("PatientName", "N/A")).strip()
             accession_no = str(ds.get("AccessionNumber", "UNKNOWN")).strip()
 
-            # Copy to Archive if not already there
             archive_dir = self.config["archive_folder"]
             os.makedirs(archive_dir, exist_ok=True)
             archive_dest = os.path.join(archive_dir, os.path.basename(dcm_path))
@@ -661,10 +655,8 @@ class RadXrReceiverApp:
             else:
                 dcm_path_for_index = dcm_path
 
-            # Index the file (no replace)
             self.index_dicom_file(dcm_path_for_index, patient_id, patient_name, accession_no)
 
-            # Generate PDF
             temp_pdf = os.path.join(self.config["receive_folder"], f"Report_{int(time.time())}.pdf")
             self.generate_pdf_report_from_dicom(dcm_path_for_index, temp_pdf)
             clean_pname = "".join(x for x in patient_name if x.isalnum() or x in " -_")
@@ -673,12 +665,10 @@ class RadXrReceiverApp:
                 os.remove(pdf_output_path)
             os.rename(temp_pdf, pdf_output_path)
 
-            # Update dashboard (using file_path as key)
             file_key = dcm_path_for_index
             self.root.after(0, lambda: self.upsert_grid_record(file_key, patient_id, patient_name, accession_no, "⏳ Processing"))
             self.root.after(0, lambda: self.upsert_grid_record(file_key, patient_id, patient_name, accession_no, "📤 Sending"))
             
-            # Send to Telegram and WhatsApp
             tg_ok = self.dispatch_to_telegram(pdf_output_path, patient_id, patient_name, accession_no, self.TELEGRAM_CHAT_ID)
             wa_ok = True
             if self.config["whatsapp_api_key"]:
@@ -695,12 +685,10 @@ class RadXrReceiverApp:
                 
         except Exception as e:
             self.root.after(0, lambda: messagebox.showerror("Pipeline Error", f"Error: {str(e)}"))
-            # Try to update status if we have file_key
             if 'file_key' in locals():
                 self.root.after(0, lambda: self.upsert_grid_record(file_key, "N/A", "N/A", "UNKNOWN", "Failed ❌"))
 
     def upsert_grid_record(self, file_path, p_id, p_name, acc_no, status):
-        """Insert or update row using file_path as unique key"""
         if file_path in self.queue_data:
             row_id = self.queue_data[file_path]
             self.tree.item(row_id, values=(p_id, p_name, acc_no, os.path.basename(file_path), status))
@@ -771,7 +759,7 @@ class RadXrReceiverApp:
         except Exception:
             return False
 
-    # ---------- Telegram Bot (Multi‑File Support) ----------
+    # ---------- Telegram Bot (Multi‑File Support with LIKE matching) ----------
     def start_telegram_bot_polling(self):
         t = threading.Thread(target=self.telegram_bot_polling_worker, daemon=True)
         t.start()
@@ -794,7 +782,7 @@ class RadXrReceiverApp:
                             if text.lower() == "/start":
                                 start_txt = (
                                     "🏥 *Welcome to RAD-XR Portal Search Node*\n\n"
-                                    "To retrieve your patient's report, send the following format:\n\n"
+                                    "To retrieve your patient's report(s), send the following format:\n\n"
                                     "`[PATIENT ID]`\n"
                                     "`[PATIENT FIRST NAME]`\n\n"
                                     "*Example:*\n"
@@ -809,6 +797,7 @@ class RadXrReceiverApp:
                                 query_id = lines[0]
                                 query_name = lines[1].lower()
                                 
+                                # Get ALL matching files (substring match on both fields)
                                 matched_files = self.get_patient_files_from_db(query_id, query_name)
 
                                 if matched_files:

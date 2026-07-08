@@ -633,7 +633,7 @@ class RadXrReceiverApp:
         self.log_message(f"   Sanitized AE Title: '{ae.ae_title}'")
         
         try:
-            # 1. Verification (C-ECHO) support - Using direct standard UID string to prevent pynetdicom version mismatch crash
+            # 1. Verification (C-ECHO) support
             ae.add_supported_context("1.2.840.10008.1.1")
             
             # 2. Add common Storage SOP Classes
@@ -657,7 +657,10 @@ class RadXrReceiverApp:
             ]
 
             self.log_message("⏳ Attempting to bind to 0.0.0.0:" + self.config["port"])
-            sys.stdout.flush()
+            
+            # Safe flush check (NoneType error ko rokne ke liye)
+            if sys.stdout is not None:
+                sys.stdout.flush()
 
             self.server_instance = ae.start_server(
                 ("0.0.0.0", int(self.config["port"])),

@@ -632,24 +632,35 @@ class RadXrReceiverApp:
         ae.ae_title = sanitized
         self.log_message(f"   Sanitized AE Title: '{ae.ae_title}'")
         
-        # Add contexts
-        ae.add_supported_context(sop_class.VerificationSOPClass)
-        for uid in sop_class.uid_to_class_name.keys():
-            if len(uid) < 45:
+        try:
+            # 1. Verification (C-ECHO) support
+            ae.add_supported_context(sop_class.VerificationSOPClass)
+            
+            # 2. Sirf zaroori common Storage SOP Classes ko add karein jo RAD-XR ke liye chahiye
+            # (Isse pynetdicom crash nahi hoga aur server turant start ho jayega)
+            common_storage_classes = [
+                "1.2.840.10008.5.1.4.1.1.1",     # Computed Radiography Image Storage
+                "1.2.840.10008.5.1.4.1.1.2",     # CT Image Storage
+                "1.2.840.10008.5.1.4.1.1.4",     # MR Image Storage
+                "1.2.840.10008.5.1.4.1.1.7",     # Secondary Capture Image Storage
+                "1.2.840.10008.5.1.4.1.1.12.1",  # X-Ray Angiographic Image Storage
+                "1.2.840.10008.5.1.4.1.1.12.2",  # X-Ray Radiofluoroscopic Image Storage
+                "1.2.840.10008.5.1.4.1.1.20",    # Nuclear Medicine Image Storage
+                "1.2.840.10008.5.1.4.1.1.6.1",   # Ultrasound Image Storage
+            ]
+            
+            for uid in common_storage_classes:
                 ae.add_supported_context(uid)
 
-        handlers = [
-            (evt.EVT_C_STORE, self.handle_incoming_c_store),
-            (evt.EVT_C_ECHO, self.handle_incoming_c_echo)
-        ]
+            handlers = [
+                (evt.EVT_C_STORE, self.handle_incoming_c_store),
+                (evt.EVT_C_ECHO, self.handle_incoming_c_echo)
+            ]
 
-        # Log BEFORE calling start_server
-        self.log_message("⏳ Attempting to bind to 0.0.0.0:" + self.config["port"])
-        # Flush log immediately
-        sys.stdout.flush()
+            self.log_message("⏳ Attempting to bind to 0.0.0.0:" + self.config["port"])
+            sys.stdout.flush()
 
-        try:
-            # This call may block if firewall or permission issue.
+            # Server start karne ka try karein
             self.server_instance = ae.start_server(
                 ("0.0.0.0", int(self.config["port"])),
                 block=False,
@@ -657,7 +668,6 @@ class RadXrReceiverApp:
             )
             self.log_message("✅ start_server() returned successfully (immediate).")
             
-            # Now verify the port is open with a timeout
             self.log_message("⏳ Waiting 2 seconds for OS to bind...")
             time.sleep(2)
             
@@ -675,11 +685,11 @@ class RadXrReceiverApp:
                 self.log_message(f"❌ Verification connection failed: {conn_err}")
                 self.root.after(0, self._server_failed_to_start, f"Port {self.config['port']} is NOT open. Error: {conn_err}")
                 return
+                
         except Exception as e:
-            # If start_server throws an exception, we catch it here.
-            self.log_message(f"❌ Server start exception (immediate): {e}")
+            self.log_message(f"❌ Server start exception: {e}")
             self.root.after(0, self._server_failed_to_start, str(e))
-
+            
     def _server_started_successfully(self):
         self.status_var.set("● Listening")
         self.lbl_status_indicator.config(fg=self.accent_green)

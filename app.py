@@ -960,12 +960,9 @@ class RadXrReceiverApp:
             self.log_message(f"❌ C-STORE error: {e}")
             return 0xC000
 
-    # ---------- PDF Generation (UPDATED FOOTER) ----------
-        def generate_pdf_report_from_dicom(self, dcm_path, output_pdf_path):
+    # ---------- PDF Generation ----------
+    def generate_pdf_report_from_dicom(self, dcm_path, output_pdf_path):
         import re
-        from reportlab.lib.styles import getSampleStyleSheet
-        from reportlab.pdfbase import pdfmetrics
-        from reportlab.pdfbase.ttfonts import TTFont
 
         ds = pydicom.dcmread(dcm_path)
         try:
@@ -1001,7 +998,7 @@ class RadXrReceiverApp:
         ]
         available_metadata = [(k, v) for k, v in metadata if v.strip() and v != "N/A"]
 
-        # Clean footer text: keep only English letters, digits, spaces, and basic punctuation
+        # Clean footer: keep only English letters, digits, spaces, and basic punctuation
         raw_footer = self.footer_message.strip()
         clean_footer = re.sub(r'[^a-zA-Z0-9\s.,!?\'"-]', '', raw_footer).strip()
 
@@ -1057,9 +1054,8 @@ class RadXrReceiverApp:
             # --- Image (preserve native pixels) ---
             img_w, img_h = image.size
             max_width = width - 80
-            # Reserve space for footer: top line at y=45, bottom at y=9 (0.5 inch = 36 pt gap)
-            # So image should not go below y_text - 45 (45 pt from bottom)
-            max_height = y_text - 45   # 45 pt above bottom line
+            # Reserve space for footer: top line at y=45, bottom at y=9 (36 points gap = 0.5 inch)
+            max_height = y_text - 45
 
             scale = 1.0
             if img_w > max_width or img_h > max_height:
@@ -1077,33 +1073,29 @@ class RadXrReceiverApp:
             if os.path.exists(temp_img_path):
                 os.remove(temp_img_path)
 
-            # --- Footer: two lines with message centered, fixed 0.5 inch gap ---
-            # Define line positions: top line at y=45 from bottom, bottom at y=9 (36 points gap)
-            footer_top = 45      # points from bottom edge
-            footer_bottom = 9    # 45 - 36 = 9
-            gap = footer_top - footer_bottom   # should be 36 points (0.5 inch)
+            # --- Footer: two lines with message, fixed 0.5 inch gap ---
+            footer_top = 45      # points from bottom
+            footer_bottom = 9    # 36 points below top = 0.5 inch
+            gap = footer_top - footer_bottom   # 36 pt
 
             c.setStrokeColorRGB(0.1, 0.5, 0.7)
             c.setLineWidth(0.5)
 
-            # Draw upper line
+            # Upper line
             c.line(40, footer_top, width - 40, footer_top)
 
-            # Draw message if present
+            # Message if any
             if clean_footer:
-                # Determine appropriate font size to fit within the width between margins
-                max_text_width = width - 80   # same as image margins
-                # Try font sizes from 12 down to 6
+                max_text_width = width - 80
                 font_size = 12
                 for size in range(12, 5, -1):
                     c.setFont("Helvetica-Bold", size)
-                    text_width = c.stringWidth(clean_footer, "Helvetica-Bold", size)
-                    if text_width <= max_text_width:
+                    if c.stringWidth(clean_footer, "Helvetica-Bold", size) <= max_text_width:
                         font_size = size
                         break
                 else:
                     font_size = 6
-                    # If still too wide at 6pt, truncate with ellipsis
+                    # Truncate with ellipsis if still too wide at 6pt
                     while c.stringWidth(clean_footer + "...", "Helvetica-Bold", 6) > max_text_width and len(clean_footer) > 1:
                         clean_footer = clean_footer[:-1]
                     if clean_footer:
@@ -1111,13 +1103,12 @@ class RadXrReceiverApp:
 
                 c.setFont("Helvetica-Bold", font_size)
                 text_width = c.stringWidth(clean_footer, "Helvetica-Bold", font_size)
-                # Center horizontally
                 x_text = (width - text_width) / 2
-                # Center vertically between the two lines
-                y_text_footer = footer_bottom + (gap / 2) - (font_size * 0.35)  # rough vertical centering
+                # Center vertically between the lines
+                y_text_footer = footer_bottom + (gap / 2) - (font_size * 0.35)
                 c.drawString(x_text, y_text_footer, clean_footer)
 
-            # Draw lower line
+            # Lower line
             c.line(40, footer_bottom, width - 40, footer_bottom)
 
             if frame_idx < num_frames - 1:
@@ -1126,7 +1117,7 @@ class RadXrReceiverApp:
         c.showPage()
         c.save()
         return patient_id, patient_name, accession_no
-        
+
     # ---------- Processing Pipeline ----------
     def autonomous_processing_pipeline(self, dcm_path, is_manual_import=False):
         pdf_output_path = ""

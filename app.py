@@ -33,6 +33,7 @@ CONFIG_DIR = r"C:\RAD-XR"
 CONFIG_FILE = os.path.join(CONFIG_DIR, "rad_xr_config.json")
 DATABASE_DIR = os.path.join(CONFIG_DIR, "DATABASE")
 DATABASE_PATH = os.path.join(DATABASE_DIR, "radxr_index.db")
+FOOTER_IMAGE_PATH = os.path.join(CONFIG_DIR, "footer_image.jpg")
 
 class DicomArchiveHandler(FileSystemEventHandler):
     def __init__(self, app_instance):
@@ -85,8 +86,9 @@ class RadXrReceiverApp:
             "receive_folder": "D:\\RAD-XR\\Inbox",
             "archive_folder": "D:\\RAD-XR\\Archive",
             "telegram_bot_token": DEFAULT_TELEGRAM_BOT_TOKEN,
-            "footer_message": "",          # caption in Telegram/WhatsApp
-            "pdf_footer_text": "",         # text inside PDF footer
+            "footer_message": "",
+            "pdf_footer_text": "",
+            "pdf_footer_image": "",      # path to footer image (if set)
             "auto_start": False,
             "bot_display_name": "RAD-XR Bot"
         }
@@ -96,6 +98,7 @@ class RadXrReceiverApp:
         self.allowed_users = [DEFAULT_MASTER_USER_ID]
         self.footer_message = ""
         self.pdf_footer_text = ""
+        self.pdf_footer_image = ""       # stores path
         self.bot_username = ""
         self.config_unlocked = False
         
@@ -196,6 +199,7 @@ class RadXrReceiverApp:
         self.config.setdefault("telegram_bot_token", DEFAULT_TELEGRAM_BOT_TOKEN)
         self.config.setdefault("footer_message", "")
         self.config.setdefault("pdf_footer_text", "")
+        self.config.setdefault("pdf_footer_image", "")
         self.config.setdefault("whatsapp_api_key", DEFAULT_WHATSAPP_API_KEY)
         self.config.setdefault("whatsapp_phone_number_id", "")
         self.config.setdefault("whatsapp_sender_phone", "")
@@ -211,6 +215,7 @@ class RadXrReceiverApp:
         self.TELEGRAM_BOT_TOKEN = self.config["telegram_bot_token"]
         self.footer_message = self.config.get("footer_message", "")
         self.pdf_footer_text = self.config.get("pdf_footer_text", "")
+        self.pdf_footer_image = self.config.get("pdf_footer_image", "")
         self.allowed_users = [DEFAULT_MASTER_USER_ID]
 
     def save_configuration(self):
@@ -964,9 +969,10 @@ class RadXrReceiverApp:
             self.log_message(f"❌ C-STORE error: {e}")
             return 0xC000
 
-    # ---------- PDF Generation (uses pdf_footer_text) ----------
+    # ---------- PDF Generation (with image footer support) ----------
     def generate_pdf_report_from_dicom(self, dcm_path, output_pdf_path):
         import re
+        from PIL import Image as PILImage
 
         ds = pydicom.dcmread(dcm_path)
         try:
@@ -1002,9 +1008,9 @@ class RadXrReceiverApp:
         ]
         available_metadata = [(k, v) for k, v in metadata if v.strip() and v != "N/A"]
 
-        # Clean footer: keep only English letters, digits, spaces, and basic punctuation
-        raw_footer = self.pdf_footer_text.strip()   # <--- USE pdf_footer_text
-        clean_footer = re.sub(r'[^a-zA-Z0-9\s.,!?\'"-]', '', raw_footer).strip()
+        # Determine footer type: image or text
+        footer_image_path = self.pdf_footer_image if self.pdf_footer_image and os.path.exists(self.pdf_footer_image) else None
+        footer_text = self.pdf_footer_text.strip() if not footer_image_path else ""
 
         for frame_idx in range(num_frames):
             frame_array = pixel_array[frame_idx] if is_multi_frame else pixel_array
@@ -1058,15 +1064,61 @@ class RadXrReceiverApp:
             # --- Image (preserve native pixels) ---
             img_w, img_h = image.size
             max_width = width - 80
-            # Reserve space for footer: top line at y=45, bottom at y=9 (36 points gap = 0.5 inch)
-            max_height = y_text - 45
+            # Reserve space for footer: we will compute dynamically based on footer content
+            # Default minimal footer space (for text only)
+            footer_min_height = 45  # points from bottom for lines and text
 
-            scale = 1.0
+            # If footer image exists, we need to reserve more space
+            footer_image_height = 0
+            if footer_image_path:
+                try:
+                    footer_img = PILImage.open(footer_image_path)
+                    f_img_w, f_img_h = footer_img.size
+                    # Scale image to fit width (max 600 pt) and limit height to 144 pt (2 inches)
+                    max_footer_width = width - 80
+                    max_footer_height = 144  # 2 inches
+                    scale = min(max_footer_width / f_img_w, max_footer_height / f_img_h, 1.0)
+                    footer_image_height = f_img_h * scale
+                    # Add some padding
+                    footer_image_height += 20  # 10 pt padding top and bottom
+                except Exception as e:
+                    self.log_message(f"Failed to load footer image: {e}")
+                    footer_image_height = 0
+
+            # Determine footer area: we need at least footer_min_height, plus image height if any
+            footer_height = max(footer_min_height, footer_image_height + 10)
+            # Ensure we don't push image too high; we cap at 45 pt from top of footer area (so lines are at bottom)
+            # We'll set top line at y = footer_height + 5, bottom at y = 5
+            footer_top = footer_height + 5
+            footer_bottom = 5
+            gap = footer_top - footer_bottom
+
+            # Adjust image vertical space: image should be centered between lines
+            # So we compute available height for image = gap - some padding
+            avail_img_height = gap - 8
+            if footer_image_height > 0 and avail_img_height > 0:
+                # Re-scale image to fit within avail_img_height while keeping width
+                footer_img = PILImage.open(footer_image_path)
+                f_img_w, f_img_h = footer_img.size
+                max_w = width - 80
+                max_h = avail_img_height
+                scale = min(max_w / f_img_w, max_h / f_img_h, 1.0)
+                draw_footer_w = f_img_w * scale
+                draw_footer_h = f_img_h * scale
+            else:
+                draw_footer_w = 0
+                draw_footer_h = 0
+
+            # Now we have defined footer_top and footer_bottom; update max_height for main image
+            max_height = y_text - footer_top - 5
+
+            # Main image scaling
+            scale_main = 1.0
             if img_w > max_width or img_h > max_height:
-                scale = min(max_width / img_w, max_height / img_h)
+                scale_main = min(max_width / img_w, max_height / img_h)
 
-            draw_width = img_w * scale
-            draw_height = img_h * scale
+            draw_width = img_w * scale_main
+            draw_height = img_h * scale_main
 
             x_pos = (width - draw_width) / 2
             y_pos = y_text - draw_height
@@ -1077,40 +1129,44 @@ class RadXrReceiverApp:
             if os.path.exists(temp_img_path):
                 os.remove(temp_img_path)
 
-            # --- Footer: two lines with message, fixed 0.5 inch gap ---
-            footer_top = 45      # points from bottom
-            footer_bottom = 9    # 36 points below top = 0.5 inch
-            gap = footer_top - footer_bottom   # 36 pt
-
+            # --- Footer: two lines, with either image or text centered ---
             c.setStrokeColorRGB(0.1, 0.5, 0.7)
             c.setLineWidth(0.5)
 
             # Upper line
             c.line(40, footer_top, width - 40, footer_top)
 
-            # Message if any
-            if clean_footer:
-                max_text_width = width - 80
-                font_size = 12
-                for size in range(12, 5, -1):
-                    c.setFont("Helvetica-Bold", size)
-                    if c.stringWidth(clean_footer, "Helvetica-Bold", size) <= max_text_width:
-                        font_size = size
-                        break
-                else:
-                    font_size = 6
-                    # Truncate with ellipsis if still too wide at 6pt
-                    while c.stringWidth(clean_footer + "...", "Helvetica-Bold", 6) > max_text_width and len(clean_footer) > 1:
-                        clean_footer = clean_footer[:-1]
-                    if clean_footer:
-                        clean_footer += "..."
+            # Draw footer content (image or text)
+            if footer_image_path and draw_footer_w > 0 and draw_footer_h > 0:
+                # Center the image between the lines
+                x_footer = (width - draw_footer_w) / 2
+                y_footer = footer_bottom + (gap / 2) - (draw_footer_h / 2)
+                # Draw image (use temp file or directly from path)
+                c.drawImage(footer_image_path, x_footer, y_footer, width=draw_footer_w, height=draw_footer_h,
+                            preserveAspectRatio=True, anchor='c')
+            elif footer_text and not footer_image_path:
+                # Text footer (clean)
+                clean_footer = re.sub(r'[^a-zA-Z0-9\s.,!?\'"-]', '', footer_text).strip()
+                if clean_footer:
+                    max_text_width = width - 80
+                    font_size = 12
+                    for size in range(12, 5, -1):
+                        c.setFont("Helvetica-Bold", size)
+                        if c.stringWidth(clean_footer, "Helvetica-Bold", size) <= max_text_width:
+                            font_size = size
+                            break
+                    else:
+                        font_size = 6
+                        while c.stringWidth(clean_footer + "...", "Helvetica-Bold", 6) > max_text_width and len(clean_footer) > 1:
+                            clean_footer = clean_footer[:-1]
+                        if clean_footer:
+                            clean_footer += "..."
 
-                c.setFont("Helvetica-Bold", font_size)
-                text_width = c.stringWidth(clean_footer, "Helvetica-Bold", font_size)
-                x_text = (width - text_width) / 2
-                # Center vertically between the lines
-                y_text_footer = footer_bottom + (gap / 2) - (font_size * 0.35)
-                c.drawString(x_text, y_text_footer, clean_footer)
+                    c.setFont("Helvetica-Bold", font_size)
+                    text_width = c.stringWidth(clean_footer, "Helvetica-Bold", font_size)
+                    x_text = (width - text_width) / 2
+                    y_text_footer = footer_bottom + (gap / 2) - (font_size * 0.35)
+                    c.drawString(x_text, y_text_footer, clean_footer)
 
             # Lower line
             c.line(40, footer_bottom, width - 40, footer_bottom)
@@ -1192,7 +1248,7 @@ class RadXrReceiverApp:
             f"🆔 *Patient ID:* {p_id}\n"
             f"🔢 *Accession No:* {acc_no}\n"
         )
-        if include_footer and self.footer_message.strip():   # <--- USE footer_message for caption
+        if include_footer and self.footer_message.strip():
             caption += f"\n{self.footer_message.strip()}\n"
         caption += f"\n*Made with ❤️ by Sandeep*"
         return caption
@@ -1284,7 +1340,7 @@ class RadXrReceiverApp:
             self.log_message(f"WhatsApp error: {e}")
             return False
 
-    # ---------- Telegram Bot Polling ----------
+    # ---------- Telegram Bot Polling (with image footer support) ----------
     def start_telegram_bot_polling(self):
         t = threading.Thread(target=self.telegram_bot_polling_worker, daemon=True)
         t.start()
@@ -1372,7 +1428,7 @@ class RadXrReceiverApp:
                                     self._send_message(base_url, chat_id, "❌ Please provide a user ID: `/remove <userid>`")
                                 continue
 
-                            # /message <text>  --> sets caption message only
+                            # /message <text>  (caption message)
                             if text.lower().startswith("/message "):
                                 new_msg = text[9:].strip()
                                 self.footer_message = new_msg
@@ -1382,14 +1438,65 @@ class RadXrReceiverApp:
                                 self.log_message(f"Caption message changed to: {new_msg}")
                                 continue
 
-                            # /footer <text>  --> sets PDF footer text
-                            if text.lower().startswith("/footer "):
-                                new_footer = text[8:].strip()
-                                self.pdf_footer_text = new_footer
-                                self.config["pdf_footer_text"] = new_footer
-                                self.save_configuration()
-                                self._send_message(base_url, chat_id, f"✅ PDF footer text updated to:\n\n{new_footer}")
-                                self.log_message(f"PDF footer text changed to: {new_footer}")
+                            # /footer handling: reply to photo -> set image footer; else text footer
+                            if text.lower().startswith("/footer"):
+                                # Check if this is a reply to a photo
+                                reply_to = msg.get("reply_to_message")
+                                if reply_to and "photo" in reply_to:
+                                    # Download the photo
+                                    try:
+                                        # Get the largest photo (last in array)
+                                        photos = reply_to["photo"]
+                                        largest = photos[-1]
+                                        file_id = largest["file_id"]
+                                        # Get file path
+                                        get_file_url = f"{base_url}/getFile?file_id={file_id}"
+                                        file_resp = requests.get(get_file_url, timeout=10)
+                                        if file_resp.status_code == 200:
+                                            file_data = file_resp.json()
+                                            if file_data.get("ok"):
+                                                file_path = file_data["result"]["file_path"]
+                                                download_url = f"https://api.telegram.org/file/bot{self.TELEGRAM_BOT_TOKEN}/{file_path}"
+                                                img_resp = requests.get(download_url, timeout=30)
+                                                if img_resp.status_code == 200:
+                                                    with open(FOOTER_IMAGE_PATH, "wb") as f:
+                                                        f.write(img_resp.content)
+                                                    self.pdf_footer_image = FOOTER_IMAGE_PATH
+                                                    self.config["pdf_footer_image"] = FOOTER_IMAGE_PATH
+                                                    # Clear any existing text footer
+                                                    self.pdf_footer_text = ""
+                                                    self.config["pdf_footer_text"] = ""
+                                                    self.save_configuration()
+                                                    self._send_message(base_url, chat_id, "✅ PDF footer image updated successfully.")
+                                                    self.log_message("PDF footer image set from reply photo.")
+                                                else:
+                                                    self._send_message(base_url, chat_id, "❌ Failed to download photo.")
+                                            else:
+                                                self._send_message(base_url, chat_id, "❌ Failed to get file info.")
+                                        else:
+                                            self._send_message(base_url, chat_id, "❌ Failed to fetch file info from Telegram.")
+                                    except Exception as e:
+                                        self._send_message(base_url, chat_id, f"❌ Error: {e}")
+                                        self.log_message(f"Error setting footer image: {e}")
+                                else:
+                                    # Text footer: clear image and set text
+                                    if self.pdf_footer_image and os.path.exists(self.pdf_footer_image):
+                                        try:
+                                            os.remove(self.pdf_footer_image)
+                                        except:
+                                            pass
+                                        self.pdf_footer_image = ""
+                                        self.config["pdf_footer_image"] = ""
+                                    # Extract text after /footer
+                                    new_footer = text[7:].strip() if len(text) > 7 else ""
+                                    self.pdf_footer_text = new_footer
+                                    self.config["pdf_footer_text"] = new_footer
+                                    self.save_configuration()
+                                    if new_footer:
+                                        self._send_message(base_url, chat_id, f"✅ PDF footer text updated to:\n\n{new_footer}")
+                                    else:
+                                        self._send_message(base_url, chat_id, "✅ PDF footer text cleared.")
+                                    self.log_message(f"PDF footer text set to: {new_footer}")
                                 continue
 
                             # /broadcast <message>
@@ -1432,6 +1539,7 @@ class RadXrReceiverApp:
                                     "/remove `<userid>` – Remove a user from broadcast list.\n"
                                     "/message `<text>` – Set caption message for Telegram/WhatsApp.\n"
                                     "/footer `<text>` – Set text inside PDF footer (between two lines).\n"
+                                    "Reply to a **photo** with `/footer` – set that photo as the PDF footer image.\n"
                                     "/broadcast `<message>` – Send text message to all users.\n"
                                     "Reply to any message with `/broadcast` – forward that message to all users.\n"
                                     "/recharge `<number>` – Add WhatsApp sending credits.\n"

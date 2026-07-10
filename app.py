@@ -78,31 +78,25 @@ class RadXrReceiverApp:
             "receive_folder": "D:\\RAD-XR\\Inbox",
             "archive_folder": "D:\\RAD-XR\\Archive",
             "telegram_bot_token": DEFAULT_TELEGRAM_BOT_TOKEN,
-            # master_user_id and allowed_users are NOT saved in config
-            "footer_message": ""                         # custom message set via /message
+            "footer_message": ""
         }
         
-        # These are loaded from config or defaults, but master ID is fixed
         self.TELEGRAM_BOT_TOKEN = None
-        self.TELEGRAM_MASTER_USER_ID = DEFAULT_MASTER_USER_ID   # fixed
-        self.allowed_users = [DEFAULT_MASTER_USER_ID]           # fixed initial
+        self.TELEGRAM_MASTER_USER_ID = DEFAULT_MASTER_USER_ID
+        self.allowed_users = [DEFAULT_MASTER_USER_ID]
         self.footer_message = ""
         
         self.server_instance = None
         self.is_listening = False
         self.bot_running = True
-        self.queue_data = {}      # file_path -> row_id
+        self.queue_data = {}
         self.last_update_id = 0
         
         self.observer = None
         self.monitoring_active = False
-        
-        # Progress tracking
         self.indexing_in_progress = False
         self.lbl_index_progress_monitor = None
         self.lbl_index_progress_config = None
-        
-        # Log console
         self.log_widget = None
         
         self.load_configuration()
@@ -135,7 +129,6 @@ class RadXrReceiverApp:
                     self.config.update(loaded_data)
             except Exception:
                 pass
-        # Ensure required keys exist
         self.config.setdefault("telegram_bot_token", DEFAULT_TELEGRAM_BOT_TOKEN)
         self.config.setdefault("footer_message", "")
         self.config.setdefault("whatsapp_api_key", DEFAULT_WHATSAPP_API_KEY)
@@ -146,22 +139,11 @@ class RadXrReceiverApp:
         self.config.setdefault("receive_folder", "D:\\RAD-XR\\Inbox")
         self.config.setdefault("archive_folder", "D:\\RAD-XR\\Archive")
         
-        # Assign instance variables
         self.TELEGRAM_BOT_TOKEN = self.config["telegram_bot_token"]
         self.footer_message = self.config.get("footer_message", "")
-        # allowed_users is always master only initially, but we load from config if present
-        # However we don't store allowed_users in config to keep master control
-        # We'll keep a separate list in memory only, no persistence needed because master can re-add users.
-        # To persist, we could store but we want to keep master ID fixed, so we'll just use the config if exists? But we decided not to store.
-        # We'll maintain allowed_users in memory only, starting with master.
         self.allowed_users = [DEFAULT_MASTER_USER_ID]
 
     def save_configuration(self):
-        # Save only non‑sensitive items (no master password, no master user id)
-        # We'll save all config except password_verified? password_verified can be saved.
-        # We'll save: whatsapp_api_key, institute_name, ae_title, ip_address, port,
-        # receive_folder, archive_folder, telegram_bot_token, footer_message
-        # Do NOT save master_user_id or allowed_users
         try:
             with open(CONFIG_FILE, "w") as f:
                 json.dump(self.config, f, indent=4)
@@ -174,7 +156,6 @@ class RadXrReceiverApp:
         style.configure("TNotebook", background=self.bg_dark, borderwidth=0)
         style.configure("TNotebook.Tab", background=self.bg_card, foreground="#9ca3af", borderwidth=0, font=("Arial", 10, "bold"))
         style.map("TNotebook.Tab", background=[("selected", self.accent_cyan)], foreground=[("selected", self.bg_dark)])
-        
         style.configure("Treeview", background=self.bg_card, fieldbackground=self.bg_card, foreground=self.text_light, borderwidth=0, font=("Arial", 10), rowheight=28)
         style.configure("Treeview.Heading", background="#374151", foreground=self.text_light, borderwidth=0, font=("Arial", 10, "bold"))
         style.map("Treeview", background=[("selected", "#4b5563")])
@@ -184,9 +165,7 @@ class RadXrReceiverApp:
         for widget in self.root.winfo_children():
             widget.destroy()
 
-    # ---------- Logging with Immediate Flush ----------
     def log_message(self, msg):
-        """Append a message to the console log and print to stdout with flush."""
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         full_msg = f"[{timestamp}] {msg}"
         print(full_msg, flush=True)
@@ -195,9 +174,8 @@ class RadXrReceiverApp:
             self.log_widget.see(END)
             self.root.update_idletasks()
 
-    # ---------- SQLite Database Functions (using fixed DATABASE_PATH) ----------
+    # ---------- Database ----------
     def init_db(self):
-        # Ensure database directory exists
         os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
@@ -225,7 +203,6 @@ class RadXrReceiverApp:
             self.indexing_in_progress = False
             return
 
-        # Initialize DB (creates table if not exists)
         self.init_db()
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
@@ -316,7 +293,7 @@ class RadXrReceiverApp:
     def index_dicom_file(self, dcm_path, patient_id, patient_name, accession_no):
         if not os.path.exists(dcm_path):
             return
-        self.init_db()  # ensure DB exists
+        self.init_db()
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
         c.execute("INSERT OR IGNORE INTO dicom_index (file_path, accession, patient_id, patient_name, created_at) VALUES (?,?,?,?,?)",
@@ -325,12 +302,16 @@ class RadXrReceiverApp:
         conn.close()
 
     def get_patient_files_from_db(self, q_id, q_name):
-        # Returns list of (file_path, patient_id, patient_name, accession) for matching entries
+        # Exact match on patient_id, first 4 chars of patient_name
         self.init_db()
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
-        c.execute("SELECT file_path, patient_id, patient_name, accession FROM dicom_index WHERE patient_id LIKE ? AND LOWER(patient_name) LIKE ?", 
-                  (f"%{q_id}%", f"%{q_name.lower()}%"))
+        name_prefix = q_name[:4].lower() if len(q_name) >= 4 else q_name.lower()
+        c.execute("""
+            SELECT file_path, patient_id, patient_name, accession
+            FROM dicom_index
+            WHERE patient_id = ? AND LOWER(patient_name) LIKE ?
+        """, (q_id.strip(), f"{name_prefix}%"))
         results = c.fetchall()
         conn.close()
         return results
@@ -340,16 +321,13 @@ class RadXrReceiverApp:
         self.clear_screen()
         main_card = Frame(self.root, bg=self.bg_card, bd=0)
         main_card.place(relx=0.5, rely=0.5, anchor="center", width=420, height=350)
-        
         Label(main_card, text="RAD-XR SYSTEM NODE", font=("Arial", 18, "bold"), fg=self.accent_cyan, bg=self.bg_card).pack(pady=(40, 5))
         Label(main_card, text="Enterprise Activation Gateway", font=("Arial", 10), fg="#9ca3af", bg=self.bg_card).pack(pady=(0, 25))
         Label(main_card, text="Node Master Password:", font=("Arial", 10, "bold"), fg=self.text_light, bg=self.bg_card).pack(anchor="w", padx=45, pady=5)
-        
         self.pass_var = StringVar()
         entry_pass = Entry(main_card, textvariable=self.pass_var, show="*", font=("Arial", 12), width=28, justify="center", bg=self.bg_dark, fg=self.text_light, bd=1, insertbackground="white")
         entry_pass.pack(pady=5)
         entry_pass.focus()
-        
         btn_verify = Button(main_card, text="Verify Node", font=("Arial", 11, "bold"), bg=self.accent_cyan, fg=self.bg_dark, width=18, activebackground="#0891b2", bd=0, cursor="hand2", command=self.verify_master_password)
         btn_verify.pack(pady=35)
 
@@ -370,39 +348,30 @@ class RadXrReceiverApp:
         self.clear_screen()
         notebook = ttk.Notebook(self.root)
         notebook.pack(fill="both", expand=True, padx=15, pady=15)
-        
         frame_receiver = Frame(notebook, bg=self.bg_dark)
         frame_settings = Frame(notebook, bg=self.bg_dark)
-        
         notebook.add(frame_receiver, text="  Live Monitor  ")
         notebook.add(frame_settings, text="  Config Control  ")
-        
+
         # ----- Live Monitor Tab -----
         top_ctrl_bar = Frame(frame_receiver, bg=self.bg_dark)
         top_ctrl_bar.pack(fill="x", pady=15, padx=15)
-        
         Label(top_ctrl_bar, text="RAD-XR PROCESS CONTROL", font=("Arial", 14, "bold"), fg=self.text_light, bg=self.bg_dark).pack(side="left")
-        
         self.status_var = StringVar(value="● Stopped")
         self.lbl_status_indicator = Label(top_ctrl_bar, textvariable=self.status_var, font=("Arial", 11, "bold"), fg=self.accent_red, bg=self.bg_dark)
         self.lbl_status_indicator.pack(side="left", padx=20)
-        
         btn_manual_upload = Button(top_ctrl_bar, text="+ Import DICOM File", font=("Arial", 9, "bold"), bg=self.accent_cyan, fg=self.bg_dark, bd=0, padx=10, pady=5, cursor="hand2", command=self.manual_file_upload_trigger)
         btn_manual_upload.pack(side="right", padx=5)
-        
         self.btn_toggle_server = Button(top_ctrl_bar, text="Start Server", bg=self.accent_green, fg=self.bg_dark, font=("Arial", 9, "bold"), bd=0, padx=10, pady=5, width=12, cursor="hand2", command=self.toggle_server_process)
         self.btn_toggle_server.pack(side="right", padx=5)
 
         content_splitter = Frame(frame_receiver, bg=self.bg_dark)
         content_splitter.pack(fill="both", expand=True, padx=15, pady=5)
-        
-        # Left panel: network config
         net_card = Frame(content_splitter, bg=self.bg_card, width=220)
         net_card.pack(side="left", fill="y", padx=(0, 10))
         net_card.pack_propagate(False)
-        
         Label(net_card, text="NETWORK CONFIG", font=("Arial", 10, "bold"), fg=self.accent_cyan, bg=self.bg_card).pack(pady=15)
-        
+
         def add_stat_lbl(parent, name, val_attr):
             Label(parent, text=name, font=("Arial", 8, "bold"), fg="#9ca3af", bg=self.bg_card).pack(anchor="w", padx=15, pady=(5, 0))
             lbl_v = Label(parent, text=self.config.get(val_attr, "N/A"), font=("Arial", 9), fg=self.text_light, bg=self.bg_card, wraplength=190, justify="left")
@@ -415,19 +384,15 @@ class RadXrReceiverApp:
         self.lbl_port = add_stat_lbl(net_card, "PORT NUMBER", "port")
         self.lbl_folder = add_stat_lbl(net_card, "INBOX DIRECTORY", "receive_folder")
         self.lbl_archive = add_stat_lbl(net_card, "ARCHIVE SYSTEM", "archive_folder")
-        
         Label(net_card, text="📁 FOLDER WATCH", font=("Arial", 8, "bold"), fg=self.accent_green if self.monitoring_active else self.accent_red, bg=self.bg_card).pack(anchor="w", padx=15, pady=(10,0))
         Label(net_card, text="ACTIVE" if self.monitoring_active else "INACTIVE", font=("Arial", 9, "bold"), fg=self.accent_green if self.monitoring_active else self.accent_red, bg=self.bg_card).pack(anchor="w", padx=15, pady=(0, 10))
-        
         Button(net_card, text="Refresh Dashboard", font=("Arial", 8, "bold"), bg="#4b5563", fg=self.text_light, bd=0, width=20, cursor="hand2", command=self.sync_archive_folder_to_dashboard).pack(side="bottom", pady=20)
-        
-        # Right panel: grid + console
+
         right_panel = Frame(content_splitter, bg=self.bg_card)
         right_panel.pack(side="right", fill="both", expand=True)
-        
         queue_container = Frame(right_panel, bg=self.bg_card)
         queue_container.pack(fill="both", expand=True)
-        
+
         cols = ("id", "name", "accession", "file", "status")
         self.tree = ttk.Treeview(queue_container, columns=cols, show="headings")
         self.tree.heading("id", text="Patient ID")
@@ -435,31 +400,26 @@ class RadXrReceiverApp:
         self.tree.heading("accession", text="Accession No.")
         self.tree.heading("file", text="File Name")
         self.tree.heading("status", text="Status")
-        
         self.tree.column("id", width=90, anchor="center")
         self.tree.column("name", width=140, anchor="w")
         self.tree.column("accession", width=100, anchor="center")
         self.tree.column("file", width=120, anchor="w")
         self.tree.column("status", width=100, anchor="center")
-        
         self.tree.pack(fill="both", expand=True, side="left")
         self.tree.bind("<Double-1>", self.on_grid_row_double_click_resend)
-        
         scrollbar = ttk.Scrollbar(queue_container, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
-        
-        # ---- Console Log Frame ----
+
+        # Console Log
         log_frame = Frame(right_panel, bg=self.bg_dark, height=120)
         log_frame.pack(fill="x", pady=(5,0))
         log_frame.pack_propagate(False)
-        
         log_header = Frame(log_frame, bg=self.bg_dark)
         log_header.pack(fill="x")
         Label(log_header, text="📋 Console Log", font=("Arial", 9, "bold"), fg=self.accent_cyan, bg=self.bg_dark).pack(side="left")
         Button(log_header, text="📋 Copy Log", font=("Arial", 8, "bold"), bg="#4b5563", fg=self.text_light, bd=0, padx=5, pady=2, cursor="hand2", command=self.copy_log).pack(side="right", padx=2)
         Button(log_header, text="🗑️ Clear Log", font=("Arial", 8, "bold"), bg="#4b5563", fg=self.text_light, bd=0, padx=5, pady=2, cursor="hand2", command=self.clear_log).pack(side="right", padx=2)
-        
         log_text_frame = Frame(log_frame, bg=self.bg_dark)
         log_text_frame.pack(fill="both", expand=True)
         self.log_widget = Text(log_text_frame, bg=self.bg_dark, fg=self.text_light, font=("Courier", 8), wrap="word", height=5)
@@ -467,20 +427,18 @@ class RadXrReceiverApp:
         log_scroll = Scrollbar(log_text_frame, command=self.log_widget.yview)
         log_scroll.pack(side="right", fill="y")
         self.log_widget.config(yscrollcommand=log_scroll.set)
-        
-        # ---- Progress label (bottom) ----
+
         progress_frame = Frame(frame_receiver, bg=self.bg_dark)
         progress_frame.pack(fill="x", padx=15, pady=5)
         self.lbl_index_progress_monitor = Label(progress_frame, text="✅ Indexing ready.", font=("Arial", 9), fg=self.accent_green, bg=self.bg_dark)
         self.lbl_index_progress_monitor.pack(side="left")
         Label(progress_frame, text="Made with ❤️ by Sandeep", font=("Arial", 9, "bold", "italic"), fg="#6b7280", bg=self.bg_dark).pack(side="right")
-        
+
         # ----- Config Control Tab -----
         Label(frame_settings, text="SYSTEM INITIALIZATION TARGETS", font=("Arial", 14, "bold"), fg=self.accent_cyan, bg=self.bg_dark).pack(pady=15)
-        
         form = Frame(frame_settings, bg=self.bg_card)
         form.pack(padx=30, fill="both", expand=True, pady=10)
-        
+
         def make_entry(lbl_txt, attr):
             f = Frame(form, bg=self.bg_card)
             f.pack(fill="x", pady=6, padx=20)
@@ -495,7 +453,7 @@ class RadXrReceiverApp:
         self.ent_ae_title = make_entry("Storage AE Title:", "ae_title")
         self.ent_ip_addr = make_entry("Host Local IP Address:", "ip_address")
         self.ent_port_num = make_entry("Server Dynamic Port:", "port")
-        
+
         f_dir1 = Frame(form, bg=self.bg_card)
         f_dir1.pack(fill="x", pady=6, padx=20)
         Label(f_dir1, text="Dynamic Cache Folder (Inbox):", font=("Arial", 9, "bold"), fg=self.text_light, bg=self.bg_card, width=25, anchor="w").pack(side="left")
@@ -503,7 +461,7 @@ class RadXrReceiverApp:
         self.ent_folder_path.pack(side="left", fill="x", expand=True, padx=5)
         self.ent_folder_path.insert(0, self.config["receive_folder"])
         Button(f_dir1, text="Browse", font=("Arial", 8, "bold"), bg="#4b5563", fg=self.text_light, bd=0, command=lambda: self.pick_directory("receive_folder", self.ent_folder_path)).pack(side="left", padx=2)
-        
+
         f_dir2 = Frame(form, bg=self.bg_card)
         f_dir2.pack(fill="x", pady=6, padx=20)
         Label(f_dir2, text="Local Archive Directory (Bot):", font=("Arial", 9, "bold"), fg=self.text_light, bg=self.bg_card, width=25, anchor="w").pack(side="left")
@@ -512,7 +470,6 @@ class RadXrReceiverApp:
         self.ent_archive_path.insert(0, self.config.get("archive_folder", "D:\\RAD-XR\\Archive"))
         Button(f_dir2, text="Browse", font=("Arial", 8, "bold"), bg="#4b5563", fg=self.text_light, bd=0, command=lambda: self.pick_directory("archive_folder", self.ent_archive_path)).pack(side="left", padx=2)
 
-        # ---- Database path display (fixed) ----
         db_frame = Frame(form, bg=self.bg_card)
         db_frame.pack(fill="x", pady=5, padx=20)
         Label(db_frame, text="Database Path (fixed):", font=("Arial", 9, "bold"), fg=self.text_light, bg=self.bg_card).pack(anchor="w")
@@ -521,12 +478,10 @@ class RadXrReceiverApp:
         Button(db_frame, text="📋 Copy Path", font=("Arial", 8, "bold"), bg="#4b5563", fg=self.text_light, bd=0, padx=5, pady=2, cursor="hand2",
                command=lambda: self.copy_to_clipboard(DATABASE_PATH)).pack(side="left", padx=10)
 
-        # Progress label (config tab)
         self.lbl_index_progress_config = Label(form, text="✅ Indexing ready.", font=("Arial", 9), fg=self.accent_green, bg=self.bg_card)
         self.lbl_index_progress_config.pack(anchor="w", padx=20, pady=(5,10))
-        # Re-index button
         Button(form, text="🔄 Re-index Archive (Full Rebuild)", font=("Arial", 9, "bold"), bg=self.accent_cyan, fg=self.bg_dark, bd=0, padx=10, pady=5, cursor="hand2", command=self.reindex_archive).pack(anchor="w", padx=20, pady=5)
-        
+
         Button(frame_settings, text="Apply Node Topology Changes", font=("Arial", 11, "bold"), bg=self.accent_green, fg=self.bg_dark, width=28, bd=0, cursor="hand2", command=self.apply_and_save_node_settings).pack(pady=15)
         Label(frame_settings, text="Made with ❤️ by Sandeep", font=("Arial", 9, "bold", "italic"), fg="#6b7280", bg=self.bg_dark).pack(side="bottom", pady=5)
 
@@ -558,7 +513,6 @@ class RadXrReceiverApp:
         archive_dir = self.config.get("archive_folder", "D:\\RAD-XR\\Archive")
         if not os.path.exists(archive_dir):
             return
-            
         def worker():
             for file in os.listdir(archive_dir):
                 if file.lower().endswith(".dcm"):
@@ -591,7 +545,6 @@ class RadXrReceiverApp:
         self.config["archive_folder"] = self.ent_archive_path.get().strip()
         self.save_configuration()
         messagebox.showinfo("System Config", "RAD-XR Core configurations updated successfully!")
-        # Restart with new archive folder monitoring
         self.show_main_dashboard()
         self.sync_archive_folder_to_dashboard()
         threading.Thread(target=self.index_all_existing_files, daemon=True).start()
@@ -623,7 +576,6 @@ class RadXrReceiverApp:
             else:
                 messagebox.showerror("Error", "File not found.")
                 return
-        
         if "Failed" in status:
             res = messagebox.askyesno("Resend Trigger", f"Re-dispatch pipeline for file: {file_name}?")
             if res:
@@ -634,11 +586,10 @@ class RadXrReceiverApp:
                 else:
                     messagebox.showerror("Error", "File no longer exists.")
 
-    # ---------- SERVER START – WITH TIMEOUT AND FLUSH ----------
+    # ---------- SERVER ----------
     def toggle_server_process(self):
         if not self.is_listening:
             port = int(self.config["port"])
-            # Check if port is already in use
             test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             result = test_sock.connect_ex(('0.0.0.0', port))
             test_sock.close()
@@ -671,52 +622,39 @@ class RadXrReceiverApp:
 
     def run_dicom_scp_listener(self):
         ae = AE()
-        # Sanitize AE title
         raw_ae = self.config["ae_title"]
         sanitized = ''.join(c if c.isalnum() or c in ' _' else '_' for c in raw_ae)
         ae.ae_title = sanitized
         self.log_message(f"   Sanitized AE Title: '{ae.ae_title}'")
-        
         try:
-            # 1. Verification (C-ECHO) support
             ae.add_supported_context("1.2.840.10008.1.1")
-            
-            # 2. Add common Storage SOP Classes
             common_storage_classes = [
-                "1.2.840.10008.5.1.4.1.1.1",     # Computed Radiography Image Storage
-                "1.2.840.10008.5.1.4.1.1.2",     # CT Image Storage
-                "1.2.840.10008.5.1.4.1.1.4",     # MR Image Storage
-                "1.2.840.10008.5.1.4.1.1.7",     # Secondary Capture Image Storage
-                "1.2.840.10008.5.1.4.1.1.12.1",  # X-Ray Angiographic Image Storage
-                "1.2.840.10008.5.1.4.1.1.12.2",  # X-Ray Radiofluoroscopic Image Storage
-                "1.2.840.10008.5.1.4.1.1.20",    # Nuclear Medicine Image Storage
-                "1.2.840.10008.5.1.4.1.1.6.1",   # Ultrasound Image Storage
+                "1.2.840.10008.5.1.4.1.1.1",
+                "1.2.840.10008.5.1.4.1.1.2",
+                "1.2.840.10008.5.1.4.1.1.4",
+                "1.2.840.10008.5.1.4.1.1.7",
+                "1.2.840.10008.5.1.4.1.1.12.1",
+                "1.2.840.10008.5.1.4.1.1.12.2",
+                "1.2.840.10008.5.1.4.1.1.20",
+                "1.2.840.10008.5.1.4.1.1.6.1",
             ]
-            
             for uid in common_storage_classes:
                 ae.add_supported_context(uid)
-
             handlers = [
                 (evt.EVT_C_STORE, self.handle_incoming_c_store),
                 (evt.EVT_C_ECHO, self.handle_incoming_c_echo)
             ]
-
             self.log_message("⏳ Attempting to bind to 0.0.0.0:" + self.config["port"])
-            
-            # Safe flush check
             if sys.stdout is not None:
                 sys.stdout.flush()
-
             self.server_instance = ae.start_server(
                 ("0.0.0.0", int(self.config["port"])),
                 block=False,
                 evt_handlers=handlers
             )
             self.log_message("✅ start_server() returned successfully (immediate).")
-            
             self.log_message("⏳ Waiting 2 seconds for OS to bind...")
             time.sleep(2)
-            
             self.log_message("🔍 Verifying port is open...")
             test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             test_sock.settimeout(3)
@@ -731,11 +669,10 @@ class RadXrReceiverApp:
                 self.log_message(f"❌ Verification connection failed: {conn_err}")
                 self.root.after(0, self._server_failed_to_start, f"Port {self.config['port']} is NOT open. Error: {conn_err}")
                 return
-                
         except Exception as e:
             self.log_message(f"❌ Server start exception: {e}")
             self.root.after(0, self._server_failed_to_start, str(e))
-            
+
     def _server_started_successfully(self):
         self.status_var.set("● Listening")
         self.lbl_status_indicator.config(fg=self.accent_green)
@@ -764,12 +701,12 @@ class RadXrReceiverApp:
             self.log_message(f"📥 C-STORE received for Accession: {accession_number} from {event.assoc.requestor.ae_title}")
             processing_thread = threading.Thread(target=self.autonomous_processing_pipeline, args=(filepath, False), daemon=True)
             processing_thread.start()
-            return 0x0000 
+            return 0x0000
         except Exception as e:
             self.log_message(f"❌ C-STORE error: {e}")
             return 0xC000
 
-    # ---------- PDF Generation with Footer Message ----------
+    # ---------- PDF Generation ----------
     def generate_pdf_report_from_dicom(self, dcm_path, output_pdf_path):
         ds = pydicom.dcmread(dcm_path)
         try:
@@ -805,7 +742,6 @@ class RadXrReceiverApp:
         ]
         available_metadata = [(k, v) for k, v in metadata if v.strip() and v != "N/A"]
 
-        # Footer text (if any)
         footer_text = self.footer_message.strip()
 
         for frame_idx in range(num_frames):
@@ -826,17 +762,14 @@ class RadXrReceiverApp:
             temp_img_path = f"workflow_temp_frame_{frame_idx}_{int(time.time())}.jpg"
             image.save(temp_img_path, quality=95)
 
-            # Header: Institute Name
             c.setFont("Helvetica-Bold", 14)
             c.drawString(40, height - 40, self.config["institute_name"])
             c.setFont("Helvetica-Oblique", 9)
             c.drawRightString(width - 40, height - 40, f"Page {frame_idx + 1} of {num_frames}")
-            
             c.setLineWidth(1)
-            c.setStrokeColorRGB(0.1, 0.5, 0.7) 
+            c.setStrokeColorRGB(0.1, 0.5, 0.7)
             c.line(40, height - 46, width - 40, height - 46)
 
-            # Metadata
             c.setFont("Helvetica", 10)
             y_text = height - 65
             col = 0
@@ -858,7 +791,6 @@ class RadXrReceiverApp:
             c.line(40, y_text, width - 40, y_text)
             y_text -= 15
 
-            # Image
             img_w, img_h = image.size
             display_width = width - 80
             display_height = (img_h / img_w) * display_width
@@ -872,18 +804,15 @@ class RadXrReceiverApp:
             y_pos = y_text - display_height
 
             c.drawImage(temp_img_path, x_pos, y_pos, width=display_width, height=display_height)
-            
             if os.path.exists(temp_img_path):
                 os.remove(temp_img_path)
 
-            # --- Footer (custom message) ---
             if footer_text:
                 c.setFont("Helvetica", 8)
                 c.setFillColorRGB(0.4, 0.4, 0.4)
-                # Place at the bottom, centered
                 footer_y = 30
                 c.drawCentredString(width / 2, footer_y, footer_text)
-                c.setFillColorRGB(0, 0, 0)  # reset
+                c.setFillColorRGB(0, 0, 0)
 
             if frame_idx < num_frames - 1:
                 c.showPage()
@@ -892,7 +821,7 @@ class RadXrReceiverApp:
         c.save()
         return patient_id, patient_name, accession_no
 
-    # ---------- Main Processing Pipeline ----------
+    # ---------- Processing Pipeline ----------
     def autonomous_processing_pipeline(self, dcm_path, is_manual_import=False):
         pdf_output_path = ""
         try:
@@ -912,20 +841,17 @@ class RadXrReceiverApp:
 
             self.index_dicom_file(dcm_path_for_index, patient_id, patient_name, accession_no)
 
-            # Generate PDF with patient name in filename
             clean_pname = "".join(x for x in patient_name if x.isalnum() or x in " -_")
             pdf_output_path = os.path.join(
-                self.config["receive_folder"], 
+                self.config["receive_folder"],
                 f"{clean_pname}'s medical report.pdf"
             )
-            # Generate PDF
             self.generate_pdf_report_from_dicom(dcm_path_for_index, pdf_output_path)
 
             file_key = dcm_path_for_index
             self.root.after(0, lambda: self.upsert_grid_record(file_key, patient_id, patient_name, accession_no, "⏳ Processing"))
             self.root.after(0, lambda: self.upsert_grid_record(file_key, patient_id, patient_name, accession_no, "📤 Sending"))
-            
-            # Send to all Telegram users + WhatsApp
+
             tg_ok = self.send_to_all_telegram(pdf_output_path, patient_id, patient_name, accession_no)
             wa_ok = True
             if self.config["whatsapp_api_key"]:
@@ -939,7 +865,6 @@ class RadXrReceiverApp:
                     os.remove(dcm_path)
             else:
                 self.root.after(0, lambda: self.upsert_grid_record(file_key, patient_id, patient_name, accession_no, "Failed ❌ (Double-Click)"))
-                
         except Exception as e:
             self.root.after(0, lambda: messagebox.showerror("Pipeline Error", f"Error: {str(e)}"))
             self.log_message(f"❌ Pipeline error: {e}")
@@ -963,13 +888,12 @@ class RadXrReceiverApp:
             f"🔢 *Accession No:* {acc_no}\n"
         )
         if include_footer and self.footer_message.strip():
-            caption += f"\n {self.footer_message.strip()}\n"
-        caption += f"\n *Made with ❤️ by Sandeep*"
+            caption += f"\n{self.footer_message.strip()}\n"
+        caption += f"\n*Made with ❤️ by Sandeep*"
         return caption
 
-    # ---------- Telegram Sending (to all allowed users) ----------
+    # ---------- Telegram Sending ----------
     def send_to_all_telegram(self, file_path, p_id, p_name, acc_no):
-        """Send PDF to all allowed Telegram users (master + added users)."""
         success = True
         for chat_id in self.allowed_users:
             ok = self.dispatch_to_telegram(file_path, p_id, p_name, acc_no, chat_id)
@@ -1003,7 +927,7 @@ class RadXrReceiverApp:
             target_phone = "91" + target_phone
 
         headers = {"Authorization": f"Bearer {self.config['whatsapp_api_key']}"}
-        upload_url = "https://graph.facebook.com/v18.0/me/media" 
+        upload_url = "https://graph.facebook.com/v18.0/me/media"
         try:
             caption_text = self.build_beautiful_caption_string(p_id, p_name, acc_no, include_footer=True)
             clean_caption = caption_text.replace("*", "").replace("_", "")
@@ -1033,7 +957,7 @@ class RadXrReceiverApp:
             self.log_message(f"WhatsApp send error: {e}")
             return False
 
-    # ---------- Telegram Bot Polling with Commands ----------
+    # ---------- Telegram Bot Polling ----------
     def start_telegram_bot_polling(self):
         t = threading.Thread(target=self.telegram_bot_polling_worker, daemon=True)
         t.start()
@@ -1052,8 +976,8 @@ class RadXrReceiverApp:
                             msg = update["message"]
                             chat_id = str(msg["chat"]["id"])
                             text = msg["text"].strip()
-                            
-                            # --- Command Handling ---
+
+                            # /start
                             if text.lower().startswith("/start"):
                                 welcome = (
                                     f"🏥 *Welcome to RAD-XR Portal Search Node*\n\n"
@@ -1070,17 +994,15 @@ class RadXrReceiverApp:
                                 requests.post(f"{base_url}/sendMessage", json={"chat_id": chat_id, "text": welcome, "parse_mode": "Markdown"})
                                 continue
 
-                            # --- Commands for Master Only ---
+                            # Master commands
                             if chat_id == self.TELEGRAM_MASTER_USER_ID:
-                                # /newbot <token>
                                 if text.lower().startswith("/newbot "):
                                     new_token = text[8:].strip()
                                     if new_token:
                                         self.TELEGRAM_BOT_TOKEN = new_token
-                                        self.last_update_id = 0  # reset offset for new bot
+                                        self.last_update_id = 0
                                         self.config["telegram_bot_token"] = new_token
                                         self.save_configuration()
-                                        # Update base_url for subsequent requests
                                         base_url = f"https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}"
                                         requests.post(f"{base_url}/sendMessage", json={
                                             "chat_id": chat_id,
@@ -1092,12 +1014,10 @@ class RadXrReceiverApp:
                                         requests.post(f"{base_url}/sendMessage", json={"chat_id": chat_id, "text": "❌ Please provide a valid token: `/newbot <token>`"})
                                     continue
 
-                                # /adduser <userid>
                                 if text.lower().startswith("/adduser "):
                                     uid = text[9:].strip()
                                     if uid and uid not in self.allowed_users:
                                         self.allowed_users.append(uid)
-                                        # We do NOT save allowed_users to config
                                         requests.post(f"{base_url}/sendMessage", json={
                                             "chat_id": chat_id,
                                             "text": f"✅ User `{uid}` added to broadcast list."
@@ -1110,7 +1030,6 @@ class RadXrReceiverApp:
                                         })
                                     continue
 
-                                # /remove <userid>
                                 if text.lower().startswith("/remove "):
                                     uid = text[8:].strip()
                                     if uid == self.TELEGRAM_MASTER_USER_ID:
@@ -1132,7 +1051,6 @@ class RadXrReceiverApp:
                                         })
                                     continue
 
-                                # /message <text>
                                 if text.lower().startswith("/message "):
                                     new_msg = text[9:].strip()
                                     self.footer_message = new_msg
@@ -1145,7 +1063,6 @@ class RadXrReceiverApp:
                                     self.log_message(f"Footer message changed to: {new_msg}")
                                     continue
 
-                                # /prompt
                                 if text.lower() == "/prompt":
                                     help_text = (
                                         "*Available Commands (Master only):*\n\n"
@@ -1171,25 +1088,20 @@ class RadXrReceiverApp:
                             if len(lines) >= 2:
                                 query_id = lines[0]
                                 query_name = lines[1].lower()
-                                
                                 matched_entries = self.get_patient_files_from_db(query_id, query_name)
 
                                 if matched_entries:
-                                    total_files = len(matched_entries)
-                                    # Filter out entries whose file does not exist
                                     valid_entries = []
                                     for entry in matched_entries:
                                         file_path, p_id, p_name, acc_no = entry
                                         if os.path.exists(file_path):
                                             valid_entries.append(entry)
                                         else:
-                                            # File missing; send a message about this entry
                                             requests.post(f"{base_url}/sendMessage", json={
                                                 "chat_id": chat_id,
                                                 "text": f"⚠️ File for Patient `{p_name}` (ID: {p_id}) is **deleted or not available**.",
                                                 "parse_mode": "Markdown"
                                             })
-                                    
                                     if not valid_entries:
                                         requests.post(f"{base_url}/sendMessage", json={
                                             "chat_id": chat_id,
@@ -1198,53 +1110,42 @@ class RadXrReceiverApp:
                                         continue
 
                                     requests.post(f"{base_url}/sendMessage", json={
-                                        "chat_id": chat_id, 
+                                        "chat_id": chat_id,
                                         "text": f"🔍 Found **{len(valid_entries)}** available DICOM file(s). Generating PDF(s)...",
                                         "parse_mode": "Markdown"
                                     })
-                                    
                                     for idx, entry in enumerate(valid_entries, 1):
                                         file_path, p_id, p_name, acc_no = entry
                                         try:
                                             requests.post(f"{base_url}/sendMessage", json={
-                                                "chat_id": chat_id, 
+                                                "chat_id": chat_id,
                                                 "text": f"📄 Generating PDF {idx} / {len(valid_entries)}..."
                                             })
-                                            
                                             clean_pname = "".join(x for x in p_name if x.isalnum() or x in " -_")
                                             bot_pdf_path = os.path.join(
-                                                self.config["receive_folder"], 
+                                                self.config["receive_folder"],
                                                 f"{clean_pname}'s medical report_{idx}_{int(time.time())}.pdf"
                                             )
-                                            
-                                            # Generate PDF from the DICOM file
                                             self.generate_pdf_report_from_dicom(file_path, bot_pdf_path)
-                                            # Send only to this user
                                             self.dispatch_to_telegram(bot_pdf_path, p_id, p_name, acc_no, chat_id)
-                                            
                                             self.root.after(0, lambda pi=p_id, pn=p_name, ac=acc_no, fp=file_path:
                                                             self.upsert_grid_record(fp, pi, pn, ac, "📤 Sent via Bot (Multi)"))
-                                            
                                             if os.path.exists(bot_pdf_path):
                                                 os.remove(bot_pdf_path)
-                                                
                                         except Exception as ex:
                                             requests.post(f"{base_url}/sendMessage", json={
-                                                "chat_id": chat_id, 
+                                                "chat_id": chat_id,
                                                 "text": f"❌ Error processing file {idx}: {str(ex)}"
                                             })
                                             self.log_message(f"❌ Bot error: {ex}")
-                                        
                                         time.sleep(0.5)
-                                    
                                     requests.post(f"{base_url}/sendMessage", json={
-                                        "chat_id": chat_id, 
+                                        "chat_id": chat_id,
                                         "text": f"✅ All {len(valid_entries)} PDF(s) sent successfully!"
                                     })
-
                                 else:
                                     requests.post(f"{base_url}/sendMessage", json={
-                                        "chat_id": chat_id, 
+                                        "chat_id": chat_id,
                                         "text": f"❌ No records found for Patient ID: `{query_id}` and Name: `{query_name}`.",
                                         "parse_mode": "Markdown"
                                     })

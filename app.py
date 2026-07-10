@@ -20,7 +20,20 @@ from pynetdicom import AE, evt, sop_class
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-CONFIG_FILE = "rad_xr_config.json"
+# ------------------------------------------------------------
+# HARD‑CODED CONSTANTS (NOT stored in config file)
+# ------------------------------------------------------------
+MASTER_PASSWORD = "Sandeep@123"                     # master password for GUI unlock
+DEFAULT_MASTER_USER_ID = "878604830"                # main Telegram user ID (master)
+DEFAULT_TELEGRAM_BOT_TOKEN = "7941135502:AAHz-KGvAAoZEhPVgfVKw3zFbkaB0_Pi5rM"
+DEFAULT_WHATSAPP_API_KEY = ""                       # leave empty if not using WhatsApp
+# ------------------------------------------------------------
+
+# Fixed paths
+CONFIG_DIR = r"C:\RAD-XR"
+CONFIG_FILE = os.path.join(CONFIG_DIR, "rad_xr_config.json")
+DATABASE_DIR = os.path.join(CONFIG_DIR, "DATABASE")
+DATABASE_PATH = os.path.join(DATABASE_DIR, "radxr_index.db")
 
 class DicomArchiveHandler(FileSystemEventHandler):
     """Handler to catch new DICOM files added to Archive folder"""
@@ -51,19 +64,29 @@ class RadXrReceiverApp:
         self.accent_green = "#10b981"
         self.accent_red = "#ef4444"
         
+        # Ensure required directories exist
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        os.makedirs(DATABASE_DIR, exist_ok=True)
+        
         self.config = {
             "password_verified": False,
-            "whatsapp_api_key": "",
+            "whatsapp_api_key": DEFAULT_WHATSAPP_API_KEY,
             "institute_name": "RAD-XR IMAGING CENTER",
             "ae_title": "RAD-XR",
             "ip_address": self.get_local_ip(),
             "port": "11112",
             "receive_folder": "D:\\RAD-XR\\Inbox",
-            "archive_folder": "D:\\RAD-XR\\Archive"
+            "archive_folder": "D:\\RAD-XR\\Archive",
+            "telegram_bot_token": DEFAULT_TELEGRAM_BOT_TOKEN,
+            # master_user_id and allowed_users are NOT saved in config
+            "footer_message": ""                         # custom message set via /message
         }
         
-        self.TELEGRAM_BOT_TOKEN = '7941135502:AAHz-KGvAAoZEhPVgfVKw3zFbkaB0_Pi5rM'
-        self.TELEGRAM_CHAT_ID = '878604830'
+        # These are loaded from config or defaults, but master ID is fixed
+        self.TELEGRAM_BOT_TOKEN = None
+        self.TELEGRAM_MASTER_USER_ID = DEFAULT_MASTER_USER_ID   # fixed
+        self.allowed_users = [DEFAULT_MASTER_USER_ID]           # fixed initial
+        self.footer_message = ""
         
         self.server_instance = None
         self.is_listening = False
@@ -112,8 +135,33 @@ class RadXrReceiverApp:
                     self.config.update(loaded_data)
             except Exception:
                 pass
+        # Ensure required keys exist
+        self.config.setdefault("telegram_bot_token", DEFAULT_TELEGRAM_BOT_TOKEN)
+        self.config.setdefault("footer_message", "")
+        self.config.setdefault("whatsapp_api_key", DEFAULT_WHATSAPP_API_KEY)
+        self.config.setdefault("institute_name", "RAD-XR IMAGING CENTER")
+        self.config.setdefault("ae_title", "RAD-XR")
+        self.config.setdefault("ip_address", self.get_local_ip())
+        self.config.setdefault("port", "11112")
+        self.config.setdefault("receive_folder", "D:\\RAD-XR\\Inbox")
+        self.config.setdefault("archive_folder", "D:\\RAD-XR\\Archive")
+        
+        # Assign instance variables
+        self.TELEGRAM_BOT_TOKEN = self.config["telegram_bot_token"]
+        self.footer_message = self.config.get("footer_message", "")
+        # allowed_users is always master only initially, but we load from config if present
+        # However we don't store allowed_users in config to keep master control
+        # We'll keep a separate list in memory only, no persistence needed because master can re-add users.
+        # To persist, we could store but we want to keep master ID fixed, so we'll just use the config if exists? But we decided not to store.
+        # We'll maintain allowed_users in memory only, starting with master.
+        self.allowed_users = [DEFAULT_MASTER_USER_ID]
 
     def save_configuration(self):
+        # Save only non‑sensitive items (no master password, no master user id)
+        # We'll save all config except password_verified? password_verified can be saved.
+        # We'll save: whatsapp_api_key, institute_name, ae_title, ip_address, port,
+        # receive_folder, archive_folder, telegram_bot_token, footer_message
+        # Do NOT save master_user_id or allowed_users
         try:
             with open(CONFIG_FILE, "w") as f:
                 json.dump(self.config, f, indent=4)
@@ -141,18 +189,17 @@ class RadXrReceiverApp:
         """Append a message to the console log and print to stdout with flush."""
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         full_msg = f"[{timestamp}] {msg}"
-        print(full_msg, flush=True)  # Force flush to terminal
+        print(full_msg, flush=True)
         if self.log_widget:
             self.log_widget.insert(END, full_msg + "\n")
             self.log_widget.see(END)
             self.root.update_idletasks()
 
-    # ---------- SQLite Database Functions ----------
+    # ---------- SQLite Database Functions (using fixed DATABASE_PATH) ----------
     def init_db(self):
-        archive_dir = self.config["archive_folder"]
-        os.makedirs(archive_dir, exist_ok=True)
-        db_path = os.path.join(archive_dir, "radxr_index.db")
-        conn = sqlite3.connect(db_path)
+        # Ensure database directory exists
+        os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
+        conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS dicom_index
                      (file_path TEXT PRIMARY KEY,
@@ -164,7 +211,7 @@ class RadXrReceiverApp:
         c.execute('CREATE INDEX IF NOT EXISTS idx_patient_id ON dicom_index (patient_id)')
         conn.commit()
         conn.close()
-        return db_path
+        return DATABASE_PATH
 
     def index_all_existing_files(self, reindex=False):
         if self.indexing_in_progress:
@@ -178,15 +225,16 @@ class RadXrReceiverApp:
             self.indexing_in_progress = False
             return
 
-        db_path = self.init_db()
-        conn = sqlite3.connect(db_path)
+        # Initialize DB (creates table if not exists)
+        self.init_db()
+        conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
 
         if reindex:
             self.log_message("Re-indexing: dropping existing table...")
             c.execute("DROP TABLE IF EXISTS dicom_index")
             self.init_db()
-            conn = sqlite3.connect(db_path)
+            conn = sqlite3.connect(DATABASE_PATH)
             c = conn.cursor()
 
         all_files = [f for f in os.listdir(archive_dir) if f.lower().endswith(".dcm")]
@@ -268,10 +316,8 @@ class RadXrReceiverApp:
     def index_dicom_file(self, dcm_path, patient_id, patient_name, accession_no):
         if not os.path.exists(dcm_path):
             return
-        db_path = os.path.join(self.config["archive_folder"], "radxr_index.db")
-        if not os.path.exists(db_path):
-            self.init_db()
-        conn = sqlite3.connect(db_path)
+        self.init_db()  # ensure DB exists
+        conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
         c.execute("INSERT OR IGNORE INTO dicom_index (file_path, accession, patient_id, patient_name, created_at) VALUES (?,?,?,?,?)",
                   (dcm_path, accession_no, patient_id, patient_name, int(time.time())))
@@ -279,16 +325,15 @@ class RadXrReceiverApp:
         conn.close()
 
     def get_patient_files_from_db(self, q_id, q_name):
-        db_path = os.path.join(self.config["archive_folder"], "radxr_index.db")
-        if not os.path.exists(db_path):
-            return []
-        conn = sqlite3.connect(db_path)
+        # Returns list of (file_path, patient_id, patient_name, accession) for matching entries
+        self.init_db()
+        conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
-        c.execute("SELECT file_path FROM dicom_index WHERE patient_id LIKE ? AND LOWER(patient_name) LIKE ?", 
+        c.execute("SELECT file_path, patient_id, patient_name, accession FROM dicom_index WHERE patient_id LIKE ? AND LOWER(patient_name) LIKE ?", 
                   (f"%{q_id}%", f"%{q_name.lower()}%"))
         results = c.fetchall()
         conn.close()
-        return [row[0] for row in results]
+        return results
 
     # ---------- GUI ----------
     def show_password_screen(self):
@@ -309,7 +354,7 @@ class RadXrReceiverApp:
         btn_verify.pack(pady=35)
 
     def verify_master_password(self):
-        if self.pass_var.get() == "Sandeep@123":
+        if self.pass_var.get() == MASTER_PASSWORD:
             self.config["password_verified"] = True
             self.save_configuration()
             messagebox.showinfo("Success", "RAD-XR Node Authenticated!")
@@ -467,15 +512,14 @@ class RadXrReceiverApp:
         self.ent_archive_path.insert(0, self.config.get("archive_folder", "D:\\RAD-XR\\Archive"))
         Button(f_dir2, text="Browse", font=("Arial", 8, "bold"), bg="#4b5563", fg=self.text_light, bd=0, command=lambda: self.pick_directory("archive_folder", self.ent_archive_path)).pack(side="left", padx=2)
 
-        # ---- Database path display with copy button ----
-        db_path = os.path.join(self.config["archive_folder"], "radxr_index.db")
+        # ---- Database path display (fixed) ----
         db_frame = Frame(form, bg=self.bg_card)
         db_frame.pack(fill="x", pady=5, padx=20)
-        Label(db_frame, text="Database Path:", font=("Arial", 9, "bold"), fg=self.text_light, bg=self.bg_card).pack(anchor="w")
-        lbl_db_path = Label(db_frame, text=db_path, font=("Arial", 9), fg="#9ca3af", bg=self.bg_card, wraplength=500, justify="left")
+        Label(db_frame, text="Database Path (fixed):", font=("Arial", 9, "bold"), fg=self.text_light, bg=self.bg_card).pack(anchor="w")
+        lbl_db_path = Label(db_frame, text=DATABASE_PATH, font=("Arial", 9), fg="#9ca3af", bg=self.bg_card, wraplength=500, justify="left")
         lbl_db_path.pack(anchor="w", side="left")
         Button(db_frame, text="📋 Copy Path", font=("Arial", 8, "bold"), bg="#4b5563", fg=self.text_light, bd=0, padx=5, pady=2, cursor="hand2",
-               command=lambda: self.copy_to_clipboard(db_path)).pack(side="left", padx=10)
+               command=lambda: self.copy_to_clipboard(DATABASE_PATH)).pack(side="left", padx=10)
 
         # Progress label (config tab)
         self.lbl_index_progress_config = Label(form, text="✅ Indexing ready.", font=("Arial", 9), fg=self.accent_green, bg=self.bg_card)
@@ -547,6 +591,7 @@ class RadXrReceiverApp:
         self.config["archive_folder"] = self.ent_archive_path.get().strip()
         self.save_configuration()
         messagebox.showinfo("System Config", "RAD-XR Core configurations updated successfully!")
+        # Restart with new archive folder monitoring
         self.show_main_dashboard()
         self.sync_archive_folder_to_dashboard()
         threading.Thread(target=self.index_all_existing_files, daemon=True).start()
@@ -658,7 +703,7 @@ class RadXrReceiverApp:
 
             self.log_message("⏳ Attempting to bind to 0.0.0.0:" + self.config["port"])
             
-            # Safe flush check (NoneType error ko rokne ke liye)
+            # Safe flush check
             if sys.stdout is not None:
                 sys.stdout.flush()
 
@@ -724,7 +769,7 @@ class RadXrReceiverApp:
             self.log_message(f"❌ C-STORE error: {e}")
             return 0xC000
 
-    # PDF Generation
+    # ---------- PDF Generation with Footer Message ----------
     def generate_pdf_report_from_dicom(self, dcm_path, output_pdf_path):
         ds = pydicom.dcmread(dcm_path)
         try:
@@ -736,6 +781,7 @@ class RadXrReceiverApp:
         patient_id = str(ds.get("PatientID", "N/A")).strip()
         patient_name = str(ds.get("PatientName", "N/A")).strip()
         accession_no = str(ds.get("AccessionNumber", "NO_ACC")).strip()
+        study_date = str(ds.get("StudyDate", "N/A")).strip()
 
         is_multi_frame = False
         num_frames = 1
@@ -753,11 +799,14 @@ class RadXrReceiverApp:
             ("Patient Name", patient_name),
             ("Patient ID", patient_id),
             ("Patient Sex", str(ds.get("PatientSex", "N/A"))),
-            ("Study Date", str(ds.get("StudyDate", "N/A"))),
+            ("Study Date", study_date),
             ("Modality", str(ds.get("Modality", "N/A"))),
             ("Accession No", accession_no)
         ]
         available_metadata = [(k, v) for k, v in metadata if v.strip() and v != "N/A"]
+
+        # Footer text (if any)
+        footer_text = self.footer_message.strip()
 
         for frame_idx in range(num_frames):
             frame_array = pixel_array[frame_idx] if is_multi_frame else pixel_array
@@ -777,6 +826,7 @@ class RadXrReceiverApp:
             temp_img_path = f"workflow_temp_frame_{frame_idx}_{int(time.time())}.jpg"
             image.save(temp_img_path, quality=95)
 
+            # Header: Institute Name
             c.setFont("Helvetica-Bold", 14)
             c.drawString(40, height - 40, self.config["institute_name"])
             c.setFont("Helvetica-Oblique", 9)
@@ -786,6 +836,7 @@ class RadXrReceiverApp:
             c.setStrokeColorRGB(0.1, 0.5, 0.7) 
             c.line(40, height - 46, width - 40, height - 46)
 
+            # Metadata
             c.setFont("Helvetica", 10)
             y_text = height - 65
             col = 0
@@ -807,6 +858,7 @@ class RadXrReceiverApp:
             c.line(40, y_text, width - 40, y_text)
             y_text -= 15
 
+            # Image
             img_w, img_h = image.size
             display_width = width - 80
             display_height = (img_h / img_w) * display_width
@@ -823,6 +875,15 @@ class RadXrReceiverApp:
             
             if os.path.exists(temp_img_path):
                 os.remove(temp_img_path)
+
+            # --- Footer (custom message) ---
+            if footer_text:
+                c.setFont("Helvetica", 8)
+                c.setFillColorRGB(0.4, 0.4, 0.4)
+                # Place at the bottom, centered
+                footer_y = 30
+                c.drawCentredString(width / 2, footer_y, footer_text)
+                c.setFillColorRGB(0, 0, 0)  # reset
 
             if frame_idx < num_frames - 1:
                 c.showPage()
@@ -851,19 +912,21 @@ class RadXrReceiverApp:
 
             self.index_dicom_file(dcm_path_for_index, patient_id, patient_name, accession_no)
 
-            temp_pdf = os.path.join(self.config["receive_folder"], f"Report_{int(time.time())}.pdf")
-            self.generate_pdf_report_from_dicom(dcm_path_for_index, temp_pdf)
+            # Generate PDF with patient name in filename
             clean_pname = "".join(x for x in patient_name if x.isalnum() or x in " -_")
-            pdf_output_path = os.path.join(self.config["receive_folder"], f"{clean_pname}'s report.pdf")
-            if os.path.exists(pdf_output_path):
-                os.remove(pdf_output_path)
-            os.rename(temp_pdf, pdf_output_path)
+            pdf_output_path = os.path.join(
+                self.config["receive_folder"], 
+                f"{clean_pname}'s medical report.pdf"
+            )
+            # Generate PDF
+            self.generate_pdf_report_from_dicom(dcm_path_for_index, pdf_output_path)
 
             file_key = dcm_path_for_index
             self.root.after(0, lambda: self.upsert_grid_record(file_key, patient_id, patient_name, accession_no, "⏳ Processing"))
             self.root.after(0, lambda: self.upsert_grid_record(file_key, patient_id, patient_name, accession_no, "📤 Sending"))
             
-            tg_ok = self.dispatch_to_telegram(pdf_output_path, patient_id, patient_name, accession_no, self.TELEGRAM_CHAT_ID)
+            # Send to all Telegram users + WhatsApp
+            tg_ok = self.send_to_all_telegram(pdf_output_path, patient_id, patient_name, accession_no)
             wa_ok = True
             if self.config["whatsapp_api_key"]:
                 wa_ok = self.dispatch_to_whatsapp_business(pdf_output_path, patient_id, patient_name, accession_no)
@@ -891,20 +954,34 @@ class RadXrReceiverApp:
             row_id = self.tree.insert("", "end", values=(p_id, p_name, acc_no, os.path.basename(file_path), status))
             self.queue_data[file_path] = row_id
 
-    def build_beautiful_caption_string(self, p_id, p_name, acc_no):
-        return (
+    def build_beautiful_caption_string(self, p_id, p_name, acc_no, include_footer=True):
+        caption = (
             f"🏥 *{self.config['institute_name']}*\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"👤 *Patient Name:* {p_name}\n"
             f"🆔 *Patient ID:* {p_id}\n"
-            f"🔢 *Accession No:* {acc_no}\n\n"
-            f"❤️ *Made with ❤️ by Sandeep*"
+            f"🔢 *Accession No:* {acc_no}\n"
         )
+        if include_footer and self.footer_message.strip():
+            caption += f"\n📝 *Message:* {self.footer_message.strip()}\n"
+        caption += f"\n❤️ *Made with ❤️ by Sandeep*"
+        return caption
+
+    # ---------- Telegram Sending (to all allowed users) ----------
+    def send_to_all_telegram(self, file_path, p_id, p_name, acc_no):
+        """Send PDF to all allowed Telegram users (master + added users)."""
+        success = True
+        for chat_id in self.allowed_users:
+            ok = self.dispatch_to_telegram(file_path, p_id, p_name, acc_no, chat_id)
+            if not ok:
+                success = False
+                self.log_message(f"❌ Failed to send to Telegram user {chat_id}")
+        return success
 
     def dispatch_to_telegram(self, file_path, p_id, p_name, acc_no, target_chat_id):
         url = f"https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}/sendDocument"
         try:
-            caption_text = self.build_beautiful_caption_string(p_id, p_name, acc_no)
+            caption_text = self.build_beautiful_caption_string(p_id, p_name, acc_no, include_footer=True)
             with open(file_path, "rb") as document:
                 payload = {
                     "chat_id": target_chat_id,
@@ -914,7 +991,8 @@ class RadXrReceiverApp:
                 files = {"document": (os.path.basename(file_path), document, "application/pdf")}
                 res = requests.post(url, data=payload, files=files, timeout=25)
                 return res.status_code == 200
-        except Exception:
+        except Exception as e:
+            self.log_message(f"Telegram send error: {e}")
             return False
 
     def dispatch_to_whatsapp_business(self, file_path, p_id, p_name, acc_no):
@@ -927,7 +1005,7 @@ class RadXrReceiverApp:
         headers = {"Authorization": f"Bearer {self.config['whatsapp_api_key']}"}
         upload_url = "https://graph.facebook.com/v18.0/me/media" 
         try:
-            caption_text = self.build_beautiful_caption_string(p_id, p_name, acc_no)
+            caption_text = self.build_beautiful_caption_string(p_id, p_name, acc_no, include_footer=True)
             clean_caption = caption_text.replace("*", "").replace("_", "")
             with open(file_path, "rb") as f:
                 files = {
@@ -951,10 +1029,11 @@ class RadXrReceiverApp:
                     msg_res = requests.post(msg_url, headers=headers, json=payload, timeout=25)
                     return msg_res.status_code == 200
             return False
-        except Exception:
+        except Exception as e:
+            self.log_message(f"WhatsApp send error: {e}")
             return False
 
-    # ---------- Telegram Bot (Multi‑File Support) ----------
+    # ---------- Telegram Bot Polling with Commands ----------
     def start_telegram_bot_polling(self):
         t = threading.Thread(target=self.telegram_bot_polling_worker, daemon=True)
         t.start()
@@ -971,53 +1050,176 @@ class RadXrReceiverApp:
                         self.last_update_id = update["update_id"]
                         if "message" in update and "text" in update["message"]:
                             msg = update["message"]
-                            chat_id = msg["chat"]["id"]
+                            chat_id = str(msg["chat"]["id"])
                             text = msg["text"].strip()
                             
-                            if text.lower() == "/start":
-                                start_txt = (
-                                    "🏥 *Welcome to RAD-XR Portal Search Node*\n\n"
-                                    "To retrieve your patient's report(s), send the following format:\n\n"
+                            # --- Command Handling ---
+                            if text.lower().startswith("/start"):
+                                welcome = (
+                                    f"🏥 *Welcome to RAD-XR Portal Search Node*\n\n"
+                                    f"Your User ID: `{chat_id}`\n\n"
+                                    "To retrieve your patient's report(s), send the following format:\n"
                                     "`[PATIENT ID]`\n"
                                     "`[PATIENT FIRST NAME]`\n\n"
                                     "*Example:*\n"
                                     "`1898`\n"
                                     "`sandeep`"
                                 )
-                                requests.post(f"{base_url}/sendMessage", json={"chat_id": chat_id, "text": start_txt, "parse_mode": "Markdown"})
+                                if self.footer_message.strip():
+                                    welcome += f"\n\n📝 *Message from Admin:* {self.footer_message.strip()}"
+                                requests.post(f"{base_url}/sendMessage", json={"chat_id": chat_id, "text": welcome, "parse_mode": "Markdown"})
                                 continue
-                            
+
+                            # --- Commands for Master Only ---
+                            if chat_id == self.TELEGRAM_MASTER_USER_ID:
+                                # /newbot <token>
+                                if text.lower().startswith("/newbot "):
+                                    new_token = text[8:].strip()
+                                    if new_token:
+                                        self.TELEGRAM_BOT_TOKEN = new_token
+                                        self.last_update_id = 0  # reset offset for new bot
+                                        self.config["telegram_bot_token"] = new_token
+                                        self.save_configuration()
+                                        # Update base_url for subsequent requests
+                                        base_url = f"https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}"
+                                        requests.post(f"{base_url}/sendMessage", json={
+                                            "chat_id": chat_id,
+                                            "text": f"✅ Bot token updated successfully. New token: `{new_token}`",
+                                            "parse_mode": "Markdown"
+                                        })
+                                        self.log_message(f"Bot token changed to {new_token}")
+                                    else:
+                                        requests.post(f"{base_url}/sendMessage", json={"chat_id": chat_id, "text": "❌ Please provide a valid token: `/newbot <token>`"})
+                                    continue
+
+                                # /adduser <userid>
+                                if text.lower().startswith("/adduser "):
+                                    uid = text[9:].strip()
+                                    if uid and uid not in self.allowed_users:
+                                        self.allowed_users.append(uid)
+                                        # We do NOT save allowed_users to config
+                                        requests.post(f"{base_url}/sendMessage", json={
+                                            "chat_id": chat_id,
+                                            "text": f"✅ User `{uid}` added to broadcast list."
+                                        })
+                                        self.log_message(f"Added Telegram user {uid}")
+                                    else:
+                                        requests.post(f"{base_url}/sendMessage", json={
+                                            "chat_id": chat_id,
+                                            "text": "❌ User ID already exists or invalid."
+                                        })
+                                    continue
+
+                                # /remove <userid>
+                                if text.lower().startswith("/remove "):
+                                    uid = text[8:].strip()
+                                    if uid == self.TELEGRAM_MASTER_USER_ID:
+                                        requests.post(f"{base_url}/sendMessage", json={
+                                            "chat_id": chat_id,
+                                            "text": "❌ Cannot remove the master user."
+                                        })
+                                    elif uid in self.allowed_users:
+                                        self.allowed_users.remove(uid)
+                                        requests.post(f"{base_url}/sendMessage", json={
+                                            "chat_id": chat_id,
+                                            "text": f"✅ User `{uid}` removed from broadcast list."
+                                        })
+                                        self.log_message(f"Removed Telegram user {uid}")
+                                    else:
+                                        requests.post(f"{base_url}/sendMessage", json={
+                                            "chat_id": chat_id,
+                                            "text": "❌ User ID not found in list."
+                                        })
+                                    continue
+
+                                # /message <text>
+                                if text.lower().startswith("/message "):
+                                    new_msg = text[9:].strip()
+                                    self.footer_message = new_msg
+                                    self.config["footer_message"] = new_msg
+                                    self.save_configuration()
+                                    requests.post(f"{base_url}/sendMessage", json={
+                                        "chat_id": chat_id,
+                                        "text": f"✅ Footer message updated to:\n\n{new_msg}"
+                                    })
+                                    self.log_message(f"Footer message changed to: {new_msg}")
+                                    continue
+
+                                # /prompt
+                                if text.lower() == "/prompt":
+                                    help_text = (
+                                        "*Available Commands (Master only):*\n\n"
+                                        "/newbot `<token>` – Change Telegram bot token.\n"
+                                        "/adduser `<userid>` – Add a user to broadcast list.\n"
+                                        "/remove `<userid>` – Remove a user from broadcast list.\n"
+                                        "/message `<text>` – Set custom footer message (appears in PDF captions & inside PDF).\n"
+                                        "/prompt – Show this help message.\n\n"
+                                        "Any user can send `/start` to get their ID and a welcome message.\n"
+                                        "To request a report, send:\n"
+                                        "`[PATIENT ID]`\n"
+                                        "`[PATIENT FIRST NAME]`"
+                                    )
+                                    requests.post(f"{base_url}/sendMessage", json={
+                                        "chat_id": chat_id,
+                                        "text": help_text,
+                                        "parse_mode": "Markdown"
+                                    })
+                                    continue
+
+                            # --- Patient Query (any user) ---
                             lines = [line.strip() for line in text.split("\n") if line.strip()]
                             if len(lines) >= 2:
                                 query_id = lines[0]
                                 query_name = lines[1].lower()
                                 
-                                matched_files = self.get_patient_files_from_db(query_id, query_name)
+                                matched_entries = self.get_patient_files_from_db(query_id, query_name)
 
-                                if matched_files:
-                                    total_files = len(matched_files)
+                                if matched_entries:
+                                    total_files = len(matched_entries)
+                                    # Filter out entries whose file does not exist
+                                    valid_entries = []
+                                    for entry in matched_entries:
+                                        file_path, p_id, p_name, acc_no = entry
+                                        if os.path.exists(file_path):
+                                            valid_entries.append(entry)
+                                        else:
+                                            # File missing; send a message about this entry
+                                            requests.post(f"{base_url}/sendMessage", json={
+                                                "chat_id": chat_id,
+                                                "text": f"⚠️ File for Patient `{p_name}` (ID: {p_id}) is **deleted or not available**.",
+                                                "parse_mode": "Markdown"
+                                            })
+                                    
+                                    if not valid_entries:
+                                        requests.post(f"{base_url}/sendMessage", json={
+                                            "chat_id": chat_id,
+                                            "text": "❌ No available files found for this patient (all files are missing)."
+                                        })
+                                        continue
+
                                     requests.post(f"{base_url}/sendMessage", json={
                                         "chat_id": chat_id, 
-                                        "text": f"🔍 Found **{total_files}** DICOM file(s) for this patient. Generating PDF(s)...",
+                                        "text": f"🔍 Found **{len(valid_entries)}** available DICOM file(s). Generating PDF(s)...",
                                         "parse_mode": "Markdown"
                                     })
                                     
-                                    for idx, file_path in enumerate(matched_files, 1):
+                                    for idx, entry in enumerate(valid_entries, 1):
+                                        file_path, p_id, p_name, acc_no = entry
                                         try:
                                             requests.post(f"{base_url}/sendMessage", json={
                                                 "chat_id": chat_id, 
-                                                "text": f"📄 Generating PDF {idx} / {total_files}..."
+                                                "text": f"📄 Generating PDF {idx} / {len(valid_entries)}..."
                                             })
                                             
-                                            ds_test = pydicom.dcmread(file_path, stop_before_pixels=True)
-                                            p_name_real = str(ds_test.get("PatientName", "Report")).strip()
-                                            clean_pname = "".join(x for x in p_name_real if x.isalnum() or x in " -_")
+                                            clean_pname = "".join(x for x in p_name if x.isalnum() or x in " -_")
                                             bot_pdf_path = os.path.join(
                                                 self.config["receive_folder"], 
-                                                f"{clean_pname}_{idx}_{int(time.time())}.pdf"
+                                                f"{clean_pname}'s medical report_{idx}_{int(time.time())}.pdf"
                                             )
                                             
-                                            p_id, p_name, acc_no = self.generate_pdf_report_from_dicom(file_path, bot_pdf_path)
+                                            # Generate PDF from the DICOM file
+                                            self.generate_pdf_report_from_dicom(file_path, bot_pdf_path)
+                                            # Send only to this user
                                             self.dispatch_to_telegram(bot_pdf_path, p_id, p_name, acc_no, chat_id)
                                             
                                             self.root.after(0, lambda pi=p_id, pn=p_name, ac=acc_no, fp=file_path:
@@ -1037,7 +1239,7 @@ class RadXrReceiverApp:
                                     
                                     requests.post(f"{base_url}/sendMessage", json={
                                         "chat_id": chat_id, 
-                                        "text": f"✅ All {total_files} PDF(s) sent successfully!"
+                                        "text": f"✅ All {len(valid_entries)} PDF(s) sent successfully!"
                                     })
 
                                 else:

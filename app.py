@@ -7,7 +7,7 @@ import time
 import shutil
 import sqlite3
 import winreg
-from tkinter import Tk, Label, Entry, Button, StringVar, messagebox, ttk, filedialog, Frame, Text, Scrollbar, END, Checkbutton, IntVar, PhotoImage
+from tkinter import Tk, Label, Entry, Button, StringVar, messagebox, ttk, filedialog, Frame, Text, Scrollbar, END, Checkbutton, IntVar, PhotoImage, Toplevel
 import numpy as np
 import pydicom
 from PIL import Image
@@ -26,6 +26,7 @@ MASTER_PASSWORD = "Sandeep@123"
 DEFAULT_MASTER_USER_ID = "878604830"
 DEFAULT_TELEGRAM_BOT_TOKEN = "7941135502:AAHz-KGvAAoZEhPVgfVKw3zFbkaB0_Pi5rM"
 DEFAULT_WHATSAPP_API_KEY = ""
+CONFIG_PASSWORD = "18040709"   # password to open Config Control tab
 # ------------------------------------------------------------
 
 CONFIG_DIR = r"C:\RAD-XR"
@@ -90,9 +91,10 @@ class RadXrReceiverApp:
         
         self.TELEGRAM_BOT_TOKEN = None
         self.TELEGRAM_MASTER_USER_ID = DEFAULT_MASTER_USER_ID
-        self.allowed_users = [DEFAULT_MASTER_USER_ID]  # kept for backward, but we use DB now
+        self.allowed_users = [DEFAULT_MASTER_USER_ID]
         self.footer_message = ""
         self.bot_username = ""
+        self.config_unlocked = False   # will be reset on each tab selection
         
         self.server_instance = None
         self.is_listening = False
@@ -107,6 +109,9 @@ class RadXrReceiverApp:
         self.lbl_index_progress_config = None
         self.log_widget = None
         self.lbl_bot_name = None
+        self.lbl_bot_username = None
+        self.lock_frame = None
+        self.config_pass_var = None
         
         self.load_configuration()
         self.setup_modern_styles()
@@ -283,6 +288,7 @@ class RadXrReceiverApp:
         return results
 
     def update_bot_username(self):
+        """Fetch bot info from Telegram and update self.bot_username and config display name."""
         if not self.TELEGRAM_BOT_TOKEN:
             return
         try:
@@ -296,8 +302,17 @@ class RadXrReceiverApp:
                     if not self.config.get("bot_display_name") or self.config["bot_display_name"] == "RAD-XR Bot":
                         self.config["bot_display_name"] = data["result"].get("first_name", "RAD-XR Bot")
                         self.save_configuration()
+                    self.refresh_bot_info_gui()
         except Exception as e:
             self.log_message(f"Failed to fetch bot info: {e}")
+
+    def refresh_bot_info_gui(self):
+        """Update the bot name and username labels in Network Config."""
+        if self.lbl_bot_name:
+            self.lbl_bot_name.config(text=f"Name: {self.config.get('bot_display_name', 'RAD-XR Bot')}")
+        if self.lbl_bot_username:
+            bot_uname = f"@{self.bot_username}" if self.bot_username else "Not available"
+            self.lbl_bot_username.config(text=f"Username: {bot_uname}")
 
     # ---------- Indexing ----------
     def index_all_existing_files(self, reindex=False):
@@ -454,15 +469,66 @@ class RadXrReceiverApp:
 
     def show_main_dashboard(self):
         self.clear_screen()
-        notebook = ttk.Notebook(self.root)
-        notebook.pack(fill="both", expand=True, padx=15, pady=15)
-        frame_receiver = Frame(notebook, bg=self.bg_dark)
-        frame_settings = Frame(notebook, bg=self.bg_dark)
-        notebook.add(frame_receiver, text="  Live Monitor  ")
-        notebook.add(frame_settings, text="  Config Control  ")
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill="both", expand=True, padx=15, pady=15)
+        frame_receiver = Frame(self.notebook, bg=self.bg_dark)
+        frame_settings = Frame(self.notebook, bg=self.bg_dark)
+        self.notebook.add(frame_receiver, text="  Live Monitor  ")
+        self.notebook.add(frame_settings, text="  Config Control  ")
 
-        # ----- Live Monitor Tab -----
-        top_ctrl_bar = Frame(frame_receiver, bg=self.bg_dark)
+        # --- Build Live Monitor Tab (no password) ---
+        self.build_live_monitor_tab(frame_receiver)
+
+        # --- Build Config Control Tab (password protected) ---
+        self.build_config_tab(frame_settings)
+
+        # Bind tab selection event to check for password
+        self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_change)
+
+        # Refresh bot info in GUI
+        self.refresh_bot_info_gui()
+
+    def on_tab_change(self, event=None):
+        """Called when user switches tabs. If Config Control is selected, show lock."""
+        if not self.notebook:
+            return
+        selected = self.notebook.select()
+        tab_text = self.notebook.tab(selected, "text")
+        if tab_text == "  Config Control  " and hasattr(self, 'lock_frame') and self.lock_frame:
+            # Always show lock and reset unlocked state
+            self.config_unlocked = False
+            self.lock_frame.place(relx=0, rely=0, relwidth=1, relheight=1)
+            # Clear password entry if it exists
+            if self.config_pass_var:
+                self.config_pass_var.set("")
+            # Focus on the password entry
+            for child in self.lock_frame.winfo_children():
+                if isinstance(child, Frame):
+                    for sub in child.winfo_children():
+                        if isinstance(sub, Entry):
+                            sub.focus()
+                            break
+
+    def unlock_config_tab(self):
+        """Verify password and unlock Config Control tab."""
+        if self.config_pass_var.get() == CONFIG_PASSWORD:
+            self.config_unlocked = True
+            if self.lock_frame:
+                self.lock_frame.place_forget()
+            messagebox.showinfo("Success", "Config Control unlocked!")
+        else:
+            messagebox.showerror("Error", "Incorrect password!")
+            # Clear and refocus
+            self.config_pass_var.set("")
+            for child in self.lock_frame.winfo_children():
+                if isinstance(child, Frame):
+                    for sub in child.winfo_children():
+                        if isinstance(sub, Entry):
+                            sub.focus()
+                            break
+
+    def build_live_monitor_tab(self, parent):
+        top_ctrl_bar = Frame(parent, bg=self.bg_dark)
         top_ctrl_bar.pack(fill="x", pady=15, padx=15)
         Label(top_ctrl_bar, text="RAD-XR PROCESS CONTROL", font=("Arial", 14, "bold"), fg=self.text_light, bg=self.bg_dark).pack(side="left")
         self.status_var = StringVar(value="● Stopped")
@@ -473,7 +539,7 @@ class RadXrReceiverApp:
         self.btn_toggle_server = Button(top_ctrl_bar, text="Start Server", bg=self.accent_green, fg=self.bg_dark, font=("Arial", 9, "bold"), bd=0, padx=10, pady=5, width=12, cursor="hand2", command=self.toggle_server_process)
         self.btn_toggle_server.pack(side="right", padx=5)
 
-        content_splitter = Frame(frame_receiver, bg=self.bg_dark)
+        content_splitter = Frame(parent, bg=self.bg_dark)
         content_splitter.pack(fill="both", expand=True, padx=15, pady=5)
 
         # Left panel: network + bot info
@@ -495,13 +561,14 @@ class RadXrReceiverApp:
         self.lbl_folder = add_stat_lbl(net_card, "INBOX DIRECTORY", "receive_folder")
         self.lbl_archive = add_stat_lbl(net_card, "ARCHIVE SYSTEM", "archive_folder")
 
-        # Bot info
+        # Bot info (with updatable labels)
         Label(net_card, text="🤖 TELEGRAM BOT", font=("Arial", 8, "bold"), fg=self.accent_cyan, bg=self.bg_card).pack(anchor="w", padx=15, pady=(10, 0))
         bot_display = self.config.get("bot_display_name", "RAD-XR Bot")
         self.lbl_bot_name = Label(net_card, text=f"Name: {bot_display}", font=("Arial", 9), fg=self.text_light, bg=self.bg_card, wraplength=190, justify="left")
         self.lbl_bot_name.pack(anchor="w", padx=15, pady=(0, 2))
         bot_uname = f"@{self.bot_username}" if self.bot_username else "Not available"
-        Label(net_card, text=f"Username: {bot_uname}", font=("Arial", 9), fg="#9ca3af", bg=self.bg_card, wraplength=190, justify="left").pack(anchor="w", padx=15, pady=(0, 5))
+        self.lbl_bot_username = Label(net_card, text=f"Username: {bot_uname}", font=("Arial", 9), fg="#9ca3af", bg=self.bg_card, wraplength=190, justify="left")
+        self.lbl_bot_username.pack(anchor="w", padx=15, pady=(0, 5))
         Label(net_card, text="Search on Telegram: @...", font=("Arial", 7), fg="#6b7280", bg=self.bg_card).pack(anchor="w", padx=15, pady=(0, 5))
 
         Label(net_card, text="📁 FOLDER WATCH", font=("Arial", 8, "bold"), fg=self.accent_green if self.monitoring_active else self.accent_red, bg=self.bg_card).pack(anchor="w", padx=15, pady=(10,0))
@@ -549,15 +616,22 @@ class RadXrReceiverApp:
         log_scroll.pack(side="right", fill="y")
         self.log_widget.config(yscrollcommand=log_scroll.set)
 
-        progress_frame = Frame(frame_receiver, bg=self.bg_dark)
+        progress_frame = Frame(parent, bg=self.bg_dark)
         progress_frame.pack(fill="x", padx=15, pady=5)
         self.lbl_index_progress_monitor = Label(progress_frame, text="✅ Indexing ready.", font=("Arial", 9), fg=self.accent_green, bg=self.bg_dark)
         self.lbl_index_progress_monitor.pack(side="left")
         Label(progress_frame, text="Made with ❤️ by Sandeep", font=("Arial", 9, "bold", "italic"), fg="#6b7280", bg=self.bg_dark).pack(side="right")
 
-        # ----- Config Control Tab -----
-        Label(frame_settings, text="SYSTEM INITIALIZATION TARGETS", font=("Arial", 14, "bold"), fg=self.accent_cyan, bg=self.bg_dark).pack(pady=15)
-        form = Frame(frame_settings, bg=self.bg_card)
+    def build_config_tab(self, parent):
+        """Build the Config Control tab content and place a lock overlay."""
+        # Create a container for the actual content
+        content_frame = Frame(parent, bg=self.bg_card)
+        content_frame.pack(fill="both", expand=True)
+
+        # We'll build the content inside content_frame
+        Label(content_frame, text="SYSTEM INITIALIZATION TARGETS", font=("Arial", 14, "bold"), fg=self.accent_cyan, bg=self.bg_card).pack(pady=15)
+
+        form = Frame(content_frame, bg=self.bg_card)
         form.pack(padx=30, fill="both", expand=True, pady=10)
 
         def make_entry(lbl_txt, attr):
@@ -620,8 +694,26 @@ class RadXrReceiverApp:
         self.lbl_index_progress_config.pack(anchor="w", padx=20, pady=(5,10))
         Button(form, text="🔄 Re-index Archive (Full Rebuild)", font=("Arial", 9, "bold"), bg=self.accent_cyan, fg=self.bg_dark, bd=0, padx=10, pady=5, cursor="hand2", command=self.reindex_archive).pack(anchor="w", padx=20, pady=5)
 
-        Button(frame_settings, text="Apply Node Topology Changes", font=("Arial", 11, "bold"), bg=self.accent_green, fg=self.bg_dark, width=28, bd=0, cursor="hand2", command=self.apply_and_save_node_settings).pack(pady=15)
-        Label(frame_settings, text="Made with ❤️ by Sandeep", font=("Arial", 9, "bold", "italic"), fg="#6b7280", bg=self.bg_dark).pack(side="bottom", pady=5)
+        Button(content_frame, text="Apply Node Topology Changes", font=("Arial", 11, "bold"), bg=self.accent_green, fg=self.bg_dark, width=28, bd=0, cursor="hand2", command=self.apply_and_save_node_settings).pack(pady=15)
+        Label(content_frame, text="Made with ❤️ by Sandeep", font=("Arial", 9, "bold", "italic"), fg="#6b7280", bg=self.bg_card).pack(side="bottom", pady=5)
+
+        # --- Lock overlay (always shown initially) ---
+        self.lock_frame = Frame(parent, bg=self.bg_dark)
+        self.lock_frame.place(relx=0, rely=0, relwidth=1, relheight=1)
+
+        lock_card = Frame(self.lock_frame, bg=self.bg_card, bd=2, relief="ridge")
+        lock_card.place(relx=0.5, rely=0.5, anchor="center", width=350, height=180)
+        Label(lock_card, text="🔒 Config Control Locked", font=("Arial", 14, "bold"), fg=self.accent_cyan, bg=self.bg_card).pack(pady=(20,10))
+        Label(lock_card, text="Enter password to access settings:", font=("Arial", 10), fg=self.text_light, bg=self.bg_card).pack(pady=5)
+        self.config_pass_var = StringVar()
+        entry_cfg_pass = Entry(lock_card, textvariable=self.config_pass_var, show="*", font=("Arial", 12), width=20, justify="center", bg=self.bg_dark, fg=self.text_light, bd=1)
+        entry_cfg_pass.pack(pady=5)
+        entry_cfg_pass.focus()
+        btn_unlock = Button(lock_card, text="Unlock", font=("Arial", 10, "bold"), bg=self.accent_cyan, fg=self.bg_dark, width=12, command=self.unlock_config_tab)
+        btn_unlock.pack(pady=10)
+
+        # Bind Enter key to unlock
+        entry_cfg_pass.bind("<Return>", lambda e: self.unlock_config_tab())
 
     # ---------- Helpers ----------
     def copy_log(self):
@@ -1156,8 +1248,8 @@ class RadXrReceiverApp:
                                     self.config["telegram_bot_token"] = new_token
                                     self.save_configuration()
                                     base_url = f"https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}"
-                                    # Fetch new bot info
                                     self.update_bot_username()
+                                    self.refresh_bot_info_gui()
                                     self._send_message(base_url, chat_id, f"✅ Bot token updated successfully. New token: `{new_token}`")
                                     self.log_message(f"Bot token changed to {new_token}")
                                 else:
@@ -1168,8 +1260,7 @@ class RadXrReceiverApp:
                             if text.lower().startswith("/adduser "):
                                 uid = text[9:].strip()
                                 if uid:
-                                    # Insert into telegram_users if not already present
-                                    self.save_telegram_user(uid, "", "")  # we don't have username/full_name, leave empty
+                                    self.save_telegram_user(uid, "", "")
                                     self._send_message(base_url, chat_id, f"✅ User `{uid}` added to broadcast list.")
                                     self.log_message(f"Added Telegram user {uid}")
                                 else:
@@ -1209,9 +1300,8 @@ class RadXrReceiverApp:
                                         if resp.status_code == 200 and resp.json().get("ok"):
                                             self.config["bot_display_name"] = new_name
                                             self.save_configuration()
+                                            self.refresh_bot_info_gui()
                                             self._send_message(base_url, chat_id, f"✅ Bot display name updated to: {new_name}")
-                                            if self.lbl_bot_name:
-                                                self.root.after(0, lambda: self.lbl_bot_name.config(text=f"Name: {new_name}"))
                                             self.log_message(f"Bot name changed to {new_name}")
                                         else:
                                             self._send_message(base_url, chat_id, "❌ Failed to update bot name via Telegram API.")

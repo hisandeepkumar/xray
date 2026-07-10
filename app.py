@@ -960,7 +960,7 @@ class RadXrReceiverApp:
             self.log_message(f"❌ C-STORE error: {e}")
             return 0xC000
 
-    # ---------- PDF Generation (UPDATED) ----------
+    # ---------- PDF Generation (UPDATED FOOTER) ----------
     def generate_pdf_report_from_dicom(self, dcm_path, output_pdf_path):
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.platypus import Paragraph
@@ -1002,7 +1002,7 @@ class RadXrReceiverApp:
 
         footer_text = self.footer_message.strip()
 
-        # Style for footer message
+        # Style for footer message (centered, auto‑wrap)
         styles = getSampleStyleSheet()
         footer_style = ParagraphStyle(
             'FooterMsg',
@@ -1062,10 +1062,10 @@ class RadXrReceiverApp:
             c.line(40, y_text, width - 40, y_text)
             y_text -= 15
 
-            # --- Image ---
+            # --- Image (preserve native pixels) ---
             img_w, img_h = image.size
             max_width = width - 80
-            max_height = y_text - 60   # reserve space for footer
+            max_height = y_text - 65   # reserve 65 points for footer (similar to header gap)
 
             scale = 1.0
             if img_w > max_width or img_h > max_height:
@@ -1083,18 +1083,27 @@ class RadXrReceiverApp:
             if os.path.exists(temp_img_path):
                 os.remove(temp_img_path)
 
-            # --- Footer: two lines with message centered ---
-            footer_y = 30
+            # --- Footer: two lines with message centered between them ---
+            # Define line positions to match header spacing
+            footer_top = 45      # upper line y-coordinate
+            footer_bottom = 30   # lower line y-coordinate
+            mid_y = (footer_top + footer_bottom) / 2
+
             c.setStrokeColorRGB(0.1, 0.5, 0.7)
             c.setLineWidth(0.5)
-            c.line(40, footer_y + 15, width - 40, footer_y + 15)
 
+            # Draw upper line
+            c.line(40, footer_top, width - 40, footer_top)
+
+            # Draw message (if any) centered between the lines
             if footer_text:
                 p = Paragraph(footer_text, footer_style)
-                p.wrapOn(c, width - 80, 100)
-                p.drawOn(c, (width - p.width) / 2, footer_y - p.height + 10)
+                p.wrapOn(c, width - 80, footer_top - footer_bottom - 4)  # available height
+                # Center horizontally and vertically
+                p.drawOn(c, (width - p.width) / 2, mid_y - p.height / 2)
 
-            c.line(40, footer_y - 5, width - 40, footer_y - 5)
+            # Draw lower line
+            c.line(40, footer_bottom, width - 40, footer_bottom)
 
             if frame_idx < num_frames - 1:
                 c.showPage()

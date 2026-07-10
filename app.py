@@ -54,18 +54,14 @@ class RadXrReceiverApp:
         self.root.geometry("850x720")
         self.root.configure(bg="#1e1e24")
         
-        # --- Set window icon ---
+        # Load icon
         try:
-            # Try to load icon.png from the same directory
             icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
             if os.path.exists(icon_path):
                 icon_img = PhotoImage(file=icon_path)
                 self.root.iconphoto(True, icon_img)
-            else:
-                # fallback: if running as EXE, icon might be embedded, but we can still try
-                pass
-        except Exception as e:
-            print(f"Icon load error: {e}")
+        except Exception:
+            pass
         
         self.bg_dark = "#1e1e24"
         self.bg_card = "#2a2a35"
@@ -94,7 +90,7 @@ class RadXrReceiverApp:
         
         self.TELEGRAM_BOT_TOKEN = None
         self.TELEGRAM_MASTER_USER_ID = DEFAULT_MASTER_USER_ID
-        self.allowed_users = [DEFAULT_MASTER_USER_ID]
+        self.allowed_users = [DEFAULT_MASTER_USER_ID]  # kept for backward, but we use DB now
         self.footer_message = ""
         self.bot_username = ""
         
@@ -110,7 +106,7 @@ class RadXrReceiverApp:
         self.lbl_index_progress_monitor = None
         self.lbl_index_progress_config = None
         self.log_widget = None
-        self.lbl_bot_name = None   # will hold the label widget
+        self.lbl_bot_name = None
         
         self.load_configuration()
         self.setup_modern_styles()
@@ -268,6 +264,13 @@ class RadXrReceiverApp:
         c.execute('''INSERT OR REPLACE INTO telegram_users (user_id, username, full_name, first_seen)
                      VALUES (?, ?, ?, COALESCE((SELECT first_seen FROM telegram_users WHERE user_id=?), ?))''',
                   (user_id, username, full_name, user_id, int(time.time())))
+        conn.commit()
+        conn.close()
+
+    def delete_telegram_user(self, user_id):
+        conn = sqlite3.connect(DATABASE_PATH)
+        c = conn.cursor()
+        c.execute("DELETE FROM telegram_users WHERE user_id = ?", (user_id,))
         conn.commit()
         conn.close()
 
@@ -492,7 +495,7 @@ class RadXrReceiverApp:
         self.lbl_folder = add_stat_lbl(net_card, "INBOX DIRECTORY", "receive_folder")
         self.lbl_archive = add_stat_lbl(net_card, "ARCHIVE SYSTEM", "archive_folder")
 
-        # Bot info (with updated label)
+        # Bot info
         Label(net_card, text="🤖 TELEGRAM BOT", font=("Arial", 8, "bold"), fg=self.accent_cyan, bg=self.bg_card).pack(anchor="w", padx=15, pady=(10, 0))
         bot_display = self.config.get("bot_display_name", "RAD-XR Bot")
         self.lbl_bot_name = Label(net_card, text=f"Name: {bot_display}", font=("Arial", 9), fg=self.text_light, bg=self.bg_card, wraplength=190, justify="left")
@@ -588,7 +591,7 @@ class RadXrReceiverApp:
         self.ent_archive_path.insert(0, self.config.get("archive_folder", "D:\\RAD-XR\\Archive"))
         Button(f_dir2, text="Browse", font=("Arial", 8, "bold"), bg="#4b5563", fg=self.text_light, bd=0, command=lambda: self.pick_directory("archive_folder", self.ent_archive_path)).pack(side="left", padx=2)
 
-        # ---- Auto‑Start Checkbox (now clearly visible) ----
+        # Auto‑Start Checkbox
         self.auto_start_var = IntVar(value=1 if self.config.get("auto_start", False) else 0)
         def toggle_auto_start():
             enable = bool(self.auto_start_var.get())
@@ -604,7 +607,7 @@ class RadXrReceiverApp:
                               selectcolor=self.bg_card, font=("Arial", 10, "bold"))
         cb_auto.pack(anchor="w", padx=20, pady=8)
 
-        # ---- Database path ----
+        # Database
         db_frame = Frame(form, bg=self.bg_card)
         db_frame.pack(fill="x", pady=5, padx=20)
         Label(db_frame, text="Database Path (fixed):", font=("Arial", 9, "bold"), fg=self.text_light, bg=self.bg_card).pack(anchor="w")
@@ -1142,8 +1145,61 @@ class RadXrReceiverApp:
                             self._send_message(base_url, chat_id, welcome)
                             continue
 
-                        # Master commands
+                        # --- Master commands ---
                         if chat_id == self.TELEGRAM_MASTER_USER_ID:
+                            # /newbot <token>
+                            if text.lower().startswith("/newbot "):
+                                new_token = text[8:].strip()
+                                if new_token:
+                                    self.TELEGRAM_BOT_TOKEN = new_token
+                                    self.last_update_id = 0
+                                    self.config["telegram_bot_token"] = new_token
+                                    self.save_configuration()
+                                    base_url = f"https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}"
+                                    # Fetch new bot info
+                                    self.update_bot_username()
+                                    self._send_message(base_url, chat_id, f"✅ Bot token updated successfully. New token: `{new_token}`")
+                                    self.log_message(f"Bot token changed to {new_token}")
+                                else:
+                                    self._send_message(base_url, chat_id, "❌ Please provide a valid token: `/newbot <token>`")
+                                continue
+
+                            # /adduser <userid>
+                            if text.lower().startswith("/adduser "):
+                                uid = text[9:].strip()
+                                if uid:
+                                    # Insert into telegram_users if not already present
+                                    self.save_telegram_user(uid, "", "")  # we don't have username/full_name, leave empty
+                                    self._send_message(base_url, chat_id, f"✅ User `{uid}` added to broadcast list.")
+                                    self.log_message(f"Added Telegram user {uid}")
+                                else:
+                                    self._send_message(base_url, chat_id, "❌ Please provide a user ID: `/adduser <userid>`")
+                                continue
+
+                            # /remove <userid>
+                            if text.lower().startswith("/remove "):
+                                uid = text[8:].strip()
+                                if uid == self.TELEGRAM_MASTER_USER_ID:
+                                    self._send_message(base_url, chat_id, "❌ Cannot remove the master user.")
+                                elif uid:
+                                    self.delete_telegram_user(uid)
+                                    self._send_message(base_url, chat_id, f"✅ User `{uid}` removed from broadcast list.")
+                                    self.log_message(f"Removed Telegram user {uid}")
+                                else:
+                                    self._send_message(base_url, chat_id, "❌ Please provide a user ID: `/remove <userid>`")
+                                continue
+
+                            # /message <text>
+                            if text.lower().startswith("/message "):
+                                new_msg = text[9:].strip()
+                                self.footer_message = new_msg
+                                self.config["footer_message"] = new_msg
+                                self.save_configuration()
+                                self._send_message(base_url, chat_id, f"✅ Footer message updated to:\n\n{new_msg}")
+                                self.log_message(f"Footer message changed to: {new_msg}")
+                                continue
+
+                            # /addbotname <name>
                             if text.lower().startswith("/addbotname "):
                                 new_name = text[12:].strip()
                                 if new_name:
@@ -1154,7 +1210,6 @@ class RadXrReceiverApp:
                                             self.config["bot_display_name"] = new_name
                                             self.save_configuration()
                                             self._send_message(base_url, chat_id, f"✅ Bot display name updated to: {new_name}")
-                                            # Update GUI label
                                             if self.lbl_bot_name:
                                                 self.root.after(0, lambda: self.lbl_bot_name.config(text=f"Name: {new_name}"))
                                             self.log_message(f"Bot name changed to {new_name}")
@@ -1166,6 +1221,7 @@ class RadXrReceiverApp:
                                     self._send_message(base_url, chat_id, "❌ Please provide a name: `/addbotname MyBot`")
                                 continue
 
+                            # /broadcast <message>
                             if text.lower().startswith("/broadcast "):
                                 broadcast_msg = text[11:].strip()
                                 if broadcast_msg:
@@ -1174,14 +1230,19 @@ class RadXrReceiverApp:
                                     self._send_message(base_url, chat_id, "❌ Please provide a message: `/broadcast Hello everyone`")
                                 continue
 
+                            # /prompt
                             if text.lower() == "/prompt":
                                 help_text = (
                                     "*Available Commands (Master only):*\n\n"
+                                    "/newbot `<token>` – Change Telegram bot token.\n"
+                                    "/adduser `<userid>` – Add a user to broadcast list.\n"
+                                    "/remove `<userid>` – Remove a user from broadcast list.\n"
+                                    "/message `<text>` – Set custom footer message (appears in PDF captions & inside PDF).\n"
                                     "/addbotname `<name>` – Change bot display name.\n"
                                     "/broadcast `<message>` – Send text message to all users.\n"
                                     "Reply to any message with `/broadcast` – forward that message to all users.\n"
-                                    "/prompt – Show this help.\n\n"
-                                    "Any user can send `/start` to get their ID and welcome.\n"
+                                    "/prompt – Show this help message.\n\n"
+                                    "Any user can send `/start` to get their ID and a welcome message.\n"
                                     "To request a report, send:\n"
                                     "`[PATIENT ID]`\n"
                                     "`[PATIENT FIRST NAME]`"
@@ -1189,13 +1250,13 @@ class RadXrReceiverApp:
                                 self._send_message(base_url, chat_id, help_text)
                                 continue
 
-                            # Reply broadcast
+                            # Reply broadcast (if reply_to_message and text == "/broadcast")
                             if msg.get("reply_to_message") and text.lower() == "/broadcast":
                                 reply_to = msg["reply_to_message"]
                                 self._broadcast_reply(base_url, reply_to, chat_id)
                                 continue
 
-                        # Patient query
+                        # --- Patient Query (any user) ---
                         lines = [line.strip() for line in text.split("\n") if line.strip()]
                         if len(lines) >= 2:
                             query_id = lines[0]

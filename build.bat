@@ -20,7 +20,7 @@ if %errorlevel% neq 0 (
 echo.
 
 echo [3/4] Compiling secure binary execution node with codecs...
-pyinstaller --noconsole --onefile --name="RAD-XR" --icon=icon.png --collect-all pydicom --collect-all pynetdicom --collect-all pylibjpeg --collect-data pydicom --hidden-import=numpy --hidden-import=pynetdicom --hidden-import=pydicom.encoders.gdcm --hidden-import=pydicom.encoders.pylibjpeg --hidden-import=pylibjpeg --hidden-import=pylibjpeg.utils --hidden-import=openjpeg --hidden-import=pylibjpeg.data app.py
+pyinstaller --noconsole --onefile --name="RAD-XR" --icon=icon.png --add-data "icon.png;." --collect-all pydicom --collect-all pynetdicom --collect-all pylibjpeg --collect-data pydicom --hidden-import=numpy --hidden-import=pynetdicom --hidden-import=pydicom.encoders.gdcm --hidden-import=pydicom.encoders.pylibjpeg --hidden-import=pylibjpeg --hidden-import=pylibjpeg.utils --hidden-import=openjpeg --hidden-import=pylibjpeg.data app.py
 if %errorlevel% neq 0 (
     echo.
     echo ERROR: Binary bundling collapsed.

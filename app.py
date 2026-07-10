@@ -126,7 +126,7 @@ class RadXrReceiverApp:
         
         self.init_db()
         self.init_telegram_users_table()
-        self.init_whatsapp_credits_table()    # <-- new table
+        self.init_whatsapp_credits_table()
         self.update_bot_username()
         
         if not self.config.get("password_verified"):
@@ -270,14 +270,12 @@ class RadXrReceiverApp:
         conn.close()
 
     def init_whatsapp_credits_table(self):
-        """Create table to store remaining WhatsApp credits."""
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
         c.execute('''CREATE TABLE IF NOT EXISTS whatsapp_credits (
                         id INTEGER PRIMARY KEY CHECK (id = 1),
                         remaining INTEGER DEFAULT 0
                      )''')
-        # Ensure a row exists
         c.execute("INSERT OR IGNORE INTO whatsapp_credits (id, remaining) VALUES (1, 0)")
         conn.commit()
         conn.close()
@@ -300,10 +298,8 @@ class RadXrReceiverApp:
         return new_total
 
     def decrement_whatsapp_credits(self):
-        """Return True if credits were decremented, False if not enough credits."""
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
-        # Atomic check-and-decrement
         c.execute("SELECT remaining FROM whatsapp_credits WHERE id = 1")
         row = c.fetchone()
         if row and row[0] > 0:
@@ -339,7 +335,6 @@ class RadXrReceiverApp:
         return results
 
     def update_bot_username(self):
-        """Fetch bot info and update self.bot_username and config display name."""
         if not self.TELEGRAM_BOT_TOKEN:
             return
         try:
@@ -965,8 +960,12 @@ class RadXrReceiverApp:
             self.log_message(f"❌ C-STORE error: {e}")
             return 0xC000
 
-    # ---------- PDF Generation ----------
+    # ---------- PDF Generation (UPDATED) ----------
     def generate_pdf_report_from_dicom(self, dcm_path, output_pdf_path):
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.platypus import Paragraph
+        from reportlab.lib.enums import TA_CENTER
+
         ds = pydicom.dcmread(dcm_path)
         try:
             pixel_array = ds.pixel_array
@@ -1003,6 +1002,17 @@ class RadXrReceiverApp:
 
         footer_text = self.footer_message.strip()
 
+        # Style for footer message
+        styles = getSampleStyleSheet()
+        footer_style = ParagraphStyle(
+            'FooterMsg',
+            parent=styles['Normal'],
+            alignment=TA_CENTER,
+            fontSize=10,
+            leading=14,
+            wordWrap='CJK'
+        )
+
         for frame_idx in range(num_frames):
             frame_array = pixel_array[frame_idx] if is_multi_frame else pixel_array
 
@@ -1021,6 +1031,7 @@ class RadXrReceiverApp:
             temp_img_path = f"workflow_temp_frame_{frame_idx}_{int(time.time())}.jpg"
             image.save(temp_img_path, quality=95)
 
+            # --- Header ---
             c.setFont("Helvetica-Bold", 14)
             c.drawString(40, height - 40, self.config["institute_name"])
             c.setFont("Helvetica-Oblique", 9)
@@ -1029,6 +1040,7 @@ class RadXrReceiverApp:
             c.setStrokeColorRGB(0.1, 0.5, 0.7)
             c.line(40, height - 46, width - 40, height - 46)
 
+            # --- Metadata ---
             c.setFont("Helvetica", 10)
             y_text = height - 65
             col = 0
@@ -1050,28 +1062,39 @@ class RadXrReceiverApp:
             c.line(40, y_text, width - 40, y_text)
             y_text -= 15
 
+            # --- Image ---
             img_w, img_h = image.size
-            display_width = width - 80
-            display_height = (img_h / img_w) * display_width
+            max_width = width - 80
+            max_height = y_text - 60   # reserve space for footer
 
-            max_available_height = y_text - 40
-            if display_height > max_available_height:
-                display_height = max_available_height
-                display_width = (img_w / img_h) * display_height
+            scale = 1.0
+            if img_w > max_width or img_h > max_height:
+                scale = min(max_width / img_w, max_height / img_h)
 
-            x_pos = (width - display_width) / 2
-            y_pos = y_text - display_height
+            draw_width = img_w * scale
+            draw_height = img_h * scale
 
-            c.drawImage(temp_img_path, x_pos, y_pos, width=display_width, height=display_height)
+            x_pos = (width - draw_width) / 2
+            y_pos = y_text - draw_height
+
+            c.drawImage(temp_img_path, x_pos, y_pos, width=draw_width, height=draw_height,
+                        preserveAspectRatio=True, anchor='c')
+
             if os.path.exists(temp_img_path):
                 os.remove(temp_img_path)
 
+            # --- Footer: two lines with message centered ---
+            footer_y = 30
+            c.setStrokeColorRGB(0.1, 0.5, 0.7)
+            c.setLineWidth(0.5)
+            c.line(40, footer_y + 15, width - 40, footer_y + 15)
+
             if footer_text:
-                c.setFont("Helvetica", 8)
-                c.setFillColorRGB(0.4, 0.4, 0.4)
-                footer_y = 30
-                c.drawCentredString(width / 2, footer_y, footer_text)
-                c.setFillColorRGB(0, 0, 0)
+                p = Paragraph(footer_text, footer_style)
+                p.wrapOn(c, width - 80, 100)
+                p.drawOn(c, (width - p.width) / 2, footer_y - p.height + 10)
+
+            c.line(40, footer_y - 5, width - 40, footer_y - 5)
 
             if frame_idx < num_frames - 1:
                 c.showPage()
@@ -1114,7 +1137,6 @@ class RadXrReceiverApp:
             tg_ok = self.send_to_all_telegram(pdf_output_path, patient_id, patient_name, accession_no)
             wa_ok = True
             if self.config["whatsapp_api_key"] and self.config["whatsapp_phone_number_id"]:
-                # Check credits before sending
                 if self.get_whatsapp_credits() > 0:
                     wa_ok = self.dispatch_to_whatsapp_business(pdf_output_path, patient_id, patient_name, accession_no)
                 else:
@@ -1187,9 +1209,8 @@ class RadXrReceiverApp:
             self.log_message(f"Telegram send error: {e}")
             return False
 
-    # ---------- WhatsApp Business (with credit check) ----------
+    # ---------- WhatsApp Business ----------
     def dispatch_to_whatsapp_business(self, file_path, p_id, p_name, acc_no):
-        # First, check and consume a credit atomically
         if not self.decrement_whatsapp_credits():
             self.log_message("❌ No WhatsApp credits available.")
             return False
@@ -1218,7 +1239,6 @@ class RadXrReceiverApp:
                 upload_res = requests.post(upload_url, headers=headers, files=files, timeout=25)
                 if upload_res.status_code != 200:
                     self.log_message(f"WhatsApp upload failed: {upload_res.text}")
-                    # We already consumed credit, but we can't restore easily – log and return False
                     return False
                 media_id = upload_res.json().get("id")
                 if not media_id:

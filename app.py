@@ -7,7 +7,7 @@ import time
 import shutil
 import sqlite3
 import winreg
-from tkinter import Tk, Label, Entry, Button, StringVar, messagebox, ttk, filedialog, Frame, Text, Scrollbar, END, Checkbutton, IntVar
+from tkinter import Tk, Label, Entry, Button, StringVar, messagebox, ttk, filedialog, Frame, Text, Scrollbar, END, Checkbutton, IntVar, PhotoImage
 import numpy as np
 import pydicom
 from PIL import Image
@@ -54,6 +54,19 @@ class RadXrReceiverApp:
         self.root.geometry("850x720")
         self.root.configure(bg="#1e1e24")
         
+        # --- Set window icon ---
+        try:
+            # Try to load icon.png from the same directory
+            icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
+            if os.path.exists(icon_path):
+                icon_img = PhotoImage(file=icon_path)
+                self.root.iconphoto(True, icon_img)
+            else:
+                # fallback: if running as EXE, icon might be embedded, but we can still try
+                pass
+        except Exception as e:
+            print(f"Icon load error: {e}")
+        
         self.bg_dark = "#1e1e24"
         self.bg_card = "#2a2a35"
         self.text_light = "#f3f4f6"
@@ -97,7 +110,7 @@ class RadXrReceiverApp:
         self.lbl_index_progress_monitor = None
         self.lbl_index_progress_config = None
         self.log_widget = None
-        self.lbl_bot_name = None
+        self.lbl_bot_name = None   # will hold the label widget
         
         self.load_configuration()
         self.setup_modern_styles()
@@ -117,7 +130,7 @@ class RadXrReceiverApp:
             self.show_main_dashboard()
             threading.Thread(target=self.index_all_existing_files, daemon=True).start()
             self.sync_archive_folder_to_dashboard()
-            self.start_folder_monitor()          # <--- method exists now
+            self.start_folder_monitor()
             self.start_telegram_bot_polling()
 
     def get_local_ip(self):
@@ -374,7 +387,7 @@ class RadXrReceiverApp:
         conn.close()
         return results
 
-    # ---------- Folder Monitoring (methods that were missing) ----------
+    # ---------- Folder Monitoring ----------
     def start_folder_monitor(self):
         archive_dir = self.config["archive_folder"]
         os.makedirs(archive_dir, exist_ok=True)
@@ -479,7 +492,7 @@ class RadXrReceiverApp:
         self.lbl_folder = add_stat_lbl(net_card, "INBOX DIRECTORY", "receive_folder")
         self.lbl_archive = add_stat_lbl(net_card, "ARCHIVE SYSTEM", "archive_folder")
 
-        # Bot info
+        # Bot info (with updated label)
         Label(net_card, text="🤖 TELEGRAM BOT", font=("Arial", 8, "bold"), fg=self.accent_cyan, bg=self.bg_card).pack(anchor="w", padx=15, pady=(10, 0))
         bot_display = self.config.get("bot_display_name", "RAD-XR Bot")
         self.lbl_bot_name = Label(net_card, text=f"Name: {bot_display}", font=("Arial", 9), fg=self.text_light, bg=self.bg_card, wraplength=190, justify="left")
@@ -575,7 +588,7 @@ class RadXrReceiverApp:
         self.ent_archive_path.insert(0, self.config.get("archive_folder", "D:\\RAD-XR\\Archive"))
         Button(f_dir2, text="Browse", font=("Arial", 8, "bold"), bg="#4b5563", fg=self.text_light, bd=0, command=lambda: self.pick_directory("archive_folder", self.ent_archive_path)).pack(side="left", padx=2)
 
-        # Auto‑Start
+        # ---- Auto‑Start Checkbox (now clearly visible) ----
         self.auto_start_var = IntVar(value=1 if self.config.get("auto_start", False) else 0)
         def toggle_auto_start():
             enable = bool(self.auto_start_var.get())
@@ -586,11 +599,12 @@ class RadXrReceiverApp:
                 self._remove_from_startup()
             self.save_configuration()
             self.log_message(f"Auto‑start {'enabled' if enable else 'disabled'}")
-        Checkbutton(form, text="Launch on System Startup (Windows)", variable=self.auto_start_var,
-                    command=toggle_auto_start, bg=self.bg_card, fg=self.text_light,
-                    selectcolor=self.bg_card, font=("Arial", 9, "bold")).pack(anchor="w", padx=20, pady=5)
+        cb_auto = Checkbutton(form, text="🚀 Launch on System Startup (Windows)", variable=self.auto_start_var,
+                              command=toggle_auto_start, bg=self.bg_card, fg=self.text_light,
+                              selectcolor=self.bg_card, font=("Arial", 10, "bold"))
+        cb_auto.pack(anchor="w", padx=20, pady=8)
 
-        # Database
+        # ---- Database path ----
         db_frame = Frame(form, bg=self.bg_card)
         db_frame.pack(fill="x", pady=5, padx=20)
         Label(db_frame, text="Database Path (fixed):", font=("Arial", 9, "bold"), fg=self.text_light, bg=self.bg_card).pack(anchor="w")
@@ -605,9 +619,6 @@ class RadXrReceiverApp:
 
         Button(frame_settings, text="Apply Node Topology Changes", font=("Arial", 11, "bold"), bg=self.accent_green, fg=self.bg_dark, width=28, bd=0, cursor="hand2", command=self.apply_and_save_node_settings).pack(pady=15)
         Label(frame_settings, text="Made with ❤️ by Sandeep", font=("Arial", 9, "bold", "italic"), fg="#6b7280", bg=self.bg_dark).pack(side="bottom", pady=5)
-
-        if self.lbl_bot_name:
-            self.lbl_bot_name.config(text=f"Name: {self.config.get('bot_display_name', 'RAD-XR Bot')}")
 
     # ---------- Helpers ----------
     def copy_log(self):
@@ -1143,6 +1154,7 @@ class RadXrReceiverApp:
                                             self.config["bot_display_name"] = new_name
                                             self.save_configuration()
                                             self._send_message(base_url, chat_id, f"✅ Bot display name updated to: {new_name}")
+                                            # Update GUI label
                                             if self.lbl_bot_name:
                                                 self.root.after(0, lambda: self.lbl_bot_name.config(text=f"Name: {new_name}"))
                                             self.log_message(f"Bot name changed to {new_name}")

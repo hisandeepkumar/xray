@@ -963,8 +963,8 @@ class RadXrReceiverApp:
             f"🔢 *Accession No:* {acc_no}\n"
         )
         if include_footer and self.footer_message.strip():
-            caption += f"\n📝 *Message:* {self.footer_message.strip()}\n"
-        caption += f"\n❤️ *Made with ❤️ by Sandeep*"
+            caption += f"\n {self.footer_message.strip()}\n"
+        caption += f"\n *Made with ❤️ by Sandeep*"
         return caption
 
     # ---------- Telegram Sending (to all allowed users) ----------

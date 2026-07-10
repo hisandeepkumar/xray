@@ -969,7 +969,7 @@ class RadXrReceiverApp:
             self.log_message(f"❌ C-STORE error: {e}")
             return 0xC000
 
-    # ---------- PDF Generation (updated with 8mm top margin, no footer lines, footer image at bottom) ----------
+    # ---------- PDF Generation (updated: 8mm top, 3mm sides, footer image at bottom, no lines) ----------
     def generate_pdf_report_from_dicom(self, dcm_path, output_pdf_path):
         import re
         from PIL import Image as PILImage
@@ -999,9 +999,9 @@ class RadXrReceiverApp:
         width, height = letter
 
         # ---- Margins ----
-        top_margin = 8 * 72 / 25.4          # 8mm in points
-        margin_lr = 3 * 72 / 25.4          # 3mm in points
-        bottom_margin = 0                  # footer touches bottom edge
+        top_margin = 8 * 72 / 25.4          # 8mm
+        margin_lr = 3 * 72 / 25.4          # 3mm
+        bottom_margin = 0                  # footer touches bottom
 
         metadata = [
             ("Patient Name", patient_name),
@@ -1013,22 +1013,21 @@ class RadXrReceiverApp:
         ]
         available_metadata = [(k, v) for k, v in metadata if v.strip() and v != "N/A"]
 
-        # Determine footer image (if any)
+        # Footer image (if any)
         footer_image_path = self.pdf_footer_image if self.pdf_footer_image and os.path.exists(self.pdf_footer_image) else None
         footer_text = self.pdf_footer_text.strip() if not footer_image_path else ""
 
-        # Pre-calculate footer image dimensions (full width, scaled proportionally, max height 144pt)
+        # Pre‑compute footer image dimensions (full width, max height 144pt)
         footer_img_w = 0
         footer_img_h = 0
-        footer_img_obj = None
         if footer_image_path:
             try:
-                footer_img_obj = PILImage.open(footer_image_path)
-                f_img_w, f_img_h = footer_img_obj.size
+                footer_img = PILImage.open(footer_image_path)
+                f_img_w, f_img_h = footer_img.size
                 # Scale to full width
-                draw_w = width  # no margin, full width
+                draw_w = width
                 draw_h = (f_img_h / f_img_w) * draw_w
-                # Cap height to 144pt (2 inches) to avoid crowding
+                # Cap height at 144pt (2 inches)
                 max_footer_h = 144
                 if draw_h > max_footer_h:
                     draw_h = max_footer_h
@@ -1036,109 +1035,581 @@ class RadXrReceiverApp:
                 footer_img_w = draw_w
                 footer_img_h = draw_h
             except Exception as e:
-                self.log_message(f"Footer image load error: {e}")
+                self.log_message(f"Footer image error: {e}")
                 footer_img_w = 0
                 footer_img_h = 0
 
-        # Define header area
-        # Header text
-        header_y = height - top_margin
-        c.setFont("Helvetica-Bold", 14)
-        c.drawString(margin_lr, header_y, self.config["institute_name"])
-        c.setFont("Helvetica-Oblique", 9)
-        c.drawRightString(width - margin_lr, header_y, f"Page {frame_idx + 1} of {num_frames}")
-        # Header line
-        c.setLineWidth(1)
-        c.setStrokeColorRGB(0.1, 0.5, 0.7)
-        c.line(margin_lr, header_y - 6, width - margin_lr, header_y - 6)
+        for frame_idx in range(num_frames):
+            frame_array = pixel_array[frame_idx] if is_multi_frame else pixel_array
 
-        # Metadata
-        y_meta_start = header_y - 20
-        c.setFont("Helvetica", 10)
-        y_text = y_meta_start
-        col = 0
-        for label, value in available_metadata:
-            x_pos = margin_lr if col == 0 else width / 2 + margin_lr - 40
-            c.setFont("Helvetica-Bold", 9)
-            c.drawString(x_pos, y_text, f"{label}: ")
-            c.setFont("Helvetica", 9)
-            c.drawString(x_pos + 80, y_text, value)
+            if frame_array.dtype != np.uint8:
+                p_min = frame_array.min()
+                p_max = frame_array.max()
+                if p_max > p_min:
+                    frame_array = (((frame_array - p_min) / (p_max - p_min)) * 255).astype(np.uint8)
+                else:
+                    frame_array = frame_array.astype(np.uint8)
+
+            # Convert to PIL Image for drawing
+            image = Image.fromarray(frame_array)
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+
+            temp_img_path = f"workflow_temp_frame_{frame_idx}_{int(time.time())}.jpg"
+            image.save(temp_img_path, quality=95)
+
+            # --- Header ---
+            header_y = height - top_margin
+            c.setFont("Helvetica-Bold", 14)
+            c.drawString(margin_lr, header_y, self.config["institute_name"])
+            c.setFont("Helvetica-Oblique", 9)
+            c.drawRightString(width - margin_lr, header_y, f"Page {frame_idx + 1} of {num_frames}")
+
+            # Header line
+            c.setLineWidth(1)
+            c.setStrokeColorRGB(0.1, 0.5, 0.7)
+            c.line(margin_lr, header_y - 6, width - margin_lr, header_y - 6)
+
+            # --- Metadata ---
+            y_meta_start = header_y - 20
+            c.setFont("Helvetica", 10)
+            y_text = y_meta_start
+            col = 0
+            for label, value in available_metadata:
+                x_pos = margin_lr if col == 0 else width / 2 + margin_lr - 40
+                c.setFont("Helvetica-Bold", 9)
+                c.drawString(x_pos, y_text, f"{label}: ")
+                c.setFont("Helvetica", 9)
+                c.drawString(x_pos + 80, y_text, value)
+                if col == 1:
+                    y_text -= 15
+                    col = 0
+                else:
+                    col = 1
             if col == 1:
                 y_text -= 15
-                col = 0
+
+            # Separator line after metadata
+            c.setLineWidth(0.5)
+            c.line(margin_lr, y_text, width - margin_lr, y_text)
+            main_image_top = y_text - 15
+
+            # --- Determine available space for main image ---
+            # Footer occupies bottom: from y=0 to footer_img_h (if any) plus a small gap
+            if footer_img_h > 0:
+                gap = 5
+                main_image_bottom = footer_img_h + gap
             else:
-                col = 1
-        if col == 1:
-            y_text -= 15
+                main_image_bottom = 0
 
-        # Separator line after metadata
-        c.setLineWidth(0.5)
-        c.line(margin_lr, y_text, width - margin_lr, y_text)
-        main_image_top = y_text - 15   # start of main image area
+            avail_height = main_image_top - main_image_bottom
+            avail_width = width - 2 * margin_lr
 
-        # Determine bottom of main image area
-        if footer_img_h > 0:
-            # Footer image occupies bottom from y=0 to footer_img_h
-            # Add a small gap (5pt) between main image and footer image
-            gap = 5
-            main_image_bottom = footer_img_h + gap
+            img_w, img_h = image.size
+            scale = 1.0
+            if img_w > avail_width or img_h > avail_height:
+                scale = min(avail_width / img_w, avail_height / img_h)
+            draw_main_w = img_w * scale
+            draw_main_h = img_h * scale
+
+            # Center horizontally and vertically within available space
+            x_main = (width - draw_main_w) / 2
+            y_main = main_image_bottom + (avail_height - draw_main_h) / 2
+
+            # Draw main image
+            c.drawImage(temp_img_path, x_main, y_main, width=draw_main_w, height=draw_main_h,
+                        preserveAspectRatio=True, anchor='c')
+            if os.path.exists(temp_img_path):
+                os.remove(temp_img_path)
+
+            # --- Footer image (if any) ---
+            if footer_img_w > 0 and footer_img_h > 0:
+                # Position at bottom-left, touching all edges
+                c.drawImage(footer_image_path, 0, 0, width=footer_img_w, height=footer_img_h,
+                            preserveAspectRatio=False, anchor='sw')
+
+            # Note: No footer lines are drawn.
+
+            if frame_idx < num_frames - 1:
+                c.showPage()
+
+        c.showPage()
+        c.save()
+        return patient_id, patient_name, accession_no
+
+    # ---------- Processing Pipeline ----------
+    def autonomous_processing_pipeline(self, dcm_path, is_manual_import=False):
+        pdf_output_path = ""
+        try:
+            ds = pydicom.dcmread(dcm_path)
+            patient_id = str(ds.get("PatientID", "N/A")).strip()
+            patient_name = str(ds.get("PatientName", "N/A")).strip()
+            accession_no = str(ds.get("AccessionNumber", "UNKNOWN")).strip()
+
+            archive_dir = self.config["archive_folder"]
+            os.makedirs(archive_dir, exist_ok=True)
+            archive_dest = os.path.join(archive_dir, os.path.basename(dcm_path))
+            if os.path.normpath(dcm_path) != os.path.normpath(archive_dest):
+                shutil.copy2(dcm_path, archive_dest)
+                dcm_path_for_index = archive_dest
+            else:
+                dcm_path_for_index = dcm_path
+
+            self.index_dicom_file(dcm_path_for_index, patient_id, patient_name, accession_no)
+
+            clean_pname = "".join(x for x in patient_name if x.isalnum() or x in " -_")
+            pdf_output_path = os.path.join(
+                self.config["receive_folder"],
+                f"{clean_pname}'s medical report.pdf"
+            )
+            self.generate_pdf_report_from_dicom(dcm_path_for_index, pdf_output_path)
+
+            file_key = dcm_path_for_index
+            self.root.after(0, lambda: self.upsert_grid_record(file_key, patient_id, patient_name, accession_no, "⏳ Processing"))
+            self.root.after(0, lambda: self.upsert_grid_record(file_key, patient_id, patient_name, accession_no, "📤 Sending"))
+
+            tg_ok = self.send_to_all_telegram(pdf_output_path, patient_id, patient_name, accession_no)
+            wa_ok = True
+            if self.config["whatsapp_api_key"] and self.config["whatsapp_phone_number_id"]:
+                if self.get_whatsapp_credits() > 0:
+                    wa_ok = self.dispatch_to_whatsapp_business(pdf_output_path, patient_id, patient_name, accession_no)
+                else:
+                    self.log_message("⚠️ Insufficient WhatsApp credits. Skipping WhatsApp send.")
+                    wa_ok = False
+
+            if tg_ok and wa_ok:
+                self.root.after(0, lambda: self.upsert_grid_record(file_key, patient_id, patient_name, accession_no, "Sent & Archived ✅"))
+                if os.path.exists(pdf_output_path):
+                    os.remove(pdf_output_path)
+                if not is_manual_import and os.path.exists(dcm_path) and os.path.normpath(dcm_path) != os.path.normpath(archive_dest):
+                    os.remove(dcm_path)
+            else:
+                self.root.after(0, lambda: self.upsert_grid_record(file_key, patient_id, patient_name, accession_no, "Failed ❌ (Double-Click)"))
+        except Exception as e:
+            self.root.after(0, lambda: messagebox.showerror("Pipeline Error", f"Error: {str(e)}"))
+            self.log_message(f"❌ Pipeline error: {e}")
+            if 'file_key' in locals():
+                self.root.after(0, lambda: self.upsert_grid_record(file_key, "N/A", "N/A", "UNKNOWN", "Failed ❌"))
+
+    def upsert_grid_record(self, file_path, p_id, p_name, acc_no, status):
+        if file_path in self.queue_data:
+            row_id = self.queue_data[file_path]
+            self.tree.item(row_id, values=(p_id, p_name, acc_no, os.path.basename(file_path), status))
         else:
-            # No footer image, main image goes to bottom edge
-            main_image_bottom = 0
+            row_id = self.tree.insert("", "end", values=(p_id, p_name, acc_no, os.path.basename(file_path), status))
+            self.queue_data[file_path] = row_id
 
-        # Main image available height
-        avail_height = main_image_top - main_image_bottom
-        avail_width = width - 2 * margin_lr
+    def build_beautiful_caption_string(self, p_id, p_name, acc_no, include_footer=True):
+        caption = (
+            f"🏥 *{self.config['institute_name']}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 *Patient Name:* {p_name}\n"
+            f"🆔 *Patient ID:* {p_id}\n"
+            f"🔢 *Accession No:* {acc_no}\n"
+        )
+        if include_footer and self.footer_message.strip():
+            caption += f"\n{self.footer_message.strip()}\n"
+        caption += f"\n*Made with ❤️ by Sandeep*"
+        return caption
 
-        # Load and scale main DICOM image
-        img_w, img_h = image.size
-        scale = 1.0
-        if img_w > avail_width or img_h > avail_height:
-            scale = min(avail_width / img_w, avail_height / img_h)
-        draw_main_w = img_w * scale
-        draw_main_h = img_h * scale
+    # ---------- Telegram ----------
+    def send_to_all_telegram(self, file_path, p_id, p_name, acc_no):
+        user_ids = self.get_all_telegram_users()
+        if not user_ids:
+            self.log_message("No Telegram users registered.")
+            return True
+        success = True
+        for chat_id in user_ids:
+            ok = self.dispatch_to_telegram(file_path, p_id, p_name, acc_no, chat_id)
+            if not ok:
+                success = False
+                self.log_message(f"❌ Failed to send to Telegram user {chat_id}")
+        return success
 
-        # Center horizontally
-        x_main = (width - draw_main_w) / 2
-        y_main = main_image_bottom + (avail_height - draw_main_h)  # bottom align? Actually we want to center vertically in the available space, so we compute y such that image is centered
-        # Better: center vertically
-        y_main = main_image_bottom + (avail_height - draw_main_h) / 2
+    def dispatch_to_telegram(self, file_path, p_id, p_name, acc_no, target_chat_id):
+        url = f"https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}/sendDocument"
+        try:
+            caption_text = self.build_beautiful_caption_string(p_id, p_name, acc_no, include_footer=True)
+            with open(file_path, "rb") as document:
+                payload = {
+                    "chat_id": target_chat_id,
+                    "caption": caption_text,
+                    "parse_mode": "Markdown"
+                }
+                files = {"document": (os.path.basename(file_path), document, "application/pdf")}
+                res = requests.post(url, data=payload, files=files, timeout=25)
+                return res.status_code == 200
+        except Exception as e:
+            self.log_message(f"Telegram send error: {e}")
+            return False
 
-        # Draw main image
-        temp_img_path = f"workflow_temp_frame_{0}_{int(time.time())}.jpg"
-        image.save(temp_img_path, quality=95)
-        c.drawImage(temp_img_path, x_main, y_main, width=draw_main_w, height=draw_main_h,
-                    preserveAspectRatio=True, anchor='c')
-        if os.path.exists(temp_img_path):
-            os.remove(temp_img_path)
+    # ---------- WhatsApp Business ----------
+    def dispatch_to_whatsapp_business(self, file_path, p_id, p_name, acc_no):
+        if not self.decrement_whatsapp_credits():
+            self.log_message("❌ No WhatsApp credits available.")
+            return False
 
-        # Draw footer image if exists
-        if footer_img_obj and footer_img_h > 0:
-            # Position at bottom left, touching borders
-            # Use the footer_image_path directly (already saved)
-            # We'll draw it at x=0, y=0, with the computed dimensions
-            # But we need to ensure it's placed at the bottom
-            c.drawImage(footer_image_path, 0, 0, width=footer_img_w, height=footer_img_h,
-                        preserveAspectRatio=False, anchor='sw')  # anchor at bottom-left, stretch to fill width
+        target_phone = "".join(filter(str.isdigit, acc_no))
+        if len(target_phone) < 10:
+            return False
+        if len(target_phone) == 10:
+            target_phone = "91" + target_phone
 
-        # Note: We don't draw footer lines anymore
+        phone_number_id = self.config["whatsapp_phone_number_id"]
+        api_key = self.config["whatsapp_api_key"]
+        if not phone_number_id or not api_key:
+            return False
 
-        # Handle multi-frame: for now we only support first frame, but we can loop if needed.
-        # For simplicity, we'll just draw the first frame (or all frames but we need to handle page breaks)
-        # Actually we need to loop over all frames:
-        # So we should put the above in a loop for frame_idx in range(num_frames)
-        # But the code above is outside the loop; we need to restructure.
+        headers = {"Authorization": f"Bearer {api_key}"}
+        upload_url = f"https://graph.facebook.com/v18.0/{phone_number_id}/media"
+        try:
+            caption_text = self.build_beautiful_caption_string(p_id, p_name, acc_no, include_footer=True)
+            clean_caption = caption_text.replace("*", "").replace("_", "")
+            with open(file_path, "rb") as f:
+                files = {
+                    "file": (os.path.basename(file_path), f, "application/pdf"),
+                    "messaging_product": (None, "whatsapp")
+                }
+                upload_res = requests.post(upload_url, headers=headers, files=files, timeout=25)
+                if upload_res.status_code != 200:
+                    self.log_message(f"WhatsApp upload failed: {upload_res.text}")
+                    return False
+                media_id = upload_res.json().get("id")
+                if not media_id:
+                    return False
 
-        # Let's rewrite properly: we'll loop over frames and for each frame we draw the main image.
-        # However, the footer image and header/metadata are the same for all pages.
-        # We'll loop over frames, and for each we create a new page (if multi-frame).
-        # We'll incorporate this loop.
+                msg_url = f"https://graph.facebook.com/v18.0/{phone_number_id}/messages"
+                payload = {
+                    "messaging_product": "whatsapp",
+                    "to": target_phone,
+                    "type": "document",
+                    "document": {
+                        "id": media_id,
+                        "filename": os.path.basename(file_path),
+                        "caption": clean_caption
+                    }
+                }
+                msg_res = requests.post(msg_url, headers=headers, json=payload, timeout=25)
+                if msg_res.status_code == 200:
+                    return True
+                else:
+                    self.log_message(f"WhatsApp send failed: {msg_res.text}")
+                    return False
+        except Exception as e:
+            self.log_message(f"WhatsApp error: {e}")
+            return False
 
-        # Since we need to return patient_id etc., we'll implement correctly.
+    # ---------- Telegram Bot Polling ----------
+    def start_telegram_bot_polling(self):
+        t = threading.Thread(target=self.telegram_bot_polling_worker, daemon=True)
+        t.start()
 
-        # I'll rewrite the method from scratch to avoid confusion.
-        # The above is a partial outline; I'll provide the final method below.
+    def telegram_bot_polling_worker(self):
+        base_url = f"https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}"
+        while self.bot_running:
+            try:
+                url = f"{base_url}/getUpdates?offset={self.last_update_id + 1}&timeout=10"
+                response = requests.get(url, timeout=15)
+                if response.status_code == 200:
+                    data = response.json()
+                    for update in data.get("result", []):
+                        self.last_update_id = update["update_id"]
+                        if "message" not in update:
+                            continue
+                        msg = update["message"]
+                        chat_id = str(msg["chat"]["id"])
+                        text = msg.get("text", "").strip()
+                        # Save user info
+                        user = msg.get("from", {})
+                        user_id = str(user.get("id", ""))
+                        username = user.get("username", "")
+                        full_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
+                        if user_id:
+                            self.save_telegram_user(user_id, username, full_name)
 
-        # But for the sake of completeness, I'll include the full method in the final code.
+                        # --- Commands ---
+                        if text.lower().startswith("/start"):
+                            welcome = (
+                                f"🏥 *Welcome to RAD-XR Portal Search Node*\n\n"
+                                f"Your User ID: `{chat_id}`\n\n"
+                                "To retrieve your patient's report(s), send the following format:\n"
+                                "`[PATIENT ID]`\n"
+                                "`[PATIENT FIRST NAME]`\n\n"
+                                "*Example:*\n"
+                                "`1898`\n"
+                                "`sandeep`"
+                            )
+                            if self.footer_message.strip():
+                                welcome += f"\n\n📝 *Message from Admin:* {self.footer_message.strip()}"
+                            self._send_message(base_url, chat_id, welcome)
+                            continue
 
-    # We'll rewrite the method as a complete implementation; I'll put it in the final answer.
+                        # --- Master commands ---
+                        if chat_id == self.TELEGRAM_MASTER_USER_ID:
+                            # /newbot <token>
+                            if text.lower().startswith("/newbot "):
+                                new_token = text[8:].strip()
+                                if new_token:
+                                    self.TELEGRAM_BOT_TOKEN = new_token
+                                    self.last_update_id = 0
+                                    self.config["telegram_bot_token"] = new_token
+                                    self.save_configuration()
+                                    base_url = f"https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}"
+                                    self.update_bot_username()
+                                    self.refresh_bot_info_gui()
+                                    self._send_message(base_url, chat_id, f"✅ Bot token updated successfully. New token: `{new_token}`")
+                                    self.log_message(f"Bot token changed to {new_token}")
+                                else:
+                                    self._send_message(base_url, chat_id, "❌ Please provide a valid token: `/newbot <token>`")
+                                continue
+
+                            # /adduser <userid>
+                            if text.lower().startswith("/adduser "):
+                                uid = text[9:].strip()
+                                if uid:
+                                    self.save_telegram_user(uid, "", "")
+                                    self._send_message(base_url, chat_id, f"✅ User `{uid}` added to broadcast list.")
+                                    self.log_message(f"Added Telegram user {uid}")
+                                else:
+                                    self._send_message(base_url, chat_id, "❌ Please provide a user ID: `/adduser <userid>`")
+                                continue
+
+                            # /remove <userid>
+                            if text.lower().startswith("/remove "):
+                                uid = text[8:].strip()
+                                if uid == self.TELEGRAM_MASTER_USER_ID:
+                                    self._send_message(base_url, chat_id, "❌ Cannot remove the master user.")
+                                elif uid:
+                                    self.delete_telegram_user(uid)
+                                    self._send_message(base_url, chat_id, f"✅ User `{uid}` removed from broadcast list.")
+                                    self.log_message(f"Removed Telegram user {uid}")
+                                else:
+                                    self._send_message(base_url, chat_id, "❌ Please provide a user ID: `/remove <userid>`")
+                                continue
+
+                            # /message <text> (caption)
+                            if text.lower().startswith("/message "):
+                                new_msg = text[9:].strip()
+                                self.footer_message = new_msg
+                                self.config["footer_message"] = new_msg
+                                self.save_configuration()
+                                self._send_message(base_url, chat_id, f"✅ Caption message updated to:\n\n{new_msg}")
+                                self.log_message(f"Caption message changed to: {new_msg}")
+                                continue
+
+                            # /footer handling (photo or text)
+                            if text.lower().startswith("/footer"):
+                                reply_to = msg.get("reply_to_message")
+                                if reply_to and "photo" in reply_to:
+                                    try:
+                                        photos = reply_to["photo"]
+                                        largest = photos[-1]
+                                        file_id = largest["file_id"]
+                                        get_file_url = f"{base_url}/getFile?file_id={file_id}"
+                                        file_resp = requests.get(get_file_url, timeout=10)
+                                        if file_resp.status_code == 200:
+                                            file_data = file_resp.json()
+                                            if file_data.get("ok"):
+                                                file_path = file_data["result"]["file_path"]
+                                                download_url = f"https://api.telegram.org/file/bot{self.TELEGRAM_BOT_TOKEN}/{file_path}"
+                                                img_resp = requests.get(download_url, timeout=30)
+                                                if img_resp.status_code == 200:
+                                                    with open(FOOTER_IMAGE_PATH, "wb") as f:
+                                                        f.write(img_resp.content)
+                                                    self.pdf_footer_image = FOOTER_IMAGE_PATH
+                                                    self.config["pdf_footer_image"] = FOOTER_IMAGE_PATH
+                                                    self.pdf_footer_text = ""
+                                                    self.config["pdf_footer_text"] = ""
+                                                    self.save_configuration()
+                                                    self._send_message(base_url, chat_id, "✅ PDF footer image updated successfully.")
+                                                    self.log_message("PDF footer image set from reply photo.")
+                                                else:
+                                                    self._send_message(base_url, chat_id, "❌ Failed to download photo.")
+                                            else:
+                                                self._send_message(base_url, chat_id, "❌ Failed to get file info.")
+                                        else:
+                                            self._send_message(base_url, chat_id, "❌ Failed to fetch file info from Telegram.")
+                                    except Exception as e:
+                                        self._send_message(base_url, chat_id, f"❌ Error: {e}")
+                                        self.log_message(f"Error setting footer image: {e}")
+                                else:
+                                    # Text footer: clear image and set text
+                                    if self.pdf_footer_image and os.path.exists(self.pdf_footer_image):
+                                        try:
+                                            os.remove(self.pdf_footer_image)
+                                        except:
+                                            pass
+                                        self.pdf_footer_image = ""
+                                        self.config["pdf_footer_image"] = ""
+                                    new_footer = text[7:].strip() if len(text) > 7 else ""
+                                    self.pdf_footer_text = new_footer
+                                    self.config["pdf_footer_text"] = new_footer
+                                    self.save_configuration()
+                                    if new_footer:
+                                        self._send_message(base_url, chat_id, f"✅ PDF footer text updated to:\n\n{new_footer}")
+                                    else:
+                                        self._send_message(base_url, chat_id, "✅ PDF footer text cleared.")
+                                    self.log_message(f"PDF footer text set to: {new_footer}")
+                                continue
+
+                            # /broadcast <message>
+                            if text.lower().startswith("/broadcast "):
+                                broadcast_msg = text[11:].strip()
+                                if broadcast_msg:
+                                    self._broadcast_text(base_url, broadcast_msg, chat_id)
+                                else:
+                                    self._send_message(base_url, chat_id, "❌ Please provide a message: `/broadcast Hello everyone`")
+                                continue
+
+                            # /recharge <number>
+                            if text.lower().startswith("/recharge "):
+                                amount_str = text[10:].strip()
+                                try:
+                                    amount = int(amount_str)
+                                    if amount > 0:
+                                        new_total = self.add_whatsapp_credits(amount)
+                                        self._send_message(base_url, chat_id,
+                                            f"✅ Recharged {amount} WhatsApp credits.\nTotal remaining: {new_total}")
+                                        self.log_message(f"Recharged {amount} credits. New total: {new_total}")
+                                    else:
+                                        self._send_message(base_url, chat_id, "❌ Please provide a positive number.")
+                                except ValueError:
+                                    self._send_message(base_url, chat_id, "❌ Please provide a valid number: `/recharge 100`")
+                                continue
+
+                            # /balance
+                            if text.lower() == "/balance":
+                                bal = self.get_whatsapp_credits()
+                                self._send_message(base_url, chat_id, f"💰 Remaining WhatsApp credits: {bal}")
+                                continue
+
+                            # /prompt
+                            if text.lower() == "/prompt":
+                                help_text = (
+                                    "*Available Commands (Master only):*\n\n"
+                                    "/newbot `<token>` – Change Telegram bot token.\n"
+                                    "/adduser `<userid>` – Add a user to broadcast list.\n"
+                                    "/remove `<userid>` – Remove a user from broadcast list.\n"
+                                    "/message `<text>` – Set caption message for Telegram/WhatsApp.\n"
+                                    "/footer `<text>` – Set text inside PDF footer (between two lines).\n"
+                                    "Reply to a **photo** with `/footer` – set that photo as the PDF footer image.\n"
+                                    "/broadcast `<message>` – Send text message to all users.\n"
+                                    "Reply to any message with `/broadcast` – forward that message to all users.\n"
+                                    "/recharge `<number>` – Add WhatsApp sending credits.\n"
+                                    "/balance – Show remaining WhatsApp credits.\n"
+                                    "/prompt – Show this help message.\n\n"
+                                    "Any user can send `/start` to get their ID and a welcome message.\n"
+                                    "To request a report, send:\n"
+                                    "`[PATIENT ID]`\n"
+                                    "`[PATIENT FIRST NAME]`"
+                                )
+                                self._send_message(base_url, chat_id, help_text)
+                                continue
+
+                            # Reply broadcast (if reply_to_message and text == "/broadcast")
+                            if msg.get("reply_to_message") and text.lower() == "/broadcast":
+                                reply_to = msg["reply_to_message"]
+                                self._broadcast_reply(base_url, reply_to, chat_id)
+                                continue
+
+                        # --- Patient Query (any user) ---
+                        lines = [line.strip() for line in text.split("\n") if line.strip()]
+                        if len(lines) >= 2:
+                            query_id = lines[0]
+                            query_name = lines[1].lower()
+                            matched_entries = self.get_patient_files_from_db(query_id, query_name)
+
+                            if matched_entries:
+                                valid_entries = []
+                                for entry in matched_entries:
+                                    file_path, p_id, p_name, acc_no = entry
+                                    if os.path.exists(file_path):
+                                        valid_entries.append(entry)
+                                    else:
+                                        self._send_message(base_url, chat_id,
+                                            f"⚠️ File for Patient `{p_name}` (ID: {p_id}) is **deleted or not available**.")
+                                if not valid_entries:
+                                    self._send_message(base_url, chat_id, "❌ No available files found for this patient.")
+                                    continue
+
+                                self._send_message(base_url, chat_id,
+                                    f"🔍 Found **{len(valid_entries)}** available DICOM file(s). Generating PDF(s)...")
+                                for idx, entry in enumerate(valid_entries, 1):
+                                    file_path, p_id, p_name, acc_no = entry
+                                    try:
+                                        self._send_message(base_url, chat_id, f"📄 Generating PDF {idx} / {len(valid_entries)}...")
+                                        clean_pname = "".join(x for x in p_name if x.isalnum() or x in " -_")
+                                        bot_pdf_path = os.path.join(
+                                            self.config["receive_folder"],
+                                            f"{clean_pname}'s medical report_{idx}_{int(time.time())}.pdf"
+                                        )
+                                        self.generate_pdf_report_from_dicom(file_path, bot_pdf_path)
+                                        self.dispatch_to_telegram(bot_pdf_path, p_id, p_name, acc_no, chat_id)
+                                        self.root.after(0, lambda pi=p_id, pn=p_name, ac=acc_no, fp=file_path:
+                                                        self.upsert_grid_record(fp, pi, pn, ac, "📤 Sent via Bot (Multi)"))
+                                        if os.path.exists(bot_pdf_path):
+                                            os.remove(bot_pdf_path)
+                                    except Exception as ex:
+                                        self._send_message(base_url, chat_id, f"❌ Error processing file {idx}: {str(ex)}")
+                                        self.log_message(f"❌ Bot error: {ex}")
+                                    time.sleep(0.5)
+                                self._send_message(base_url, chat_id, f"✅ All {len(valid_entries)} PDF(s) sent successfully!")
+                            else:
+                                self._send_message(base_url, chat_id,
+                                    f"❌ No records found for Patient ID: `{query_id}` and Name: `{query_name}`.")
+            except Exception as e:
+                self.log_message(f"Bot polling error: {e}")
+            time.sleep(1)
+
+    def _send_message(self, base_url, chat_id, text, parse_mode="Markdown"):
+        try:
+            requests.post(f"{base_url}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": parse_mode}, timeout=10)
+        except Exception as e:
+            self.log_message(f"Error sending message: {e}")
+
+    def _broadcast_text(self, base_url, text, master_chat_id):
+        users = self.get_all_telegram_users()
+        if not users:
+            self._send_message(base_url, master_chat_id, "No users to broadcast to.")
+            return
+        count = 0
+        for uid in users:
+            try:
+                requests.post(f"{base_url}/sendMessage", json={"chat_id": uid, "text": text, "parse_mode": "Markdown"}, timeout=10)
+                count += 1
+            except Exception as e:
+                self.log_message(f"Broadcast failed to {uid}: {e}")
+        self._send_message(base_url, master_chat_id, f"✅ Broadcast sent to {count} users.")
+
+    def _broadcast_reply(self, base_url, reply_msg, master_chat_id):
+        users = self.get_all_telegram_users()
+        if not users:
+            self._send_message(base_url, master_chat_id, "No users to broadcast to.")
+            return
+        count = 0
+        for uid in users:
+            try:
+                orig_chat_id = reply_msg["chat"]["id"]
+                orig_msg_id = reply_msg["message_id"]
+                copy_url = f"{base_url}/copyMessage"
+                payload = {
+                    "chat_id": uid,
+                    "from_chat_id": orig_chat_id,
+                    "message_id": orig_msg_id
+                }
+                if "caption" in reply_msg:
+                    payload["caption"] = reply_msg["caption"]
+                resp = requests.post(copy_url, json=payload, timeout=15)
+                if resp.status_code == 200:
+                    count += 1
+                else:
+                    self.log_message(f"Copy failed for {uid}: {resp.text}")
+            except Exception as e:
+                self.log_message(f"Broadcast reply error to {uid}: {e}")
+            time.sleep(0.1)
+        self._send_message(base_url, master_chat_id, f"✅ Broadcast reply sent to {count} users.")
+
+if __name__ == "__main__":
+    root = Tk()
+    app = RadXrReceiverApp(root)
+    root.mainloop()

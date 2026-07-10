@@ -76,14 +76,14 @@ class RadXrReceiverApp:
             "telegram_bot_token": DEFAULT_TELEGRAM_BOT_TOKEN,
             "footer_message": "",
             "auto_start": False,
-            "bot_display_name": "RAD-XR Bot"          # new: bot's display name
+            "bot_display_name": "RAD-XR Bot"
         }
         
         self.TELEGRAM_BOT_TOKEN = None
         self.TELEGRAM_MASTER_USER_ID = DEFAULT_MASTER_USER_ID
-        self.allowed_users = [DEFAULT_MASTER_USER_ID]   # deprecated, now using DB table
+        self.allowed_users = [DEFAULT_MASTER_USER_ID]
         self.footer_message = ""
-        self.bot_username = ""   # fetched from getMe
+        self.bot_username = ""
         
         self.server_instance = None
         self.is_listening = False
@@ -97,7 +97,7 @@ class RadXrReceiverApp:
         self.lbl_index_progress_monitor = None
         self.lbl_index_progress_config = None
         self.log_widget = None
-        self.lbl_bot_name = None   # for GUI update
+        self.lbl_bot_name = None
         
         self.load_configuration()
         self.setup_modern_styles()
@@ -107,11 +107,8 @@ class RadXrReceiverApp:
         else:
             self._remove_from_startup()
         
-        # Initialize DB and create telegram_users table
         self.init_db()
         self.init_telegram_users_table()
-        
-        # Fetch bot username (if token is valid)
         self.update_bot_username()
         
         if not self.config.get("password_verified"):
@@ -120,7 +117,7 @@ class RadXrReceiverApp:
             self.show_main_dashboard()
             threading.Thread(target=self.index_all_existing_files, daemon=True).start()
             self.sync_archive_folder_to_dashboard()
-            self.start_folder_monitor()
+            self.start_folder_monitor()          # <--- method exists now
             self.start_telegram_bot_polling()
 
     def get_local_ip(self):
@@ -133,7 +130,7 @@ class RadXrReceiverApp:
         except Exception:
             return "127.0.0.1"
 
-    # ---------- Auto‑Start ----------
+    # ---------- Auto‑Start Registry ----------
     def _get_app_path(self):
         if getattr(sys, 'frozen', False):
             return sys.executable
@@ -190,7 +187,7 @@ class RadXrReceiverApp:
         
         self.TELEGRAM_BOT_TOKEN = self.config["telegram_bot_token"]
         self.footer_message = self.config.get("footer_message", "")
-        self.allowed_users = [DEFAULT_MASTER_USER_ID]  # kept for backward, but broadcast uses DB
+        self.allowed_users = [DEFAULT_MASTER_USER_ID]
 
     def save_configuration(self):
         try:
@@ -270,7 +267,6 @@ class RadXrReceiverApp:
         return results
 
     def update_bot_username(self):
-        """Fetch bot's username from Telegram API and store in self.bot_username"""
         if not self.TELEGRAM_BOT_TOKEN:
             return
         try:
@@ -281,12 +277,136 @@ class RadXrReceiverApp:
                 if data.get("ok"):
                     self.bot_username = data["result"].get("username", "")
                     self.log_message(f"Bot username: @{self.bot_username}")
-                    # Also update display name if not set
                     if not self.config.get("bot_display_name") or self.config["bot_display_name"] == "RAD-XR Bot":
                         self.config["bot_display_name"] = data["result"].get("first_name", "RAD-XR Bot")
                         self.save_configuration()
         except Exception as e:
             self.log_message(f"Failed to fetch bot info: {e}")
+
+    # ---------- Indexing ----------
+    def index_all_existing_files(self, reindex=False):
+        if self.indexing_in_progress:
+            self.log_message("Indexing already in progress. Skipping.")
+            return
+        self.indexing_in_progress = True
+        self.log_message("Starting indexing of archive folder...")
+        archive_dir = self.config["archive_folder"]
+        if not os.path.exists(archive_dir):
+            self.log_message(f"Archive folder {archive_dir} does not exist.")
+            self.indexing_in_progress = False
+            return
+
+        self.init_db()
+        conn = sqlite3.connect(DATABASE_PATH)
+        c = conn.cursor()
+
+        if reindex:
+            self.log_message("Re-indexing: dropping existing table...")
+            c.execute("DROP TABLE IF EXISTS dicom_index")
+            self.init_db()
+            conn = sqlite3.connect(DATABASE_PATH)
+            c = conn.cursor()
+
+        all_files = [f for f in os.listdir(archive_dir) if f.lower().endswith(".dcm")]
+        total = len(all_files)
+        processed = 0
+
+        self.root.after(0, self.update_index_progress, processed, total)
+
+        for file in all_files:
+            full_path = os.path.join(archive_dir, file)
+            try:
+                if not reindex:
+                    c.execute("SELECT file_path FROM dicom_index WHERE file_path = ?", (full_path,))
+                    if c.fetchone():
+                        processed += 1
+                        self.root.after(0, self.update_index_progress, processed, total)
+                        continue
+                ds = pydicom.dcmread(full_path, stop_before_pixels=True)
+                accession = str(ds.get("AccessionNumber", "UNKNOWN")).strip()
+                patient_id = str(ds.get("PatientID", "N/A")).strip()
+                patient_name = str(ds.get("PatientName", "N/A")).strip()
+                c.execute("INSERT OR IGNORE INTO dicom_index (file_path, accession, patient_id, patient_name, created_at) VALUES (?,?,?,?,?)",
+                          (full_path, accession, patient_id, patient_name, int(os.path.getctime(full_path))))
+            except Exception as e:
+                self.log_message(f"❌ Indexing failed for {full_path}: {e}")
+            processed += 1
+            self.root.after(0, self.update_index_progress, processed, total)
+
+        conn.commit()
+        conn.close()
+        self.indexing_in_progress = False
+        self.root.after(0, self.update_index_progress, total, total, done=True)
+        self.log_message(f"✅ Indexing complete: {processed} files indexed.")
+
+    def update_index_progress(self, current, total, done=False):
+        if done:
+            text = f"✅ Indexing complete: {total} files indexed."
+        else:
+            text = f"⏳ Indexing: {current} / {total} files processed..."
+        if self.lbl_index_progress_monitor:
+            self.lbl_index_progress_monitor.config(text=text)
+        if self.lbl_index_progress_config:
+            self.lbl_index_progress_config.config(text=text)
+
+    def index_dicom_file(self, dcm_path, patient_id, patient_name, accession_no):
+        if not os.path.exists(dcm_path):
+            return
+        self.init_db()
+        conn = sqlite3.connect(DATABASE_PATH)
+        c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO dicom_index (file_path, accession, patient_id, patient_name, created_at) VALUES (?,?,?,?,?)",
+                  (dcm_path, accession_no, patient_id, patient_name, int(time.time())))
+        conn.commit()
+        conn.close()
+
+    def get_patient_files_from_db(self, q_id, q_name):
+        self.init_db()
+        conn = sqlite3.connect(DATABASE_PATH)
+        c = conn.cursor()
+        name_prefix = q_name[:4].lower() if len(q_name) >= 4 else q_name.lower()
+        c.execute("""
+            SELECT file_path, patient_id, patient_name, accession
+            FROM dicom_index
+            WHERE patient_id = ? AND LOWER(patient_name) LIKE ?
+        """, (q_id.strip(), f"{name_prefix}%"))
+        results = c.fetchall()
+        conn.close()
+        return results
+
+    # ---------- Folder Monitoring (methods that were missing) ----------
+    def start_folder_monitor(self):
+        archive_dir = self.config["archive_folder"]
+        os.makedirs(archive_dir, exist_ok=True)
+        if self.observer and self.monitoring_active:
+            self.stop_folder_monitor()
+        self.observer = Observer()
+        event_handler = DicomArchiveHandler(self)
+        self.observer.schedule(event_handler, path=archive_dir, recursive=False)
+        self.observer.start()
+        self.monitoring_active = True
+        self.log_message(f"📁 Watching Archive folder: {archive_dir}")
+
+    def stop_folder_monitor(self):
+        if self.observer:
+            self.observer.stop()
+            self.observer.join()
+            self.monitoring_active = False
+            self.log_message("📁 Folder monitoring stopped.")
+
+    def handle_new_external_dicom(self, file_path):
+        try:
+            if not os.path.exists(file_path):
+                return
+            ds = pydicom.dcmread(file_path, stop_before_pixels=True)
+            patient_id = str(ds.get("PatientID", "N/A")).strip()
+            patient_name = str(ds.get("PatientName", "N/A")).strip()
+            accession_no = str(ds.get("AccessionNumber", "UNKNOWN")).strip()
+            self.index_dicom_file(file_path, patient_id, patient_name, accession_no)
+            self.root.after(0, lambda: self.upsert_grid_record(file_path, patient_id, patient_name, accession_no, "Archived (External) 📁"))
+            self.log_message(f"✅ External DICOM indexed: {os.path.basename(file_path)}")
+        except Exception as e:
+            self.log_message(f"❌ Error indexing external DICOM {file_path}: {e}")
 
     # ---------- GUI ----------
     def show_password_screen(self):
@@ -340,7 +460,7 @@ class RadXrReceiverApp:
         content_splitter = Frame(frame_receiver, bg=self.bg_dark)
         content_splitter.pack(fill="both", expand=True, padx=15, pady=5)
 
-        # Left panel: network config + bot info
+        # Left panel: network + bot info
         net_card = Frame(content_splitter, bg=self.bg_card, width=220)
         net_card.pack(side="left", fill="y", padx=(0, 10))
         net_card.pack_propagate(False)
@@ -359,16 +479,13 @@ class RadXrReceiverApp:
         self.lbl_folder = add_stat_lbl(net_card, "INBOX DIRECTORY", "receive_folder")
         self.lbl_archive = add_stat_lbl(net_card, "ARCHIVE SYSTEM", "archive_folder")
 
-        # ---- Telegram Bot Info (new) ----
+        # Bot info
         Label(net_card, text="🤖 TELEGRAM BOT", font=("Arial", 8, "bold"), fg=self.accent_cyan, bg=self.bg_card).pack(anchor="w", padx=15, pady=(10, 0))
-        # Bot display name
         bot_display = self.config.get("bot_display_name", "RAD-XR Bot")
         self.lbl_bot_name = Label(net_card, text=f"Name: {bot_display}", font=("Arial", 9), fg=self.text_light, bg=self.bg_card, wraplength=190, justify="left")
         self.lbl_bot_name.pack(anchor="w", padx=15, pady=(0, 2))
-        # Bot username
         bot_uname = f"@{self.bot_username}" if self.bot_username else "Not available"
         Label(net_card, text=f"Username: {bot_uname}", font=("Arial", 9), fg="#9ca3af", bg=self.bg_card, wraplength=190, justify="left").pack(anchor="w", padx=15, pady=(0, 5))
-        # Search hint
         Label(net_card, text="Search on Telegram: @...", font=("Arial", 7), fg="#6b7280", bg=self.bg_card).pack(anchor="w", padx=15, pady=(0, 5))
 
         Label(net_card, text="📁 FOLDER WATCH", font=("Arial", 8, "bold"), fg=self.accent_green if self.monitoring_active else self.accent_red, bg=self.bg_card).pack(anchor="w", padx=15, pady=(10,0))
@@ -458,7 +575,7 @@ class RadXrReceiverApp:
         self.ent_archive_path.insert(0, self.config.get("archive_folder", "D:\\RAD-XR\\Archive"))
         Button(f_dir2, text="Browse", font=("Arial", 8, "bold"), bg="#4b5563", fg=self.text_light, bd=0, command=lambda: self.pick_directory("archive_folder", self.ent_archive_path)).pack(side="left", padx=2)
 
-        # Auto‑Start Checkbox
+        # Auto‑Start
         self.auto_start_var = IntVar(value=1 if self.config.get("auto_start", False) else 0)
         def toggle_auto_start():
             enable = bool(self.auto_start_var.get())
@@ -489,7 +606,6 @@ class RadXrReceiverApp:
         Button(frame_settings, text="Apply Node Topology Changes", font=("Arial", 11, "bold"), bg=self.accent_green, fg=self.bg_dark, width=28, bd=0, cursor="hand2", command=self.apply_and_save_node_settings).pack(pady=15)
         Label(frame_settings, text="Made with ❤️ by Sandeep", font=("Arial", 9, "bold", "italic"), fg="#6b7280", bg=self.bg_dark).pack(side="bottom", pady=5)
 
-        # Update bot name label if it exists
         if self.lbl_bot_name:
             self.lbl_bot_name.config(text=f"Name: {self.config.get('bot_display_name', 'RAD-XR Bot')}")
 
@@ -901,13 +1017,12 @@ class RadXrReceiverApp:
         caption += f"\n*Made with ❤️ by Sandeep*"
         return caption
 
-    # ---------- Telegram Sending ----------
+    # ---------- Telegram ----------
     def send_to_all_telegram(self, file_path, p_id, p_name, acc_no):
-        # Send to all users in DB (including master)
         user_ids = self.get_all_telegram_users()
         if not user_ids:
             self.log_message("No Telegram users registered.")
-            return True  # consider success
+            return True
         success = True
         for chat_id in user_ids:
             ok = self.dispatch_to_telegram(file_path, p_id, p_name, acc_no, chat_id)
@@ -971,7 +1086,7 @@ class RadXrReceiverApp:
             self.log_message(f"WhatsApp send error: {e}")
             return False
 
-    # ---------- Telegram Bot Polling with Commands ----------
+    # ---------- Telegram Bot Polling ----------
     def start_telegram_bot_polling(self):
         t = threading.Thread(target=self.telegram_bot_polling_worker, daemon=True)
         t.start()
@@ -999,7 +1114,7 @@ class RadXrReceiverApp:
                         if user_id:
                             self.save_telegram_user(user_id, username, full_name)
 
-                        # --- Command Handling ---
+                        # --- Commands ---
                         if text.lower().startswith("/start"):
                             welcome = (
                                 f"🏥 *Welcome to RAD-XR Portal Search Node*\n\n"
@@ -1016,13 +1131,11 @@ class RadXrReceiverApp:
                             self._send_message(base_url, chat_id, welcome)
                             continue
 
-                        # --- Master commands ---
+                        # Master commands
                         if chat_id == self.TELEGRAM_MASTER_USER_ID:
-                            # /addbotname <name>
                             if text.lower().startswith("/addbotname "):
                                 new_name = text[12:].strip()
                                 if new_name:
-                                    # Update bot name via Telegram API
                                     try:
                                         set_url = f"{base_url}/setMyName?name={new_name}"
                                         resp = requests.get(set_url, timeout=10)
@@ -1030,7 +1143,6 @@ class RadXrReceiverApp:
                                             self.config["bot_display_name"] = new_name
                                             self.save_configuration()
                                             self._send_message(base_url, chat_id, f"✅ Bot display name updated to: {new_name}")
-                                            # Update GUI
                                             if self.lbl_bot_name:
                                                 self.root.after(0, lambda: self.lbl_bot_name.config(text=f"Name: {new_name}"))
                                             self.log_message(f"Bot name changed to {new_name}")
@@ -1042,7 +1154,6 @@ class RadXrReceiverApp:
                                     self._send_message(base_url, chat_id, "❌ Please provide a name: `/addbotname MyBot`")
                                 continue
 
-                            # /broadcast <message>
                             if text.lower().startswith("/broadcast "):
                                 broadcast_msg = text[11:].strip()
                                 if broadcast_msg:
@@ -1051,7 +1162,6 @@ class RadXrReceiverApp:
                                     self._send_message(base_url, chat_id, "❌ Please provide a message: `/broadcast Hello everyone`")
                                 continue
 
-                            # /prompt
                             if text.lower() == "/prompt":
                                 help_text = (
                                     "*Available Commands (Master only):*\n\n"
@@ -1067,16 +1177,13 @@ class RadXrReceiverApp:
                                 self._send_message(base_url, chat_id, help_text)
                                 continue
 
-                        # --- Reply broadcast (master replies to a message with /broadcast) ---
-                        if chat_id == self.TELEGRAM_MASTER_USER_ID:
-                            # Check if this is a reply to another message
+                            # Reply broadcast
                             if msg.get("reply_to_message") and text.lower() == "/broadcast":
                                 reply_to = msg["reply_to_message"]
-                                # Forward/copy the replied message to all users
                                 self._broadcast_reply(base_url, reply_to, chat_id)
                                 continue
 
-                        # --- Patient Query (any user) ---
+                        # Patient query
                         lines = [line.strip() for line in text.split("\n") if line.strip()]
                         if len(lines) >= 2:
                             query_id = lines[0]
@@ -1153,22 +1260,16 @@ class RadXrReceiverApp:
         count = 0
         for uid in users:
             try:
-                # Use copyMessage to forward without showing it's forwarded
-                # Get the message_id and chat_id of the original
                 orig_chat_id = reply_msg["chat"]["id"]
                 orig_msg_id = reply_msg["message_id"]
-                # Copy to each user
                 copy_url = f"{base_url}/copyMessage"
                 payload = {
                     "chat_id": uid,
                     "from_chat_id": orig_chat_id,
                     "message_id": orig_msg_id
                 }
-                # If there's a caption and it's a media message, include it
                 if "caption" in reply_msg:
                     payload["caption"] = reply_msg["caption"]
-                # If parse_mode needed, add it
-                # We'll just use default
                 resp = requests.post(copy_url, json=payload, timeout=15)
                 if resp.status_code == 200:
                     count += 1
@@ -1178,97 +1279,6 @@ class RadXrReceiverApp:
                 self.log_message(f"Broadcast reply error to {uid}: {e}")
             time.sleep(0.1)
         self._send_message(base_url, master_chat_id, f"✅ Broadcast reply sent to {count} users.")
-
-    # ---------- Index functions (unchanged) ----------
-    def index_all_existing_files(self, reindex=False):
-        if self.indexing_in_progress:
-            self.log_message("Indexing already in progress. Skipping.")
-            return
-        self.indexing_in_progress = True
-        self.log_message("Starting indexing of archive folder...")
-        archive_dir = self.config["archive_folder"]
-        if not os.path.exists(archive_dir):
-            self.log_message(f"Archive folder {archive_dir} does not exist.")
-            self.indexing_in_progress = False
-            return
-
-        self.init_db()
-        conn = sqlite3.connect(DATABASE_PATH)
-        c = conn.cursor()
-
-        if reindex:
-            self.log_message("Re-indexing: dropping existing table...")
-            c.execute("DROP TABLE IF EXISTS dicom_index")
-            self.init_db()
-            conn = sqlite3.connect(DATABASE_PATH)
-            c = conn.cursor()
-
-        all_files = [f for f in os.listdir(archive_dir) if f.lower().endswith(".dcm")]
-        total = len(all_files)
-        processed = 0
-
-        self.root.after(0, self.update_index_progress, processed, total)
-
-        for file in all_files:
-            full_path = os.path.join(archive_dir, file)
-            try:
-                if not reindex:
-                    c.execute("SELECT file_path FROM dicom_index WHERE file_path = ?", (full_path,))
-                    if c.fetchone():
-                        processed += 1
-                        self.root.after(0, self.update_index_progress, processed, total)
-                        continue
-                ds = pydicom.dcmread(full_path, stop_before_pixels=True)
-                accession = str(ds.get("AccessionNumber", "UNKNOWN")).strip()
-                patient_id = str(ds.get("PatientID", "N/A")).strip()
-                patient_name = str(ds.get("PatientName", "N/A")).strip()
-                c.execute("INSERT OR IGNORE INTO dicom_index (file_path, accession, patient_id, patient_name, created_at) VALUES (?,?,?,?,?)",
-                          (full_path, accession, patient_id, patient_name, int(os.path.getctime(full_path))))
-            except Exception as e:
-                self.log_message(f"❌ Indexing failed for {full_path}: {e}")
-            processed += 1
-            self.root.after(0, self.update_index_progress, processed, total)
-
-        conn.commit()
-        conn.close()
-        self.indexing_in_progress = False
-        self.root.after(0, self.update_index_progress, total, total, done=True)
-        self.log_message(f"✅ Indexing complete: {processed} files indexed.")
-
-    def update_index_progress(self, current, total, done=False):
-        if done:
-            text = f"✅ Indexing complete: {total} files indexed."
-        else:
-            text = f"⏳ Indexing: {current} / {total} files processed..."
-        if self.lbl_index_progress_monitor:
-            self.lbl_index_progress_monitor.config(text=text)
-        if self.lbl_index_progress_config:
-            self.lbl_index_progress_config.config(text=text)
-
-    def index_dicom_file(self, dcm_path, patient_id, patient_name, accession_no):
-        if not os.path.exists(dcm_path):
-            return
-        self.init_db()
-        conn = sqlite3.connect(DATABASE_PATH)
-        c = conn.cursor()
-        c.execute("INSERT OR IGNORE INTO dicom_index (file_path, accession, patient_id, patient_name, created_at) VALUES (?,?,?,?,?)",
-                  (dcm_path, accession_no, patient_id, patient_name, int(time.time())))
-        conn.commit()
-        conn.close()
-
-    def get_patient_files_from_db(self, q_id, q_name):
-        self.init_db()
-        conn = sqlite3.connect(DATABASE_PATH)
-        c = conn.cursor()
-        name_prefix = q_name[:4].lower() if len(q_name) >= 4 else q_name.lower()
-        c.execute("""
-            SELECT file_path, patient_id, patient_name, accession
-            FROM dicom_index
-            WHERE patient_id = ? AND LOWER(patient_name) LIKE ?
-        """, (q_id.strip(), f"{name_prefix}%"))
-        results = c.fetchall()
-        conn.close()
-        return results
 
 if __name__ == "__main__":
     root = Tk()

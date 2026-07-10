@@ -88,7 +88,7 @@ class RadXrReceiverApp:
             "telegram_bot_token": DEFAULT_TELEGRAM_BOT_TOKEN,
             "footer_message": "",
             "pdf_footer_text": "",
-            "pdf_footer_image": "",      # path to footer image (if set)
+            "pdf_footer_image": "",
             "auto_start": False,
             "bot_display_name": "RAD-XR Bot"
         }
@@ -98,7 +98,7 @@ class RadXrReceiverApp:
         self.allowed_users = [DEFAULT_MASTER_USER_ID]
         self.footer_message = ""
         self.pdf_footer_text = ""
-        self.pdf_footer_image = ""       # stores path
+        self.pdf_footer_image = ""
         self.bot_username = ""
         self.config_unlocked = False
         
@@ -969,7 +969,7 @@ class RadXrReceiverApp:
             self.log_message(f"❌ C-STORE error: {e}")
             return 0xC000
 
-    # ---------- PDF Generation (with image footer support) ----------
+    # ---------- PDF Generation (with 3mm margins) ----------
     def generate_pdf_report_from_dicom(self, dcm_path, output_pdf_path):
         import re
         from PIL import Image as PILImage
@@ -997,6 +997,10 @@ class RadXrReceiverApp:
 
         c = canvas.Canvas(output_pdf_path, pagesize=letter)
         width, height = letter
+
+        # ---- 3mm margin (≈8.5 points) ----
+        margin_pt = 3 * 72 / 25.4  # 8.5039
+        margin = margin_pt
 
         metadata = [
             ("Patient Name", patient_name),
@@ -1031,20 +1035,23 @@ class RadXrReceiverApp:
             image.save(temp_img_path, quality=95)
 
             # --- Header ---
+            # Institute name at top margin
             c.setFont("Helvetica-Bold", 14)
-            c.drawString(40, height - 40, self.config["institute_name"])
+            c.drawString(margin, height - margin, self.config["institute_name"])
+            # Page number at right
             c.setFont("Helvetica-Oblique", 9)
-            c.drawRightString(width - 40, height - 40, f"Page {frame_idx + 1} of {num_frames}")
+            c.drawRightString(width - margin, height - margin, f"Page {frame_idx + 1} of {num_frames}")
+            # Line below header
             c.setLineWidth(1)
             c.setStrokeColorRGB(0.1, 0.5, 0.7)
-            c.line(40, height - 46, width - 40, height - 46)
+            c.line(margin, height - margin - 6, width - margin, height - margin - 6)
 
             # --- Metadata ---
             c.setFont("Helvetica", 10)
-            y_text = height - 65
+            y_text = height - margin - 20   # start below header line
             col = 0
             for label, value in available_metadata:
-                x_pos = 40 if col == 0 else width / 2 + 10
+                x_pos = margin if col == 0 else width / 2 + margin - 40  # approximate
                 c.setFont("Helvetica-Bold", 9)
                 c.drawString(x_pos, y_text, f"{label}: ")
                 c.setFont("Helvetica", 9)
@@ -1057,62 +1064,42 @@ class RadXrReceiverApp:
             if col == 1:
                 y_text -= 15
 
+            # Separator line
             c.setLineWidth(0.5)
-            c.line(40, y_text, width - 40, y_text)
+            c.line(margin, y_text, width - margin, y_text)
             y_text -= 15
 
             # --- Image (preserve native pixels) ---
             img_w, img_h = image.size
-            max_width = width - 80
-            # Reserve space for footer: we will compute dynamically based on footer content
-            # Default minimal footer space (for text only)
-            footer_min_height = 45  # points from bottom for lines and text
-
-            # If footer image exists, we need to reserve more space
+            # Available width: full width minus margins
+            max_width = width - 2 * margin
+            # Reserve space for footer: we'll compute later
+            # For now, assume minimal footer height (for text) = 45 pt, but will be recalculated
+            # We'll compute footer height needed based on image or text
+            footer_min_height = 45  # enough for text with lines
             footer_image_height = 0
             if footer_image_path:
                 try:
                     footer_img = PILImage.open(footer_image_path)
                     f_img_w, f_img_h = footer_img.size
-                    # Scale image to fit width (max 600 pt) and limit height to 144 pt (2 inches)
-                    max_footer_width = width - 80
+                    max_footer_width = width - 2 * margin
                     max_footer_height = 144  # 2 inches
                     scale = min(max_footer_width / f_img_w, max_footer_height / f_img_h, 1.0)
                     footer_image_height = f_img_h * scale
-                    # Add some padding
-                    footer_image_height += 20  # 10 pt padding top and bottom
+                    footer_image_height += 20  # padding
                 except Exception as e:
                     self.log_message(f"Failed to load footer image: {e}")
                     footer_image_height = 0
 
-            # Determine footer area: we need at least footer_min_height, plus image height if any
             footer_height = max(footer_min_height, footer_image_height + 10)
-            # Ensure we don't push image too high; we cap at 45 pt from top of footer area (so lines are at bottom)
-            # We'll set top line at y = footer_height + 5, bottom at y = 5
-            footer_top = footer_height + 5
-            footer_bottom = 5
+            # Define footer lines: top line at y = footer_height + margin, bottom at margin
+            footer_top = footer_height + margin
+            footer_bottom = margin
             gap = footer_top - footer_bottom
 
-            # Adjust image vertical space: image should be centered between lines
-            # So we compute available height for image = gap - some padding
-            avail_img_height = gap - 8
-            if footer_image_height > 0 and avail_img_height > 0:
-                # Re-scale image to fit within avail_img_height while keeping width
-                footer_img = PILImage.open(footer_image_path)
-                f_img_w, f_img_h = footer_img.size
-                max_w = width - 80
-                max_h = avail_img_height
-                scale = min(max_w / f_img_w, max_h / f_img_h, 1.0)
-                draw_footer_w = f_img_w * scale
-                draw_footer_h = f_img_h * scale
-            else:
-                draw_footer_w = 0
-                draw_footer_h = 0
-
-            # Now we have defined footer_top and footer_bottom; update max_height for main image
+            # Now compute available height for main image
             max_height = y_text - footer_top - 5
 
-            # Main image scaling
             scale_main = 1.0
             if img_w > max_width or img_h > max_height:
                 scale_main = min(max_width / img_w, max_height / img_h)
@@ -1129,26 +1116,31 @@ class RadXrReceiverApp:
             if os.path.exists(temp_img_path):
                 os.remove(temp_img_path)
 
-            # --- Footer: two lines, with either image or text centered ---
+            # --- Footer: two lines with image or text centered ---
             c.setStrokeColorRGB(0.1, 0.5, 0.7)
             c.setLineWidth(0.5)
 
             # Upper line
-            c.line(40, footer_top, width - 40, footer_top)
+            c.line(margin, footer_top, width - margin, footer_top)
 
-            # Draw footer content (image or text)
-            if footer_image_path and draw_footer_w > 0 and draw_footer_h > 0:
-                # Center the image between the lines
+            # Draw footer content
+            if footer_image_path and footer_image_height > 0:
+                # Re-scale image to fit within gap
+                footer_img = PILImage.open(footer_image_path)
+                f_img_w, f_img_h = footer_img.size
+                avail_w = width - 2 * margin
+                avail_h = gap - 8
+                scale_f = min(avail_w / f_img_w, avail_h / f_img_h, 1.0)
+                draw_footer_w = f_img_w * scale_f
+                draw_footer_h = f_img_h * scale_f
                 x_footer = (width - draw_footer_w) / 2
                 y_footer = footer_bottom + (gap / 2) - (draw_footer_h / 2)
-                # Draw image (use temp file or directly from path)
                 c.drawImage(footer_image_path, x_footer, y_footer, width=draw_footer_w, height=draw_footer_h,
                             preserveAspectRatio=True, anchor='c')
             elif footer_text and not footer_image_path:
-                # Text footer (clean)
                 clean_footer = re.sub(r'[^a-zA-Z0-9\s.,!?\'"-]', '', footer_text).strip()
                 if clean_footer:
-                    max_text_width = width - 80
+                    max_text_width = width - 2 * margin
                     font_size = 12
                     for size in range(12, 5, -1):
                         c.setFont("Helvetica-Bold", size)
@@ -1169,7 +1161,7 @@ class RadXrReceiverApp:
                     c.drawString(x_text, y_text_footer, clean_footer)
 
             # Lower line
-            c.line(40, footer_bottom, width - 40, footer_bottom)
+            c.line(margin, footer_bottom, width - margin, footer_bottom)
 
             if frame_idx < num_frames - 1:
                 c.showPage()
@@ -1340,7 +1332,7 @@ class RadXrReceiverApp:
             self.log_message(f"WhatsApp error: {e}")
             return False
 
-    # ---------- Telegram Bot Polling (with image footer support) ----------
+    # ---------- Telegram Bot Polling ----------
     def start_telegram_bot_polling(self):
         t = threading.Thread(target=self.telegram_bot_polling_worker, daemon=True)
         t.start()
@@ -1428,7 +1420,7 @@ class RadXrReceiverApp:
                                     self._send_message(base_url, chat_id, "❌ Please provide a user ID: `/remove <userid>`")
                                 continue
 
-                            # /message <text>  (caption message)
+                            # /message <text> (caption)
                             if text.lower().startswith("/message "):
                                 new_msg = text[9:].strip()
                                 self.footer_message = new_msg
@@ -1438,18 +1430,14 @@ class RadXrReceiverApp:
                                 self.log_message(f"Caption message changed to: {new_msg}")
                                 continue
 
-                            # /footer handling: reply to photo -> set image footer; else text footer
+                            # /footer handling (photo or text)
                             if text.lower().startswith("/footer"):
-                                # Check if this is a reply to a photo
                                 reply_to = msg.get("reply_to_message")
                                 if reply_to and "photo" in reply_to:
-                                    # Download the photo
                                     try:
-                                        # Get the largest photo (last in array)
                                         photos = reply_to["photo"]
                                         largest = photos[-1]
                                         file_id = largest["file_id"]
-                                        # Get file path
                                         get_file_url = f"{base_url}/getFile?file_id={file_id}"
                                         file_resp = requests.get(get_file_url, timeout=10)
                                         if file_resp.status_code == 200:
@@ -1463,7 +1451,6 @@ class RadXrReceiverApp:
                                                         f.write(img_resp.content)
                                                     self.pdf_footer_image = FOOTER_IMAGE_PATH
                                                     self.config["pdf_footer_image"] = FOOTER_IMAGE_PATH
-                                                    # Clear any existing text footer
                                                     self.pdf_footer_text = ""
                                                     self.config["pdf_footer_text"] = ""
                                                     self.save_configuration()
@@ -1487,7 +1474,6 @@ class RadXrReceiverApp:
                                             pass
                                         self.pdf_footer_image = ""
                                         self.config["pdf_footer_image"] = ""
-                                    # Extract text after /footer
                                     new_footer = text[7:].strip() if len(text) > 7 else ""
                                     self.pdf_footer_text = new_footer
                                     self.config["pdf_footer_text"] = new_footer

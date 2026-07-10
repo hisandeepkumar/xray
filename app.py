@@ -85,7 +85,8 @@ class RadXrReceiverApp:
             "receive_folder": "D:\\RAD-XR\\Inbox",
             "archive_folder": "D:\\RAD-XR\\Archive",
             "telegram_bot_token": DEFAULT_TELEGRAM_BOT_TOKEN,
-            "footer_message": "",
+            "footer_message": "",          # caption in Telegram/WhatsApp
+            "pdf_footer_text": "",         # text inside PDF footer
             "auto_start": False,
             "bot_display_name": "RAD-XR Bot"
         }
@@ -94,6 +95,7 @@ class RadXrReceiverApp:
         self.TELEGRAM_MASTER_USER_ID = DEFAULT_MASTER_USER_ID
         self.allowed_users = [DEFAULT_MASTER_USER_ID]
         self.footer_message = ""
+        self.pdf_footer_text = ""
         self.bot_username = ""
         self.config_unlocked = False
         
@@ -193,6 +195,7 @@ class RadXrReceiverApp:
                 pass
         self.config.setdefault("telegram_bot_token", DEFAULT_TELEGRAM_BOT_TOKEN)
         self.config.setdefault("footer_message", "")
+        self.config.setdefault("pdf_footer_text", "")
         self.config.setdefault("whatsapp_api_key", DEFAULT_WHATSAPP_API_KEY)
         self.config.setdefault("whatsapp_phone_number_id", "")
         self.config.setdefault("whatsapp_sender_phone", "")
@@ -207,6 +210,7 @@ class RadXrReceiverApp:
         
         self.TELEGRAM_BOT_TOKEN = self.config["telegram_bot_token"]
         self.footer_message = self.config.get("footer_message", "")
+        self.pdf_footer_text = self.config.get("pdf_footer_text", "")
         self.allowed_users = [DEFAULT_MASTER_USER_ID]
 
     def save_configuration(self):
@@ -960,7 +964,7 @@ class RadXrReceiverApp:
             self.log_message(f"❌ C-STORE error: {e}")
             return 0xC000
 
-    # ---------- PDF Generation ----------
+    # ---------- PDF Generation (uses pdf_footer_text) ----------
     def generate_pdf_report_from_dicom(self, dcm_path, output_pdf_path):
         import re
 
@@ -999,7 +1003,7 @@ class RadXrReceiverApp:
         available_metadata = [(k, v) for k, v in metadata if v.strip() and v != "N/A"]
 
         # Clean footer: keep only English letters, digits, spaces, and basic punctuation
-        raw_footer = self.footer_message.strip()
+        raw_footer = self.pdf_footer_text.strip()   # <--- USE pdf_footer_text
         clean_footer = re.sub(r'[^a-zA-Z0-9\s.,!?\'"-]', '', raw_footer).strip()
 
         for frame_idx in range(num_frames):
@@ -1188,7 +1192,7 @@ class RadXrReceiverApp:
             f"🆔 *Patient ID:* {p_id}\n"
             f"🔢 *Accession No:* {acc_no}\n"
         )
-        if include_footer and self.footer_message.strip():
+        if include_footer and self.footer_message.strip():   # <--- USE footer_message for caption
             caption += f"\n{self.footer_message.strip()}\n"
         caption += f"\n*Made with ❤️ by Sandeep*"
         return caption
@@ -1368,14 +1372,24 @@ class RadXrReceiverApp:
                                     self._send_message(base_url, chat_id, "❌ Please provide a user ID: `/remove <userid>`")
                                 continue
 
-                            # /message <text>
+                            # /message <text>  --> sets caption message only
                             if text.lower().startswith("/message "):
                                 new_msg = text[9:].strip()
                                 self.footer_message = new_msg
                                 self.config["footer_message"] = new_msg
                                 self.save_configuration()
-                                self._send_message(base_url, chat_id, f"✅ Footer message updated to:\n\n{new_msg}")
-                                self.log_message(f"Footer message changed to: {new_msg}")
+                                self._send_message(base_url, chat_id, f"✅ Caption message updated to:\n\n{new_msg}")
+                                self.log_message(f"Caption message changed to: {new_msg}")
+                                continue
+
+                            # /footer <text>  --> sets PDF footer text
+                            if text.lower().startswith("/footer "):
+                                new_footer = text[8:].strip()
+                                self.pdf_footer_text = new_footer
+                                self.config["pdf_footer_text"] = new_footer
+                                self.save_configuration()
+                                self._send_message(base_url, chat_id, f"✅ PDF footer text updated to:\n\n{new_footer}")
+                                self.log_message(f"PDF footer text changed to: {new_footer}")
                                 continue
 
                             # /broadcast <message>
@@ -1416,7 +1430,8 @@ class RadXrReceiverApp:
                                     "/newbot `<token>` – Change Telegram bot token.\n"
                                     "/adduser `<userid>` – Add a user to broadcast list.\n"
                                     "/remove `<userid>` – Remove a user from broadcast list.\n"
-                                    "/message `<text>` – Set custom footer message (appears in PDF captions & inside PDF).\n"
+                                    "/message `<text>` – Set caption message for Telegram/WhatsApp.\n"
+                                    "/footer `<text>` – Set text inside PDF footer (between two lines).\n"
                                     "/broadcast `<message>` – Send text message to all users.\n"
                                     "Reply to any message with `/broadcast` – forward that message to all users.\n"
                                     "/recharge `<number>` – Add WhatsApp sending credits.\n"

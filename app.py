@@ -850,44 +850,21 @@ class RadXrReceiverApp:
                 else:
                     messagebox.showerror("Error", "File no longer exists.")
 
-    # ---------- DICOM Server (Enhanced with all requirements) ----------
+    # ---------- DICOM Server (with IP binding fix) ----------
     def _validate_ae_title(self, ae_title):
         """Validate AE Title according to DICOM rules: max 16 chars, alnum, space, underscore."""
         if not ae_title:
             return False, "AE Title cannot be empty."
         if len(ae_title) > 16:
             return False, f"AE Title exceeds 16 characters (got {len(ae_title)})."
-        # Allowed characters: letters, digits, spaces, underscores
         allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 _")
         if not all(c in allowed for c in ae_title):
             return False, "AE Title contains invalid characters (only alphanumeric, space, underscore allowed)."
         return True, "OK"
 
-    def _is_private_ip(self, ip):
-        """Check if IP is in private/local range (127.x, 10.x, 172.16-31.x, 192.168.x)."""
-        try:
-            parts = list(map(int, ip.split('.')))
-            if len(parts) != 4:
-                return False
-            # 127.x.x.x (loopback)
-            if parts[0] == 127:
-                return True
-            # 10.x.x.x
-            if parts[0] == 10:
-                return True
-            # 172.16.0.0 - 172.31.255.255
-            if parts[0] == 172 and 16 <= parts[1] <= 31:
-                return True
-            # 192.168.x.x
-            if parts[0] == 192 and parts[1] == 168:
-                return True
-            return False
-        except:
-            return False
-
     def toggle_server_process(self):
         if not self.is_listening:
-            # --- Validate configuration before starting ---
+            # Validate configuration
             ip = self.config["ip_address"].strip()
             if not ip:
                 messagebox.showerror("Configuration Error", "IP Address cannot be empty.")
@@ -919,7 +896,6 @@ class RadXrReceiverApp:
                     messagebox.showerror("Port Error", f"Port {port} is already in use on {ip}.\nPlease change the IP or port.")
                     return
             except Exception as e:
-                # If we can't check, proceed anyway
                 self.log_message(f"⚠️ Could not check port availability: {e}")
 
             os.makedirs(self.config["receive_folder"], exist_ok=True)
@@ -973,7 +949,7 @@ class RadXrReceiverApp:
             ]
             ip = self.config["ip_address"].strip()
             if not ip:
-                ip = "0.0.0.0"  # fallback but should not happen due to validation
+                ip = "0.0.0.0"  # fallback
             port = int(self.config["port"])
             self.log_message(f"⏳ Attempting to bind to {ip}:{port}")
             if sys.stdout is not None:
@@ -1024,23 +1000,14 @@ class RadXrReceiverApp:
         return 0x0000
 
     def handle_incoming_c_store(self, event):
-        # Get remote connection details
         remote_ip, remote_port = event.assoc.socket.getpeername()
         calling_ae = event.assoc.requestor.ae_title
         called_ae = event.assoc.respondor.ae_title
-
-        # --- Check if remote IP is private/local ---
-        if not self._is_private_ip(remote_ip):
-            error_msg = f"Rejected C-STORE from public IP {remote_ip} (only private IPs allowed)."
-            self.log_message(f"❌ {error_msg}")
-            # Return a failure status (0xC000 = failure)
-            return 0xC000
 
         try:
             ds = event.dataset
             ds.file_meta = event.file_meta
 
-            # Log detailed info
             sop_class = getattr(ds, "SOPClassUID", "Unknown")
             ts = getattr(event.context.transfer_syntax, "name", str(event.context.transfer_syntax))
             patient_name = str(ds.get("PatientName", "N/A")).strip()
@@ -1056,16 +1023,13 @@ class RadXrReceiverApp:
             self.log_message(f"   Patient: {patient_name} (ID: {patient_id})")
             self.log_message(f"   Accession: {accession_number}")
 
-            # Generate filename
             filename = f"RADXR_{accession_number}.dcm"
             filepath = os.path.join(self.config["receive_folder"], filename)
 
-            # Save DICOM file with file_meta
             ds.save_as(filepath, write_like_original=False)
 
             self.log_message(f"✅ C-STORE saved to {filepath}")
 
-            # Start processing pipeline
             threading.Thread(
                 target=self.autonomous_processing_pipeline,
                 args=(filepath, False),
@@ -1076,8 +1040,7 @@ class RadXrReceiverApp:
 
         except Exception as e:
             self.log_message(f"❌ C-STORE error: {e}")
-            # Return failure status
-            return 0xC000
+            return 0xC000  # Failure
 
     # ---------- PDF Generation ----------
     def generate_pdf_report_from_dicom(self, dcm_path, output_pdf_path):

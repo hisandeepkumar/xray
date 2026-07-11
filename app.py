@@ -16,6 +16,7 @@ from reportlab.pdfgen import canvas
 import requests
 
 from pynetdicom import AE, evt, sop_class
+from pynetdicom.presentation import AllStoragePresentationContexts
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -849,16 +850,20 @@ class RadXrReceiverApp:
                 else:
                     messagebox.showerror("Error", "File no longer exists.")
 
-    # ---------- DICOM Server ----------
+    # ---------- DICOM Server (with IP binding fix) ----------
     def toggle_server_process(self):
         if not self.is_listening:
             port = int(self.config["port"])
+            ip = self.config["ip_address"].strip()
+            if not ip:
+                ip = "0.0.0.0"
+            # Check if port is already in use on the specified IP
             test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            result = test_sock.connect_ex(('0.0.0.0', port))
+            result = test_sock.connect_ex((ip, port))
             test_sock.close()
             if result == 0:
-                self.log_message(f"❌ Port {port} is already in use.")
-                messagebox.showerror("Port Error", f"Port {port} is already in use. Please close other applications or change the port.")
+                self.log_message(f"❌ Port {port} is already in use on {ip}.")
+                messagebox.showerror("Port Error", f"Port {port} is already in use on {ip}. Please close other applications or change the IP/port.")
                 return
 
             os.makedirs(self.config["receive_folder"], exist_ok=True)
@@ -869,6 +874,7 @@ class RadXrReceiverApp:
             self.btn_toggle_server.config(text="Starting...", bg="#4b5563")
             self.log_message("🚀 Starting DICOM server...")
             self.log_message(f"   AE Title: {self.config['ae_title']}")
+            self.log_message(f"   IP: {ip}")
             self.log_message(f"   Port: {port}")
             self.log_message(f"   Inbox: {self.config['receive_folder']}")
             self.log_message(f"   Archive: {self.config['archive_folder']}")
@@ -893,47 +899,51 @@ class RadXrReceiverApp:
         try:
             # C-ECHO support
             ae.add_supported_context("1.2.840.10008.1.1")
-            
-            # Add ALL standard Storage SOP Classes to accept any image type
-            for uid in sop_class.storage_sop_class_list:
-                ae.add_supported_context(uid)
-            
+
+            # Support all DICOM Storage SOP Classes (Canon/Konica/Fuji/Agfa etc.)
+            for context in AllStoragePresentationContexts:
+                ae.add_supported_context(
+                    context.abstract_syntax,
+                    context.transfer_syntax
+                )
+
+            self.log_message(f"Loaded {len(AllStoragePresentationContexts)} Storage Presentation Contexts")
             handlers = [
                 (evt.EVT_C_STORE, self.handle_incoming_c_store),
                 (evt.EVT_C_ECHO, self.handle_incoming_c_echo)
             ]
-
-            self.log_message("⏳ Attempting to bind to 0.0.0.0:" + self.config["port"])
+            ip = self.config["ip_address"].strip()
+            if not ip:
+                ip = "0.0.0.0"
+            self.log_message(f"⏳ Attempting to bind to {ip}:{self.config['port']}")
             if sys.stdout is not None:
                 sys.stdout.flush()
-
             self.server_instance = ae.start_server(
-                ("0.0.0.0", int(self.config["port"])),
+                (ip, int(self.config["port"])),
                 block=False,
                 evt_handlers=handlers
             )
             self.log_message("✅ start_server() returned successfully (immediate).")
+            self.log_message("⏳ Waiting 2 seconds for OS to bind...")
             time.sleep(2)
-            
             self.log_message("🔍 Verifying port is open...")
             test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             test_sock.settimeout(3)
             try:
-                test_sock.connect(('127.0.0.1', int(self.config["port"])))
+                test_sock.connect((ip, int(self.config["port"])))
                 test_sock.close()
                 self.root.after(0, self._server_started_successfully)
-                self.log_message(f"✅ DICOM server is LISTENING on port {self.config['port']}")
+                self.log_message(f"✅ DICOM server is LISTENING on {ip}:{self.config['port']}")
                 while self.is_listening:
                     time.sleep(0.5)
             except Exception as conn_err:
                 self.log_message(f"❌ Verification connection failed: {conn_err}")
-                self.root.after(0, self._server_failed_to_start, f"Port {self.config['port']} is NOT open. Error: {conn_err}")
+                self.root.after(0, self._server_failed_to_start, f"Port {self.config['port']} on {ip} is NOT open. Error: {conn_err}")
                 return
-                
         except Exception as e:
             self.log_message(f"❌ Server start exception: {e}")
             self.root.after(0, self._server_failed_to_start, str(e))
-            
+
     def _server_started_successfully(self):
         self.status_var.set("● Listening")
         self.lbl_status_indicator.config(fg=self.accent_green)
@@ -954,20 +964,35 @@ class RadXrReceiverApp:
 
     def handle_incoming_c_store(self, event):
         try:
-            dataset = event.dataset
-            accession_number = str(dataset.get("AccessionNumber", "UNKNOWN_ACC")).strip()
+            ds = event.dataset
+            ds.file_meta = event.file_meta
+
+            sop = getattr(ds, "SOPClassUID", "Unknown")
+            ts = getattr(event.context.transfer_syntax, "name", str(event.context.transfer_syntax))
+            self.log_message(f"📥 SOP Class: {sop}")
+            self.log_message(f"📥 Transfer Syntax: {ts}")
+
+            accession_number = str(ds.get("AccessionNumber", "UNKNOWN_ACC")).strip()
             filename = f"RADXR_{accession_number}.dcm"
             filepath = os.path.join(self.config["receive_folder"], filename)
-            event.write_dataset(filepath)
-            self.log_message(f"📥 C-STORE received for Accession: {accession_number} from {event.assoc.requestor.ae_title}")
-            processing_thread = threading.Thread(target=self.autonomous_processing_pipeline, args=(filepath, False), daemon=True)
-            processing_thread.start()
-            return 0x0000 
+
+            ds.save_as(filepath, write_like_original=False)
+
+            self.log_message(f"📥 C-STORE received from {event.assoc.requestor.ae_title}")
+
+            threading.Thread(
+                target=self.autonomous_processing_pipeline,
+                args=(filepath, False),
+                daemon=True
+            ).start()
+
+            return 0x0000
+
         except Exception as e:
             self.log_message(f"❌ C-STORE error: {e}")
             return 0xC000
 
-    # ---------- PDF Generation ----------
+    # ---------- PDF Generation (updated: 8mm top, 3mm sides, footer image at bottom, no lines) ----------
     def generate_pdf_report_from_dicom(self, dcm_path, output_pdf_path):
         import re
         from PIL import Image as PILImage
@@ -996,9 +1021,10 @@ class RadXrReceiverApp:
         c = canvas.Canvas(output_pdf_path, pagesize=letter)
         width, height = letter
 
-        # Margins: top 8mm, left/right 3mm, bottom 0 (footer touches edge)
+        # ---- Margins ----
         top_margin = 8 * 72 / 25.4          # 8mm
         margin_lr = 3 * 72 / 25.4          # 3mm
+        bottom_margin = 0                  # footer touches bottom
 
         metadata = [
             ("Patient Name", patient_name),
@@ -1010,6 +1036,7 @@ class RadXrReceiverApp:
         ]
         available_metadata = [(k, v) for k, v in metadata if v.strip() and v != "N/A"]
 
+        # Footer image (if any)
         footer_image_path = self.pdf_footer_image if self.pdf_footer_image and os.path.exists(self.pdf_footer_image) else None
         footer_text = self.pdf_footer_text.strip() if not footer_image_path else ""
 
@@ -1020,8 +1047,10 @@ class RadXrReceiverApp:
             try:
                 footer_img = PILImage.open(footer_image_path)
                 f_img_w, f_img_h = footer_img.size
+                # Scale to full width
                 draw_w = width
                 draw_h = (f_img_h / f_img_w) * draw_w
+                # Cap height at 144pt (2 inches)
                 max_footer_h = 144
                 if draw_h > max_footer_h:
                     draw_h = max_footer_h
@@ -1044,6 +1073,7 @@ class RadXrReceiverApp:
                 else:
                     frame_array = frame_array.astype(np.uint8)
 
+            # Convert to PIL Image for drawing
             image = Image.fromarray(frame_array)
             if image.mode != "RGB":
                 image = image.convert("RGB")
@@ -1058,6 +1088,7 @@ class RadXrReceiverApp:
             c.setFont("Helvetica-Oblique", 9)
             c.drawRightString(width - margin_lr, header_y, f"Page {frame_idx + 1} of {num_frames}")
 
+            # Header line
             c.setLineWidth(1)
             c.setStrokeColorRGB(0.1, 0.5, 0.7)
             c.line(margin_lr, header_y - 6, width - margin_lr, header_y - 6)
@@ -1081,11 +1112,13 @@ class RadXrReceiverApp:
             if col == 1:
                 y_text -= 15
 
+            # Separator line after metadata
             c.setLineWidth(0.5)
             c.line(margin_lr, y_text, width - margin_lr, y_text)
             main_image_top = y_text - 15
 
-            # --- Main image area ---
+            # --- Determine available space for main image ---
+            # Footer occupies bottom: from y=0 to footer_img_h (if any) plus a small gap
             if footer_img_h > 0:
                 gap = 5
                 main_image_bottom = footer_img_h + gap
@@ -1102,9 +1135,11 @@ class RadXrReceiverApp:
             draw_main_w = img_w * scale
             draw_main_h = img_h * scale
 
+            # Center horizontally and vertically within available space
             x_main = (width - draw_main_w) / 2
             y_main = main_image_bottom + (avail_height - draw_main_h) / 2
 
+            # Draw main image
             c.drawImage(temp_img_path, x_main, y_main, width=draw_main_w, height=draw_main_h,
                         preserveAspectRatio=True, anchor='c')
             if os.path.exists(temp_img_path):
@@ -1112,8 +1147,11 @@ class RadXrReceiverApp:
 
             # --- Footer image (if any) ---
             if footer_img_w > 0 and footer_img_h > 0:
+                # Position at bottom-left, touching all edges
                 c.drawImage(footer_image_path, 0, 0, width=footer_img_w, height=footer_img_h,
                             preserveAspectRatio=False, anchor='sw')
+
+            # Note: No footer lines are drawn.
 
             if frame_idx < num_frames - 1:
                 c.showPage()
@@ -1304,6 +1342,7 @@ class RadXrReceiverApp:
                         msg = update["message"]
                         chat_id = str(msg["chat"]["id"])
                         text = msg.get("text", "").strip()
+                        # Save user info
                         user = msg.get("from", {})
                         user_id = str(user.get("id", ""))
                         username = user.get("username", "")
@@ -1311,6 +1350,7 @@ class RadXrReceiverApp:
                         if user_id:
                             self.save_telegram_user(user_id, username, full_name)
 
+                        # --- Commands ---
                         if text.lower().startswith("/start"):
                             welcome = (
                                 f"🏥 *Welcome to RAD-XR Portal Search Node*\n\n"
@@ -1327,6 +1367,7 @@ class RadXrReceiverApp:
                             self._send_message(base_url, chat_id, welcome)
                             continue
 
+                        # --- Master commands ---
                         if chat_id == self.TELEGRAM_MASTER_USER_ID:
                             # /newbot <token>
                             if text.lower().startswith("/newbot "):
@@ -1369,7 +1410,7 @@ class RadXrReceiverApp:
                                     self._send_message(base_url, chat_id, "❌ Please provide a user ID: `/remove <userid>`")
                                 continue
 
-                            # /message <text>
+                            # /message <text> (caption)
                             if text.lower().startswith("/message "):
                                 new_msg = text[9:].strip()
                                 self.footer_message = new_msg
@@ -1415,6 +1456,7 @@ class RadXrReceiverApp:
                                         self._send_message(base_url, chat_id, f"❌ Error: {e}")
                                         self.log_message(f"Error setting footer image: {e}")
                                 else:
+                                    # Text footer: clear image and set text
                                     if self.pdf_footer_image and os.path.exists(self.pdf_footer_image):
                                         try:
                                             os.remove(self.pdf_footer_image)
@@ -1487,13 +1529,13 @@ class RadXrReceiverApp:
                                 self._send_message(base_url, chat_id, help_text)
                                 continue
 
-                            # Reply broadcast
+                            # Reply broadcast (if reply_to_message and text == "/broadcast")
                             if msg.get("reply_to_message") and text.lower() == "/broadcast":
                                 reply_to = msg["reply_to_message"]
                                 self._broadcast_reply(base_url, reply_to, chat_id)
                                 continue
 
-                        # --- Patient Query ---
+                        # --- Patient Query (any user) ---
                         lines = [line.strip() for line in text.split("\n") if line.strip()]
                         if len(lines) >= 2:
                             query_id = lines[0]

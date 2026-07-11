@@ -59,7 +59,7 @@ class DicomArchiveHandler(FileSystemEventHandler):
 class RadXrReceiverApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("RAD-XR")   # simplified
+        self.root.title("RAD-XR")
         self.root.geometry("850x720")
         self.root.configure(bg="#1e1e24")
         
@@ -128,7 +128,7 @@ class RadXrReceiverApp:
         self.lbl_bot_name = None
         self.lbl_bot_username = None
         self.lbl_whatsapp_credits = None
-        self.lbl_telegram_credits = None   # new
+        self.lbl_telegram_credits = None
         self.lock_frame = None
         self.config_pass_var = None
         self.ent_wa_phone_id = None
@@ -301,13 +301,11 @@ class RadXrReceiverApp:
     def init_credits_tables(self):
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
-        # WhatsApp credits
         c.execute('''CREATE TABLE IF NOT EXISTS whatsapp_credits (
                         id INTEGER PRIMARY KEY CHECK (id = 1),
                         remaining INTEGER DEFAULT 0
                      )''')
         c.execute("INSERT OR IGNORE INTO whatsapp_credits (id, remaining) VALUES (1, 0)")
-        # Telegram credits
         c.execute('''CREATE TABLE IF NOT EXISTS telegram_credits (
                         id INTEGER PRIMARY KEY CHECK (id = 1),
                         remaining INTEGER DEFAULT 0
@@ -316,7 +314,6 @@ class RadXrReceiverApp:
         conn.commit()
         conn.close()
 
-    # ---------- WhatsApp Credits ----------
     def get_whatsapp_credits(self):
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
@@ -347,7 +344,6 @@ class RadXrReceiverApp:
         conn.close()
         return False
 
-    # ---------- Telegram Credits ----------
     def get_telegram_credits(self):
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
@@ -644,12 +640,11 @@ class RadXrReceiverApp:
     def build_live_monitor_tab(self, parent):
         top_ctrl_bar = Frame(parent, bg=self.bg_dark)
         top_ctrl_bar.pack(fill="x", pady=15, padx=15)
-        Label(top_ctrl_bar, text="RAD-XR", font=("Arial", 14, "bold"), fg=self.text_light, bg=self.bg_dark).pack(side="left")  # simplified
+        Label(top_ctrl_bar, text="RAD-XR", font=("Arial", 14, "bold"), fg=self.text_light, bg=self.bg_dark).pack(side="left")
         self.status_var = StringVar(value="● Stopped")
         self.lbl_status_indicator = Label(top_ctrl_bar, textvariable=self.status_var, font=("Arial", 11, "bold"), fg=self.accent_red, bg=self.bg_dark)
         self.lbl_status_indicator.pack(side="left", padx=20)
 
-        # New: Resend Failed button between Import and Start
         btn_manual_upload = Button(top_ctrl_bar, text="+ Import DICOM File", font=("Arial", 9, "bold"), bg=self.accent_cyan, fg=self.bg_dark, bd=0, padx=10, pady=5, cursor="hand2", command=self.manual_file_upload_trigger)
         btn_manual_upload.pack(side="right", padx=5)
 
@@ -677,7 +672,6 @@ class RadXrReceiverApp:
         self.lbl_ae = add_stat_lbl(net_card, "AE TITLE", "ae_title")
         self.lbl_ip = add_stat_lbl(net_card, "IP ADDRESS", "ip_address")
         self.lbl_port = add_stat_lbl(net_card, "PORT NUMBER", "port")
-        # Removed Inbox/Archive from here
 
         # Credits
         Label(net_card, text="💳 CREDITS", font=("Arial", 8, "bold"), fg=self.accent_cyan, bg=self.bg_card).pack(anchor="w", padx=15, pady=(10, 0))
@@ -744,18 +738,17 @@ class RadXrReceiverApp:
         self.lbl_index_progress_monitor.pack(side="left")
         Label(progress_frame, text="Made with ❤️ by Sandeep", font=("Arial", 9, "bold", "italic"), fg="#6b7280", bg=self.bg_dark).pack(side="right")
 
-    # New: Refresh Dashboard (updates credits)
     def refresh_dashboard(self):
         self.refresh_credits_gui()
         self.sync_archive_folder_to_dashboard()
         self.log_message("🔄 Dashboard refreshed (credits updated).")
 
-    # New: Resend Failed Images
+    # --- UPDATED: Resend Failed (now detects any status with ❌) ---
     def resend_failed_images(self):
         failed_items = []
         for item in self.tree.get_children():
             values = self.tree.item(item, 'values')
-            if values and "Failed" in values[4]:  # status column
+            if values and "❌" in values[4]:  # any status with cross mark
                 failed_items.append(item)
         if not failed_items:
             messagebox.showinfo("Resend", "No failed images to resend.")
@@ -766,15 +759,21 @@ class RadXrReceiverApp:
                 row_values = self.tree.item(item, 'values')
                 file_name = row_values[3]
                 file_path = None
-                # find file_path from queue_data or archive
+                # Try to find in queue_data (map from file_path to row)
                 for fpath, rid in self.queue_data.items():
                     if rid == item:
                         file_path = fpath
                         break
                 if not file_path:
-                    full_archive = os.path.join(self.config["archive_folder"], file_name)
-                    if os.path.exists(full_archive):
-                        file_path = full_archive
+                    # Try inbox first (original file might still be there)
+                    inbox_file = os.path.join(self.config["receive_folder"], file_name)
+                    if os.path.exists(inbox_file):
+                        file_path = inbox_file
+                    else:
+                        # Fallback to archive
+                        full_archive = os.path.join(self.config["archive_folder"], file_name)
+                        if os.path.exists(full_archive):
+                            file_path = full_archive
                 if file_path and os.path.exists(file_path):
                     self.tree.item(item, values=(row_values[0], row_values[1], row_values[2], file_name, "⚡ Resending"))
                     th = threading.Thread(target=self.autonomous_processing_pipeline, args=(file_path, False), daemon=True)
@@ -963,7 +962,7 @@ class RadXrReceiverApp:
             else:
                 messagebox.showerror("Error", "File not found.")
                 return
-        if "Failed" in status:
+        if "❌" in status:
             res = messagebox.askyesno("Resend Trigger", f"Re-dispatch pipeline for file: {file_name}?")
             if res:
                 if os.path.exists(file_path):
@@ -1268,7 +1267,7 @@ class RadXrReceiverApp:
         c.save()
         return patient_id, patient_name, accession_no
 
-    # ---------- Processing Pipeline ----------
+    # ---------- Processing Pipeline (updated: keep Inbox until Telegram succeeds) ----------
     def autonomous_processing_pipeline(self, dcm_path, is_manual_import=False):
         pdf_output_path = ""
         try:
@@ -1299,26 +1298,22 @@ class RadXrReceiverApp:
             self.root.after(0, lambda: self.upsert_grid_record(file_key, patient_id, patient_name, accession_no, "⏳ Processing"))
             self.root.after(0, lambda: self.upsert_grid_record(file_key, patient_id, patient_name, accession_no, "📤 Sending"))
 
-            # ---- Telegram sending (with credit check) ----
+            # ---- Telegram (with credit check) ----
             tg_ok = False
             tg_credits = self.get_telegram_credits()
             if tg_credits > 0:
-                # Decrement credit and send
                 if self.decrement_telegram_credits():
                     tg_ok = self.send_to_all_telegram(pdf_output_path, patient_id, patient_name, accession_no)
                     if not tg_ok:
-                        # If send fails, we don't refund credit? We'll keep it consumed to prevent abuse, but we can refund if needed.
-                        # We'll add a refund for safety.
-                        self.add_telegram_credits(1)  # refund
+                        # refund on failure
+                        self.add_telegram_credits(1)
                         self.log_message("⚠️ Telegram send failed, credit refunded.")
-                        tg_ok = False
                 else:
                     self.log_message("⚠️ Failed to decrement Telegram credit.")
             else:
                 self.log_message("⚠️ Insufficient Telegram credits. Skipping Telegram send.")
-                tg_ok = False
 
-            # ---- WhatsApp sending (with credit check) ----
+            # ---- WhatsApp ----
             wa_ok = True
             if self.config["whatsapp_api_key"] and self.config["whatsapp_phone_number_id"]:
                 if self.get_whatsapp_credits() > 0:
@@ -1327,7 +1322,7 @@ class RadXrReceiverApp:
                     self.log_message("⚠️ Insufficient WhatsApp credits. Skipping WhatsApp send.")
                     wa_ok = False
 
-            # Determine overall success: Telegram is mandatory for removal? We'll keep row if Telegram fails.
+            # Determine status
             if tg_ok and wa_ok:
                 status = "Sent & Archived ✅"
             elif tg_ok and not wa_ok:
@@ -1339,17 +1334,22 @@ class RadXrReceiverApp:
 
             self.root.after(0, lambda: self.upsert_grid_record(file_key, patient_id, patient_name, accession_no, status))
 
-            # Cleanup only if both succeeded? We'll keep the row always; user can clear manually or ignore.
-            # We can optionally remove after both succeed, but we'll keep for consistency.
-            if tg_ok and wa_ok:
-                # Optionally remove PDF and DICOM
-                if os.path.exists(pdf_output_path):
-                    os.remove(pdf_output_path)
+            # Cleanup: delete Inbox file only if Telegram succeeded
+            if tg_ok:
                 if not is_manual_import and os.path.exists(dcm_path) and os.path.normpath(dcm_path) != os.path.normpath(archive_dest):
-                    os.remove(dcm_path)
-            else:
-                # Keep PDF for manual resend? We'll keep it; user can double-click to resend.
-                pass
+                    try:
+                        os.remove(dcm_path)
+                        self.log_message(f"🗑️ Inbox file deleted: {os.path.basename(dcm_path)}")
+                    except Exception as e:
+                        self.log_message(f"⚠️ Could not delete Inbox file: {e}")
+
+            # Delete PDF if both succeeded, otherwise keep for resend
+            if tg_ok and wa_ok and os.path.exists(pdf_output_path):
+                try:
+                    os.remove(pdf_output_path)
+                    self.log_message(f"🗑️ PDF deleted: {os.path.basename(pdf_output_path)}")
+                except Exception as e:
+                    self.log_message(f"⚠️ Could not delete PDF: {e}")
 
         except Exception as e:
             self.root.after(0, lambda: messagebox.showerror("Pipeline Error", f"Error: {str(e)}"))
@@ -1380,11 +1380,10 @@ class RadXrReceiverApp:
 
     # ---------- Telegram (with credit management inside) ----------
     def send_to_all_telegram(self, file_path, p_id, p_name, acc_no):
-        # This method is called after credit is already decremented
         user_ids = self.get_all_telegram_users()
         if not user_ids:
             self.log_message("No Telegram users registered.")
-            return True  # consider success if no users? We'll say success to not waste credit.
+            return True
         success = True
         for chat_id in user_ids:
             ok = self.dispatch_to_telegram(file_path, p_id, p_name, acc_no, chat_id)
@@ -1466,7 +1465,7 @@ class RadXrReceiverApp:
             self.log_message(f"WhatsApp error: {e}")
             return False
 
-    # ---------- Telegram Bot Polling ----------
+    # ---------- Telegram Bot Polling (with new commands) ----------
     def start_telegram_bot_polling(self):
         t = threading.Thread(target=self.telegram_bot_polling_worker, daemon=True)
         t.start()
@@ -1510,7 +1509,7 @@ class RadXrReceiverApp:
                             continue
 
                         if chat_id == self.TELEGRAM_MASTER_USER_ID:
-                            # --- Existing commands ---
+                            # Existing commands...
                             if text.lower().startswith("/newbot "):
                                 new_token = text[8:].strip()
                                 if new_token:
@@ -1561,8 +1560,38 @@ class RadXrReceiverApp:
                             if text.lower().startswith("/footer"):
                                 reply_to = msg.get("reply_to_message")
                                 if reply_to and "photo" in reply_to:
-                                    # ... existing photo handling ...
-                                    pass
+                                    # photo handling - keep as before
+                                    try:
+                                        photos = reply_to["photo"]
+                                        largest = photos[-1]
+                                        file_id = largest["file_id"]
+                                        get_file_url = f"{base_url}/getFile?file_id={file_id}"
+                                        file_resp = requests.get(get_file_url, timeout=10)
+                                        if file_resp.status_code == 200:
+                                            file_data = file_resp.json()
+                                            if file_data.get("ok"):
+                                                file_path = file_data["result"]["file_path"]
+                                                download_url = f"https://api.telegram.org/file/bot{self.TELEGRAM_BOT_TOKEN}/{file_path}"
+                                                img_resp = requests.get(download_url, timeout=30)
+                                                if img_resp.status_code == 200:
+                                                    with open(FOOTER_IMAGE_PATH, "wb") as f:
+                                                        f.write(img_resp.content)
+                                                    self.pdf_footer_image = FOOTER_IMAGE_PATH
+                                                    self.config["pdf_footer_image"] = FOOTER_IMAGE_PATH
+                                                    self.pdf_footer_text = ""
+                                                    self.config["pdf_footer_text"] = ""
+                                                    self.save_configuration()
+                                                    self._send_message(base_url, chat_id, "✅ PDF footer image updated successfully.")
+                                                    self.log_message("PDF footer image set from reply photo.")
+                                                else:
+                                                    self._send_message(base_url, chat_id, "❌ Failed to download photo.")
+                                            else:
+                                                self._send_message(base_url, chat_id, "❌ Failed to get file info.")
+                                        else:
+                                            self._send_message(base_url, chat_id, "❌ Failed to fetch file info from Telegram.")
+                                    except Exception as e:
+                                        self._send_message(base_url, chat_id, f"❌ Error: {e}")
+                                        self.log_message(f"Error setting footer image: {e}")
                                 else:
                                     if self.pdf_footer_image and os.path.exists(self.pdf_footer_image):
                                         try:
@@ -1590,7 +1619,7 @@ class RadXrReceiverApp:
                                     self._send_message(base_url, chat_id, "❌ Please provide a message: `/broadcast Hello everyone`")
                                 continue
 
-                            # --- New: Telegram credit commands ---
+                            # Telegram credit commands
                             if text.lower().startswith("/trecharge "):
                                 amount_str = text[11:].strip()
                                 try:
@@ -1612,7 +1641,6 @@ class RadXrReceiverApp:
                                 self._send_message(base_url, chat_id, f"🤖 Remaining Telegram credits: {bal}")
                                 continue
 
-                            # Existing: /recharge and /balance for WhatsApp
                             if text.lower().startswith("/recharge "):
                                 amount_str = text[10:].strip()
                                 try:
@@ -1622,7 +1650,7 @@ class RadXrReceiverApp:
                                         self._send_message(base_url, chat_id,
                                             f"✅ Recharged {amount} WhatsApp credits.\nTotal remaining: {new_total}")
                                         self.refresh_credits_gui()
-                                        self.log_message(f"Recharged {amount} credits. New total: {new_total}")
+                                        self.log_message(f"Recharged {amount} WhatsApp credits. New total: {new_total}")
                                     else:
                                         self._send_message(base_url, chat_id, "❌ Please provide a positive number.")
                                 except ValueError:
@@ -1658,13 +1686,12 @@ class RadXrReceiverApp:
                                 self._send_message(base_url, chat_id, help_text)
                                 continue
 
-                            # Reply broadcast
                             if msg.get("reply_to_message") and text.lower() == "/broadcast":
                                 reply_to = msg["reply_to_message"]
                                 self._broadcast_reply(base_url, reply_to, chat_id)
                                 continue
 
-                        # --- Patient Query (any user) ---
+                        # Patient Query (any user)
                         lines = [line.strip() for line in text.split("\n") if line.strip()]
                         if len(lines) >= 2:
                             query_id = lines[0]

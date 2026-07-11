@@ -850,14 +850,31 @@ class RadXrReceiverApp:
                 else:
                     messagebox.showerror("Error", "File no longer exists.")
 
-    # ---------- DICOM Server (with IP binding fix) ----------
+    # ---------- DICOM Server (with IP validation) ----------
+    def is_valid_local_ip(self, ip):
+        """Check if the given IP is a valid local address on this machine."""
+        if ip in ["0.0.0.0", "127.0.0.1"]:
+            return True
+        try:
+            local_ips = socket.gethostbyname_ex(socket.gethostname())[2]
+            return ip in local_ips
+        except Exception:
+            return False
+
     def toggle_server_process(self):
         if not self.is_listening:
             port = int(self.config["port"])
             ip = self.config["ip_address"].strip()
             if not ip:
                 ip = "0.0.0.0"
-            # Check if port is already in use on the specified IP
+            
+            # Validate if the IP is local, if not, warn and fallback to 0.0.0.0
+            if ip != "0.0.0.0" and not self.is_valid_local_ip(ip):
+                self.log_message(f"⚠️ IP '{ip}' is not a valid local IP. Falling back to 0.0.0.0 (all interfaces).")
+                messagebox.showwarning("Invalid IP", f"The IP '{ip}' is not assigned to this PC.\nUsing 0.0.0.0 (all interfaces) instead.")
+                ip = "0.0.0.0"
+            
+            # Check if port is already in use on the chosen IP
             test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             result = test_sock.connect_ex((ip, port))
             test_sock.close()
@@ -900,7 +917,7 @@ class RadXrReceiverApp:
             # C-ECHO support
             ae.add_supported_context("1.2.840.10008.1.1")
 
-            # Support all DICOM Storage SOP Classes (Canon/Konica/Fuji/Agfa etc.)
+            # Support all DICOM Storage SOP Classes
             for context in AllStoragePresentationContexts:
                 ae.add_supported_context(
                     context.abstract_syntax,
@@ -914,6 +931,10 @@ class RadXrReceiverApp:
             ]
             ip = self.config["ip_address"].strip()
             if not ip:
+                ip = "0.0.0.0"
+            # Re‑validate (in case it was changed after toggle start)
+            if ip != "0.0.0.0" and not self.is_valid_local_ip(ip):
+                self.log_message(f"⚠️ IP '{ip}' invalid. Falling back to 0.0.0.0 in the actual bind.")
                 ip = "0.0.0.0"
             self.log_message(f"⏳ Attempting to bind to {ip}:{self.config['port']}")
             if sys.stdout is not None:
@@ -992,7 +1013,7 @@ class RadXrReceiverApp:
             self.log_message(f"❌ C-STORE error: {e}")
             return 0xC000
 
-    # ---------- PDF Generation (updated: 8mm top, 3mm sides, footer image at bottom, no lines) ----------
+    # ---------- PDF Generation ----------
     def generate_pdf_report_from_dicom(self, dcm_path, output_pdf_path):
         import re
         from PIL import Image as PILImage
@@ -1118,7 +1139,6 @@ class RadXrReceiverApp:
             main_image_top = y_text - 15
 
             # --- Determine available space for main image ---
-            # Footer occupies bottom: from y=0 to footer_img_h (if any) plus a small gap
             if footer_img_h > 0:
                 gap = 5
                 main_image_bottom = footer_img_h + gap

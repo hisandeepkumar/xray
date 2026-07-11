@@ -16,6 +16,7 @@ from reportlab.pdfgen import canvas
 import requests
 
 from pynetdicom import AE, evt, sop_class
+from pynetdicom import uid as pydicom_uid
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -885,39 +886,67 @@ class RadXrReceiverApp:
 
     def run_dicom_scp_listener(self):
         ae = AE()
+        # Sanitize AE title
         raw_ae = self.config["ae_title"]
         sanitized = ''.join(c if c.isalnum() or c in ' _' else '_' for c in raw_ae)
         ae.ae_title = sanitized
         self.log_message(f"   Sanitized AE Title: '{ae.ae_title}'")
+        
         try:
+            # 1. Verification (C-ECHO) support
             ae.add_supported_context("1.2.840.10008.1.1")
-            common_storage_classes = [
-                "1.2.840.10008.5.1.4.1.1.1",
-                "1.2.840.10008.5.1.4.1.1.2",
-                "1.2.840.10008.5.1.4.1.1.4",
-                "1.2.840.10008.5.1.4.1.1.7",
-                "1.2.840.10008.5.1.4.1.1.12.1",
-                "1.2.840.10008.5.1.4.1.1.12.2",
-                "1.2.840.10008.5.1.4.1.1.20",
-                "1.2.840.10008.5.1.4.1.1.6.1",
+            
+            # 2. Add ALL standard Storage SOP Classes (fix for abstract-syntax-not-supported)
+            storage_sop_uids = [
+                # CT, MR, US, XA, CR, etc.
+                '1.2.840.10008.5.1.4.1.1.1',   # Computed Radiography
+                '1.2.840.10008.5.1.4.1.1.2',   # CT
+                '1.2.840.10008.5.1.4.1.1.4',   # MR
+                '1.2.840.10008.5.1.4.1.1.7',   # Secondary Capture
+                '1.2.840.10008.5.1.4.1.1.12.1', # X-Ray Angiographic
+                '1.2.840.10008.5.1.4.1.1.12.2', # X-Ray Radiofluoroscopic
+                '1.2.840.10008.5.1.4.1.1.20',   # Nuclear Medicine
+                '1.2.840.10008.5.1.4.1.1.6.1',  # Ultrasound
+                '1.2.840.10008.5.1.4.1.1.77.1.5.1', # Enhanced MR
+                '1.2.840.10008.5.1.4.1.1.77.1.5.2', # Enhanced CT
+                '1.2.840.10008.5.1.4.1.1.77.1.4.1', # Enhanced XA
+                '1.2.840.10008.5.1.4.1.1.77.1.4.2', # Enhanced XRF
+                '1.2.840.10008.5.1.4.1.1.77.1.1.1', # Enhanced US
+                '1.2.840.10008.5.1.4.1.1.88.1',     # VL Endoscopic
+                '1.2.840.10008.5.1.4.1.1.88.2',     # VL Microscopic
+                '1.2.840.10008.5.1.4.1.1.88.3',     # VL Slide Coordinates
+                '1.2.840.10008.5.1.4.1.1.88.4',     # VL Whole Slide
+                '1.2.840.10008.5.1.4.1.1.88.33',    # VL Photographic
+                # plus many more – we'll add all from sop_class.storage_sop_class_list
             ]
-            for uid in common_storage_classes:
+            
+            # Add all from pynetdicom's list for completeness
+            for uid in sop_class.storage_sop_class_list:
                 ae.add_supported_context(uid)
+            
+            # Also add any missing common ones manually (just in case)
+            # Already covered by the list above.
+            
             handlers = [
                 (evt.EVT_C_STORE, self.handle_incoming_c_store),
                 (evt.EVT_C_ECHO, self.handle_incoming_c_echo)
             ]
+
             self.log_message("⏳ Attempting to bind to 0.0.0.0:" + self.config["port"])
+            
             if sys.stdout is not None:
                 sys.stdout.flush()
+
             self.server_instance = ae.start_server(
                 ("0.0.0.0", int(self.config["port"])),
                 block=False,
                 evt_handlers=handlers
             )
             self.log_message("✅ start_server() returned successfully (immediate).")
+            
             self.log_message("⏳ Waiting 2 seconds for OS to bind...")
             time.sleep(2)
+            
             self.log_message("🔍 Verifying port is open...")
             test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             test_sock.settimeout(3)
@@ -932,10 +961,11 @@ class RadXrReceiverApp:
                 self.log_message(f"❌ Verification connection failed: {conn_err}")
                 self.root.after(0, self._server_failed_to_start, f"Port {self.config['port']} is NOT open. Error: {conn_err}")
                 return
+                
         except Exception as e:
             self.log_message(f"❌ Server start exception: {e}")
             self.root.after(0, self._server_failed_to_start, str(e))
-
+            
     def _server_started_successfully(self):
         self.status_var.set("● Listening")
         self.lbl_status_indicator.config(fg=self.accent_green)
@@ -964,12 +994,12 @@ class RadXrReceiverApp:
             self.log_message(f"📥 C-STORE received for Accession: {accession_number} from {event.assoc.requestor.ae_title}")
             processing_thread = threading.Thread(target=self.autonomous_processing_pipeline, args=(filepath, False), daemon=True)
             processing_thread.start()
-            return 0x0000
+            return 0x0000 
         except Exception as e:
             self.log_message(f"❌ C-STORE error: {e}")
             return 0xC000
 
-    # ---------- PDF Generation (updated: 8mm top, 3mm sides, footer image at bottom, no lines) ----------
+    # ---------- PDF Generation ----------
     def generate_pdf_report_from_dicom(self, dcm_path, output_pdf_path):
         import re
         from PIL import Image as PILImage
@@ -1128,7 +1158,7 @@ class RadXrReceiverApp:
                 c.drawImage(footer_image_path, 0, 0, width=footer_img_w, height=footer_img_h,
                             preserveAspectRatio=False, anchor='sw')
 
-            # Note: No footer lines are drawn.
+            # No footer lines.
 
             if frame_idx < num_frames - 1:
                 c.showPage()

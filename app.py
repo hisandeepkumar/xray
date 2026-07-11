@@ -16,7 +16,6 @@ from reportlab.pdfgen import canvas
 import requests
 
 from pynetdicom import AE, evt, sop_class
-from pynetdicom import uid as pydicom_uid
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
@@ -886,46 +885,18 @@ class RadXrReceiverApp:
 
     def run_dicom_scp_listener(self):
         ae = AE()
-        # Sanitize AE title
         raw_ae = self.config["ae_title"]
         sanitized = ''.join(c if c.isalnum() or c in ' _' else '_' for c in raw_ae)
         ae.ae_title = sanitized
         self.log_message(f"   Sanitized AE Title: '{ae.ae_title}'")
         
         try:
-            # 1. Verification (C-ECHO) support
+            # C-ECHO support
             ae.add_supported_context("1.2.840.10008.1.1")
             
-            # 2. Add ALL standard Storage SOP Classes (fix for abstract-syntax-not-supported)
-            storage_sop_uids = [
-                # CT, MR, US, XA, CR, etc.
-                '1.2.840.10008.5.1.4.1.1.1',   # Computed Radiography
-                '1.2.840.10008.5.1.4.1.1.2',   # CT
-                '1.2.840.10008.5.1.4.1.1.4',   # MR
-                '1.2.840.10008.5.1.4.1.1.7',   # Secondary Capture
-                '1.2.840.10008.5.1.4.1.1.12.1', # X-Ray Angiographic
-                '1.2.840.10008.5.1.4.1.1.12.2', # X-Ray Radiofluoroscopic
-                '1.2.840.10008.5.1.4.1.1.20',   # Nuclear Medicine
-                '1.2.840.10008.5.1.4.1.1.6.1',  # Ultrasound
-                '1.2.840.10008.5.1.4.1.1.77.1.5.1', # Enhanced MR
-                '1.2.840.10008.5.1.4.1.1.77.1.5.2', # Enhanced CT
-                '1.2.840.10008.5.1.4.1.1.77.1.4.1', # Enhanced XA
-                '1.2.840.10008.5.1.4.1.1.77.1.4.2', # Enhanced XRF
-                '1.2.840.10008.5.1.4.1.1.77.1.1.1', # Enhanced US
-                '1.2.840.10008.5.1.4.1.1.88.1',     # VL Endoscopic
-                '1.2.840.10008.5.1.4.1.1.88.2',     # VL Microscopic
-                '1.2.840.10008.5.1.4.1.1.88.3',     # VL Slide Coordinates
-                '1.2.840.10008.5.1.4.1.1.88.4',     # VL Whole Slide
-                '1.2.840.10008.5.1.4.1.1.88.33',    # VL Photographic
-                # plus many more – we'll add all from sop_class.storage_sop_class_list
-            ]
-            
-            # Add all from pynetdicom's list for completeness
+            # Add ALL standard Storage SOP Classes to accept any image type
             for uid in sop_class.storage_sop_class_list:
                 ae.add_supported_context(uid)
-            
-            # Also add any missing common ones manually (just in case)
-            # Already covered by the list above.
             
             handlers = [
                 (evt.EVT_C_STORE, self.handle_incoming_c_store),
@@ -933,7 +904,6 @@ class RadXrReceiverApp:
             ]
 
             self.log_message("⏳ Attempting to bind to 0.0.0.0:" + self.config["port"])
-            
             if sys.stdout is not None:
                 sys.stdout.flush()
 
@@ -943,8 +913,6 @@ class RadXrReceiverApp:
                 evt_handlers=handlers
             )
             self.log_message("✅ start_server() returned successfully (immediate).")
-            
-            self.log_message("⏳ Waiting 2 seconds for OS to bind...")
             time.sleep(2)
             
             self.log_message("🔍 Verifying port is open...")
@@ -1028,10 +996,9 @@ class RadXrReceiverApp:
         c = canvas.Canvas(output_pdf_path, pagesize=letter)
         width, height = letter
 
-        # ---- Margins ----
+        # Margins: top 8mm, left/right 3mm, bottom 0 (footer touches edge)
         top_margin = 8 * 72 / 25.4          # 8mm
         margin_lr = 3 * 72 / 25.4          # 3mm
-        bottom_margin = 0                  # footer touches bottom
 
         metadata = [
             ("Patient Name", patient_name),
@@ -1043,7 +1010,6 @@ class RadXrReceiverApp:
         ]
         available_metadata = [(k, v) for k, v in metadata if v.strip() and v != "N/A"]
 
-        # Footer image (if any)
         footer_image_path = self.pdf_footer_image if self.pdf_footer_image and os.path.exists(self.pdf_footer_image) else None
         footer_text = self.pdf_footer_text.strip() if not footer_image_path else ""
 
@@ -1054,10 +1020,8 @@ class RadXrReceiverApp:
             try:
                 footer_img = PILImage.open(footer_image_path)
                 f_img_w, f_img_h = footer_img.size
-                # Scale to full width
                 draw_w = width
                 draw_h = (f_img_h / f_img_w) * draw_w
-                # Cap height at 144pt (2 inches)
                 max_footer_h = 144
                 if draw_h > max_footer_h:
                     draw_h = max_footer_h
@@ -1080,7 +1044,6 @@ class RadXrReceiverApp:
                 else:
                     frame_array = frame_array.astype(np.uint8)
 
-            # Convert to PIL Image for drawing
             image = Image.fromarray(frame_array)
             if image.mode != "RGB":
                 image = image.convert("RGB")
@@ -1095,7 +1058,6 @@ class RadXrReceiverApp:
             c.setFont("Helvetica-Oblique", 9)
             c.drawRightString(width - margin_lr, header_y, f"Page {frame_idx + 1} of {num_frames}")
 
-            # Header line
             c.setLineWidth(1)
             c.setStrokeColorRGB(0.1, 0.5, 0.7)
             c.line(margin_lr, header_y - 6, width - margin_lr, header_y - 6)
@@ -1119,13 +1081,11 @@ class RadXrReceiverApp:
             if col == 1:
                 y_text -= 15
 
-            # Separator line after metadata
             c.setLineWidth(0.5)
             c.line(margin_lr, y_text, width - margin_lr, y_text)
             main_image_top = y_text - 15
 
-            # --- Determine available space for main image ---
-            # Footer occupies bottom: from y=0 to footer_img_h (if any) plus a small gap
+            # --- Main image area ---
             if footer_img_h > 0:
                 gap = 5
                 main_image_bottom = footer_img_h + gap
@@ -1142,11 +1102,9 @@ class RadXrReceiverApp:
             draw_main_w = img_w * scale
             draw_main_h = img_h * scale
 
-            # Center horizontally and vertically within available space
             x_main = (width - draw_main_w) / 2
             y_main = main_image_bottom + (avail_height - draw_main_h) / 2
 
-            # Draw main image
             c.drawImage(temp_img_path, x_main, y_main, width=draw_main_w, height=draw_main_h,
                         preserveAspectRatio=True, anchor='c')
             if os.path.exists(temp_img_path):
@@ -1154,11 +1112,8 @@ class RadXrReceiverApp:
 
             # --- Footer image (if any) ---
             if footer_img_w > 0 and footer_img_h > 0:
-                # Position at bottom-left, touching all edges
                 c.drawImage(footer_image_path, 0, 0, width=footer_img_w, height=footer_img_h,
                             preserveAspectRatio=False, anchor='sw')
-
-            # No footer lines.
 
             if frame_idx < num_frames - 1:
                 c.showPage()
@@ -1349,7 +1304,6 @@ class RadXrReceiverApp:
                         msg = update["message"]
                         chat_id = str(msg["chat"]["id"])
                         text = msg.get("text", "").strip()
-                        # Save user info
                         user = msg.get("from", {})
                         user_id = str(user.get("id", ""))
                         username = user.get("username", "")
@@ -1357,7 +1311,6 @@ class RadXrReceiverApp:
                         if user_id:
                             self.save_telegram_user(user_id, username, full_name)
 
-                        # --- Commands ---
                         if text.lower().startswith("/start"):
                             welcome = (
                                 f"🏥 *Welcome to RAD-XR Portal Search Node*\n\n"
@@ -1374,7 +1327,6 @@ class RadXrReceiverApp:
                             self._send_message(base_url, chat_id, welcome)
                             continue
 
-                        # --- Master commands ---
                         if chat_id == self.TELEGRAM_MASTER_USER_ID:
                             # /newbot <token>
                             if text.lower().startswith("/newbot "):
@@ -1417,7 +1369,7 @@ class RadXrReceiverApp:
                                     self._send_message(base_url, chat_id, "❌ Please provide a user ID: `/remove <userid>`")
                                 continue
 
-                            # /message <text> (caption)
+                            # /message <text>
                             if text.lower().startswith("/message "):
                                 new_msg = text[9:].strip()
                                 self.footer_message = new_msg
@@ -1463,7 +1415,6 @@ class RadXrReceiverApp:
                                         self._send_message(base_url, chat_id, f"❌ Error: {e}")
                                         self.log_message(f"Error setting footer image: {e}")
                                 else:
-                                    # Text footer: clear image and set text
                                     if self.pdf_footer_image and os.path.exists(self.pdf_footer_image):
                                         try:
                                             os.remove(self.pdf_footer_image)
@@ -1536,13 +1487,13 @@ class RadXrReceiverApp:
                                 self._send_message(base_url, chat_id, help_text)
                                 continue
 
-                            # Reply broadcast (if reply_to_message and text == "/broadcast")
+                            # Reply broadcast
                             if msg.get("reply_to_message") and text.lower() == "/broadcast":
                                 reply_to = msg["reply_to_message"]
                                 self._broadcast_reply(base_url, reply_to, chat_id)
                                 continue
 
-                        # --- Patient Query (any user) ---
+                        # --- Patient Query ---
                         lines = [line.strip() for line in text.split("\n") if line.strip()]
                         if len(lines) >= 2:
                             query_id = lines[0]

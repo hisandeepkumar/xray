@@ -30,11 +30,16 @@ DEFAULT_WHATSAPP_API_KEY = ""
 CONFIG_PASSWORD = "18040709"
 # ------------------------------------------------------------
 
-CONFIG_DIR = r"C:\RAD-XR"
+# --- Portable Config Directory (user-specific, no admin required) ---
+CONFIG_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'RAD-XR')
 CONFIG_FILE = os.path.join(CONFIG_DIR, "rad_xr_config.json")
 DATABASE_DIR = os.path.join(CONFIG_DIR, "DATABASE")
 DATABASE_PATH = os.path.join(DATABASE_DIR, "radxr_index.db")
 FOOTER_IMAGE_PATH = os.path.join(CONFIG_DIR, "footer_image.jpg")
+
+# Default folders (will be created inside CONFIG_DIR)
+DEFAULT_INBOX = os.path.join(CONFIG_DIR, "Inbox")
+DEFAULT_ARCHIVE = os.path.join(CONFIG_DIR, "Archive")
 
 class DicomArchiveHandler(FileSystemEventHandler):
     def __init__(self, app_instance):
@@ -84,8 +89,8 @@ class RadXrReceiverApp:
             "ae_title": "RAD-XR",
             "ip_address": self.get_local_ip(),
             "port": "11112",
-            "receive_folder": "D:\\RAD-XR\\Inbox",
-            "archive_folder": "D:\\RAD-XR\\Archive",
+            "receive_folder": DEFAULT_INBOX,
+            "archive_folder": DEFAULT_ARCHIVE,
             "telegram_bot_token": DEFAULT_TELEGRAM_BOT_TOKEN,
             "footer_message": "",
             "pdf_footer_text": "",
@@ -208,8 +213,8 @@ class RadXrReceiverApp:
         self.config.setdefault("ae_title", "RAD-XR")
         self.config.setdefault("ip_address", self.get_local_ip())
         self.config.setdefault("port", "11112")
-        self.config.setdefault("receive_folder", "D:\\RAD-XR\\Inbox")
-        self.config.setdefault("archive_folder", "D:\\RAD-XR\\Archive")
+        self.config.setdefault("receive_folder", DEFAULT_INBOX)
+        self.config.setdefault("archive_folder", DEFAULT_ARCHIVE)
         self.config.setdefault("auto_start", False)
         self.config.setdefault("bot_display_name", "RAD-XR Bot")
         
@@ -462,7 +467,12 @@ class RadXrReceiverApp:
     # ---------- Folder Monitoring ----------
     def start_folder_monitor(self):
         archive_dir = self.config["archive_folder"]
-        os.makedirs(archive_dir, exist_ok=True)
+        try:
+            os.makedirs(archive_dir, exist_ok=True)
+        except Exception as e:
+            self.log_message(f"❌ Failed to create archive folder: {e}")
+            messagebox.showerror("Folder Error", f"Cannot create archive folder:\n{archive_dir}\n\nError: {e}")
+            return
         if self.observer and self.monitoring_active:
             self.stop_folder_monitor()
         self.observer = Observer()
@@ -699,7 +709,7 @@ class RadXrReceiverApp:
         Label(f_dir2, text="Local Archive Directory (Bot):", font=("Arial", 9, "bold"), fg=self.text_light, bg=self.bg_card, width=25, anchor="w").pack(side="left")
         self.ent_archive_path = Entry(f_dir2, font=("Arial", 10), bg=self.bg_dark, fg=self.text_light, bd=1, insertbackground="white")
         self.ent_archive_path.pack(side="left", fill="x", expand=True, padx=5)
-        self.ent_archive_path.insert(0, self.config.get("archive_folder", "D:\\RAD-XR\\Archive"))
+        self.ent_archive_path.insert(0, self.config.get("archive_folder", DEFAULT_ARCHIVE))
         Button(f_dir2, text="Browse", font=("Arial", 8, "bold"), bg="#4b5563", fg=self.text_light, bd=0, command=lambda: self.pick_directory("archive_folder", self.ent_archive_path)).pack(side="left", padx=2)
 
         self.auto_start_var = IntVar(value=1 if self.config.get("auto_start", False) else 0)
@@ -772,7 +782,7 @@ class RadXrReceiverApp:
             threading.Thread(target=self.index_all_existing_files, args=(True,), daemon=True).start()
 
     def sync_archive_folder_to_dashboard(self):
-        archive_dir = self.config.get("archive_folder", "D:\\RAD-XR\\Archive")
+        archive_dir = self.config.get("archive_folder", DEFAULT_ARCHIVE)
         if not os.path.exists(archive_dir):
             return
         def worker():
@@ -850,12 +860,11 @@ class RadXrReceiverApp:
                 else:
                     messagebox.showerror("Error", "File no longer exists.")
 
-    # ---------- DICOM Server (using configured IP, fallback to 0.0.0.0) ----------
+    # ---------- DICOM Server ----------
     def toggle_server_process(self):
         if not self.is_listening:
             port = int(self.config["port"])
             ip = self.config["ip_address"].strip()
-            # If IP is empty or "0.0.0.0", we bind to all interfaces
             if not ip:
                 ip = "0.0.0.0"
             # Check if port is already in use on the specified IP
@@ -871,8 +880,14 @@ class RadXrReceiverApp:
             except Exception as e:
                 self.log_message(f"⚠️ Could not check port availability: {e}")
 
-            os.makedirs(self.config["receive_folder"], exist_ok=True)
-            os.makedirs(self.config["archive_folder"], exist_ok=True)
+            try:
+                os.makedirs(self.config["receive_folder"], exist_ok=True)
+                os.makedirs(self.config["archive_folder"], exist_ok=True)
+            except Exception as e:
+                self.log_message(f"❌ Failed to create folders: {e}")
+                messagebox.showerror("Folder Error", f"Cannot create required folders:\n{e}")
+                return
+
             self.is_listening = True
             self.status_var.set("● Starting...")
             self.lbl_status_indicator.config(fg=self.accent_cyan)
@@ -903,7 +918,6 @@ class RadXrReceiverApp:
         try:
             ae.add_supported_context("1.2.840.10008.1.1")
 
-            # Support all DICOM Storage SOP Classes (Canon/Konica/Fuji/Agfa etc.)
             for context in AllStoragePresentationContexts:
                 ae.add_supported_context(
                     context.abstract_syntax,

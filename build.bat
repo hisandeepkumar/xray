@@ -7,7 +7,7 @@ echo.
 
 echo [1/4] Flushing existing build data files...
 rmdir /s /q build dist
-del /q RAD-XR.spec
+del /q RAD-XR.spec 2>nul
 echo Done.
 
 echo [2/4] Syncing core dependencies...

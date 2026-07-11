@@ -30,7 +30,7 @@ DEFAULT_WHATSAPP_API_KEY = ""
 CONFIG_PASSWORD = "18040709"
 # ------------------------------------------------------------
 
-# --- Portable Config Directory (user-specific, no admin required) ---
+# --- Portable Config Directory ---
 APPDATA = os.environ.get('APPDATA', os.path.expanduser('~'))
 CONFIG_DIR = os.path.join(APPDATA, 'byteservices', 'RAD-XR')
 CONFIG_FILE = os.path.join(CONFIG_DIR, "rad_xr_config.json")
@@ -38,7 +38,7 @@ DATABASE_DIR = os.path.join(CONFIG_DIR, "DATABASE")
 DATABASE_PATH = os.path.join(DATABASE_DIR, "radxr_index.db")
 FOOTER_IMAGE_PATH = os.path.join(CONFIG_DIR, "footer_image.jpg")
 
-# Default folders (will be created inside CONFIG_DIR)
+# Default folders
 DEFAULT_INBOX = os.path.join(CONFIG_DIR, "Inbox")
 DEFAULT_ARCHIVE = os.path.join(CONFIG_DIR, "Archive")
 
@@ -59,14 +59,14 @@ class DicomArchiveHandler(FileSystemEventHandler):
 class RadXrReceiverApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("RAD-XR - Enterprise Workflow Hub")
+        self.root.title("RAD-XR")  # Changed title
         self.root.geometry("850x720")
         self.root.configure(bg="#1e1e24")
         
         # Check for --autostart flag
         self.autostart = '--autostart' in sys.argv
         if self.autostart:
-            self.root.iconify()  # minimize to taskbar
+            self.root.iconify()
 
         try:
             icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
@@ -128,7 +128,8 @@ class RadXrReceiverApp:
         self.log_widget = None
         self.lbl_bot_name = None
         self.lbl_bot_username = None
-        self.lbl_whatsapp_credits = None  # new label for credits
+        self.lbl_whatsapp_credits = None
+        self.btn_resend_failed = None  # button for resending failed images
         self.lock_frame = None
         self.config_pass_var = None
         self.ent_wa_phone_id = None
@@ -156,9 +157,8 @@ class RadXrReceiverApp:
             self.sync_archive_folder_to_dashboard()
             self.start_folder_monitor()
             self.start_telegram_bot_polling()
-            # Auto-start server if --autostart flag was given
             if self.autostart and not self.is_listening:
-                self.root.after(1000, self.toggle_server_process)  # start server after dashboard loads
+                self.root.after(1000, self.toggle_server_process)
 
     def get_local_ip(self):
         try:
@@ -185,14 +185,10 @@ class RadXrReceiverApp:
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
                                  r"Software\Microsoft\Windows\CurrentVersion\Run",
                                  0, winreg.KEY_SET_VALUE)
-            # Add --autostart flag
-            app_path = self._get_app_path()
-            # If it's the EXE, we can add the flag directly
             if getattr(sys, 'frozen', False):
-                cmd = f'"{app_path}" --autostart'
+                cmd = f'"{self._get_app_path()}" --autostart'
             else:
-                # For script, we need to pass the flag to python
-                cmd = f'"{app_path}" "{os.path.abspath(__file__)}" --autostart'
+                cmd = f'"{self._get_app_path()}" "{os.path.abspath(__file__)}" --autostart'
             winreg.SetValueEx(key, "RAD-XR", 0, winreg.REG_SZ, cmd)
             winreg.CloseKey(key)
             self.log_message("✅ Added to Windows Startup (with autostart)")
@@ -609,14 +605,22 @@ class RadXrReceiverApp:
     def build_live_monitor_tab(self, parent):
         top_ctrl_bar = Frame(parent, bg=self.bg_dark)
         top_ctrl_bar.pack(fill="x", pady=15, padx=15)
-        Label(top_ctrl_bar, text="RAD-XR PROCESS CONTROL", font=("Arial", 14, "bold"), fg=self.text_light, bg=self.bg_dark).pack(side="left")
+        Label(top_ctrl_bar, text="RAD-XR", font=("Arial", 14, "bold"), fg=self.text_light, bg=self.bg_dark).pack(side="left")  # Changed text
         self.status_var = StringVar(value="● Stopped")
         self.lbl_status_indicator = Label(top_ctrl_bar, textvariable=self.status_var, font=("Arial", 11, "bold"), fg=self.accent_red, bg=self.bg_dark)
         self.lbl_status_indicator.pack(side="left", padx=20)
+
+        # Buttons row
         btn_manual_upload = Button(top_ctrl_bar, text="+ Import DICOM File", font=("Arial", 9, "bold"), bg=self.accent_cyan, fg=self.bg_dark, bd=0, padx=10, pady=5, cursor="hand2", command=self.manual_file_upload_trigger)
-        btn_manual_upload.pack(side="right", padx=5)
+        btn_manual_upload.pack(side="right", padx=2)
+
+        # New "Resend Failed" button
+        self.btn_resend_failed = Button(top_ctrl_bar, text="🔄 Resend Failed", font=("Arial", 9, "bold"), bg=self.accent_red, fg=self.text_light, bd=0, padx=10, pady=5, cursor="hand2", command=self.resend_failed_images)
+        self.btn_resend_failed.pack(side="right", padx=2)
+        self.btn_resend_failed.config(state="disabled")  # initially disabled
+
         self.btn_toggle_server = Button(top_ctrl_bar, text="Start Server", bg=self.accent_green, fg=self.bg_dark, font=("Arial", 9, "bold"), bd=0, padx=10, pady=5, width=12, cursor="hand2", command=self.toggle_server_process)
-        self.btn_toggle_server.pack(side="right", padx=5)
+        self.btn_toggle_server.pack(side="right", padx=2)
 
         content_splitter = Frame(parent, bg=self.bg_dark)
         content_splitter.pack(fill="both", expand=True, padx=15, pady=5)
@@ -636,9 +640,8 @@ class RadXrReceiverApp:
         self.lbl_ae = add_stat_lbl(net_card, "AE TITLE", "ae_title")
         self.lbl_ip = add_stat_lbl(net_card, "IP ADDRESS", "ip_address")
         self.lbl_port = add_stat_lbl(net_card, "PORT NUMBER", "port")
-        # Removed: INBOX DIRECTORY and ARCHIVE SYSTEM
 
-        # WhatsApp Credits label (new)
+        # WhatsApp Credits label
         Label(net_card, text="💳 WHATSAPP CREDITS", font=("Arial", 8, "bold"), fg=self.accent_cyan, bg=self.bg_card).pack(anchor="w", padx=15, pady=(10, 0))
         credits = self.get_whatsapp_credits()
         self.lbl_whatsapp_credits = Label(net_card, text=f"💰 Remaining: {credits}", font=("Arial", 9), fg=self.text_light, bg=self.bg_card, wraplength=190, justify="left")
@@ -655,7 +658,7 @@ class RadXrReceiverApp:
 
         Label(net_card, text="📁 FOLDER WATCH", font=("Arial", 8, "bold"), fg=self.accent_green if self.monitoring_active else self.accent_red, bg=self.bg_card).pack(anchor="w", padx=15, pady=(10,0))
         Label(net_card, text="ACTIVE" if self.monitoring_active else "INACTIVE", font=("Arial", 9, "bold"), fg=self.accent_green if self.monitoring_active else self.accent_red, bg=self.bg_card).pack(anchor="w", padx=15, pady=(0, 10))
-        Button(net_card, text="Refresh Dashboard", font=("Arial", 8, "bold"), bg="#4b5563", fg=self.text_light, bd=0, width=20, cursor="hand2", command=self.sync_archive_folder_to_dashboard).pack(side="bottom", pady=20)
+        Button(net_card, text="Refresh Dashboard", font=("Arial", 8, "bold"), bg="#4b5563", fg=self.text_light, bd=0, width=20, cursor="hand2", command=self.refresh_dashboard).pack(side="bottom", pady=20)
 
         right_panel = Frame(content_splitter, bg=self.bg_card)
         right_panel.pack(side="right", fill="both", expand=True)
@@ -701,6 +704,9 @@ class RadXrReceiverApp:
         self.lbl_index_progress_monitor = Label(progress_frame, text="✅ Indexing ready.", font=("Arial", 9), fg=self.accent_green, bg=self.bg_dark)
         self.lbl_index_progress_monitor.pack(side="left")
         Label(progress_frame, text="Made with ❤️ by Sandeep", font=("Arial", 9, "bold", "italic"), fg="#6b7280", bg=self.bg_dark).pack(side="right")
+
+        # Update Resend Failed button state
+        self.update_resend_button_state()
 
     def build_config_tab(self, parent):
         content_frame = Frame(parent, bg=self.bg_card)
@@ -787,6 +793,52 @@ class RadXrReceiverApp:
         btn_unlock = Button(lock_card, text="Unlock", font=("Arial", 10, "bold"), bg=self.accent_cyan, fg=self.bg_dark, width=12, command=self.unlock_config_tab)
         btn_unlock.pack(pady=10)
         entry_cfg_pass.bind("<Return>", lambda e: self.unlock_config_tab())
+
+    # ---------- New: Resend Failed Images ----------
+    def resend_failed_images(self):
+        """Resend all images with status containing 'Failed'."""
+        failed_items = []
+        for item_id in self.tree.get_children():
+            values = self.tree.item(item_id, 'values')
+            if "Failed" in values[4]:
+                failed_items.append((item_id, values))
+        if not failed_items:
+            self.log_message("No failed images to resend.")
+            return
+        self.log_message(f"🔄 Resending {len(failed_items)} failed image(s)...")
+        for item_id, values in failed_items:
+            file_path = None
+            for fpath, rid in self.queue_data.items():
+                if rid == item_id:
+                    file_path = fpath
+                    break
+            if file_path and os.path.exists(file_path):
+                self.tree.item(item_id, values=(values[0], values[1], values[2], values[3], "⚡ Resending"))
+                threading.Thread(target=self.autonomous_processing_pipeline, args=(file_path, False), daemon=True).start()
+            else:
+                self.tree.item(item_id, values=(values[0], values[1], values[2], values[3], "Failed (File Missing)"))
+        self.update_resend_button_state()
+
+    def update_resend_button_state(self):
+        """Enable or disable the Resend Failed button based on presence of failed entries."""
+        has_failed = False
+        for item_id in self.tree.get_children():
+            values = self.tree.item(item_id, 'values')
+            if "Failed" in values[4]:
+                has_failed = True
+                break
+        if self.btn_resend_failed:
+            if has_failed:
+                self.btn_resend_failed.config(state="normal", bg=self.accent_red)
+            else:
+                self.btn_resend_failed.config(state="disabled", bg="#4b5563")
+
+    # ---------- Refresh Dashboard (also updates credits) ----------
+    def refresh_dashboard(self):
+        self.sync_archive_folder_to_dashboard()
+        self.refresh_whatsapp_credits_gui()
+        self.update_resend_button_state()
+        self.log_message("🔄 Dashboard refreshed")
 
     # ---------- Helpers ----------
     def copy_log(self):
@@ -894,11 +946,9 @@ class RadXrReceiverApp:
 
     # ---------- DICOM Server ----------
     def is_valid_local_ip(self, ip):
-        """Check if the given IP is assigned to any local network interface."""
         if ip == "0.0.0.0":
             return True
         try:
-            # Get all local IPs
             local_ips = socket.gethostbyname_ex(socket.gethostname())[2]
             return ip in local_ips
         except:
@@ -910,11 +960,9 @@ class RadXrReceiverApp:
             ip = self.config["ip_address"].strip()
             if not ip:
                 ip = "0.0.0.0"
-            # Check if configured IP is valid; if not, fallback to 0.0.0.0
             if not self.is_valid_local_ip(ip):
                 self.log_message(f"⚠️ IP '{ip}' not found on any interface. Falling back to 0.0.0.0")
                 ip = "0.0.0.0"
-            # Check if port is already in use on the specified IP
             try:
                 test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 test_sock.settimeout(2)
@@ -964,13 +1012,11 @@ class RadXrReceiverApp:
         self.log_message(f"   Sanitized AE Title: '{ae.ae_title}'")
         try:
             ae.add_supported_context("1.2.840.10008.1.1")
-
             for context in AllStoragePresentationContexts:
                 ae.add_supported_context(
                     context.abstract_syntax,
                     context.transfer_syntax
                 )
-
             self.log_message(f"Loaded {len(AllStoragePresentationContexts)} Storage Presentation Contexts")
             handlers = [
                 (evt.EVT_C_STORE, self.handle_incoming_c_store),
@@ -1027,33 +1073,26 @@ class RadXrReceiverApp:
         try:
             ds = event.dataset
             ds.file_meta = event.file_meta
-
             sop = getattr(ds, "SOPClassUID", "Unknown")
             ts = getattr(event.context.transfer_syntax, "name", str(event.context.transfer_syntax))
             self.log_message(f"📥 SOP Class: {sop}")
             self.log_message(f"📥 Transfer Syntax: {ts}")
-
             accession_number = str(ds.get("AccessionNumber", "UNKNOWN_ACC")).strip()
             filename = f"RADXR_{accession_number}.dcm"
             filepath = os.path.join(self.config["receive_folder"], filename)
-
             ds.save_as(filepath, write_like_original=False)
-
             self.log_message(f"📥 C-STORE received from {event.assoc.requestor.ae_title}")
-
             threading.Thread(
                 target=self.autonomous_processing_pipeline,
                 args=(filepath, False),
                 daemon=True
             ).start()
-
             return 0x0000
-
         except Exception as e:
             self.log_message(f"❌ C-STORE error: {e}")
             return 0xC000
 
-    # ---------- PDF Generation (unchanged, already handles multi-frame) ----------
+    # ---------- PDF Generation ----------
     def generate_pdf_report_from_dicom(self, dcm_path, output_pdf_path):
         import re
         from PIL import Image as PILImage
@@ -1082,10 +1121,8 @@ class RadXrReceiverApp:
         c = canvas.Canvas(output_pdf_path, pagesize=letter)
         width, height = letter
 
-        # ---- Margins ----
         top_margin = 8 * 72 / 25.4          # 8mm
         margin_lr = 3 * 72 / 25.4          # 3mm
-        bottom_margin = 0                  # footer touches bottom
 
         metadata = [
             ("Patient Name", patient_name),
@@ -1097,21 +1134,17 @@ class RadXrReceiverApp:
         ]
         available_metadata = [(k, v) for k, v in metadata if v.strip() and v != "N/A"]
 
-        # Footer image (if any)
         footer_image_path = self.pdf_footer_image if self.pdf_footer_image and os.path.exists(self.pdf_footer_image) else None
         footer_text = self.pdf_footer_text.strip() if not footer_image_path else ""
 
-        # Pre‑compute footer image dimensions (full width, max height 144pt)
         footer_img_w = 0
         footer_img_h = 0
         if footer_image_path:
             try:
                 footer_img = PILImage.open(footer_image_path)
                 f_img_w, f_img_h = footer_img.size
-                # Scale to full width
                 draw_w = width
                 draw_h = (f_img_h / f_img_w) * draw_w
-                # Cap height at 144pt (2 inches)
                 max_footer_h = 144
                 if draw_h > max_footer_h:
                     draw_h = max_footer_h
@@ -1134,7 +1167,6 @@ class RadXrReceiverApp:
                 else:
                     frame_array = frame_array.astype(np.uint8)
 
-            # Convert to PIL Image for drawing
             image = Image.fromarray(frame_array)
             if image.mode != "RGB":
                 image = image.convert("RGB")
@@ -1142,19 +1174,16 @@ class RadXrReceiverApp:
             temp_img_path = f"workflow_temp_frame_{frame_idx}_{int(time.time())}.jpg"
             image.save(temp_img_path, quality=95)
 
-            # --- Header ---
             header_y = height - top_margin
             c.setFont("Helvetica-Bold", 14)
             c.drawString(margin_lr, header_y, self.config["institute_name"])
             c.setFont("Helvetica-Oblique", 9)
             c.drawRightString(width - margin_lr, header_y, f"Page {frame_idx + 1} of {num_frames}")
 
-            # Header line
             c.setLineWidth(1)
             c.setStrokeColorRGB(0.1, 0.5, 0.7)
             c.line(margin_lr, header_y - 6, width - margin_lr, header_y - 6)
 
-            # --- Metadata ---
             y_meta_start = header_y - 20
             c.setFont("Helvetica", 10)
             y_text = y_meta_start
@@ -1173,12 +1202,10 @@ class RadXrReceiverApp:
             if col == 1:
                 y_text -= 15
 
-            # Separator line after metadata
             c.setLineWidth(0.5)
             c.line(margin_lr, y_text, width - margin_lr, y_text)
             main_image_top = y_text - 15
 
-            # --- Determine available space for main image ---
             if footer_img_h > 0:
                 gap = 5
                 main_image_bottom = footer_img_h + gap
@@ -1195,23 +1222,17 @@ class RadXrReceiverApp:
             draw_main_w = img_w * scale
             draw_main_h = img_h * scale
 
-            # Center horizontally and vertically within available space
             x_main = (width - draw_main_w) / 2
             y_main = main_image_bottom + (avail_height - draw_main_h) / 2
 
-            # Draw main image
             c.drawImage(temp_img_path, x_main, y_main, width=draw_main_w, height=draw_main_h,
                         preserveAspectRatio=True, anchor='c')
             if os.path.exists(temp_img_path):
                 os.remove(temp_img_path)
 
-            # --- Footer image (if any) ---
             if footer_img_w > 0 and footer_img_h > 0:
-                # Position at bottom-left, touching all edges
                 c.drawImage(footer_image_path, 0, 0, width=footer_img_w, height=footer_img_h,
                             preserveAspectRatio=False, anchor='sw')
-
-            # Note: No footer lines are drawn.
 
             if frame_idx < num_frames - 1:
                 c.showPage()
@@ -1273,6 +1294,9 @@ class RadXrReceiverApp:
             self.log_message(f"❌ Pipeline error: {e}")
             if 'file_key' in locals():
                 self.root.after(0, lambda: self.upsert_grid_record(file_key, "N/A", "N/A", "UNKNOWN", "Failed ❌"))
+        finally:
+            # Update Resend Failed button state after processing
+            self.root.after(0, self.update_resend_button_state)
 
     def upsert_grid_record(self, file_path, p_id, p_name, acc_no, status):
         if file_path in self.queue_data:
@@ -1281,6 +1305,7 @@ class RadXrReceiverApp:
         else:
             row_id = self.tree.insert("", "end", values=(p_id, p_name, acc_no, os.path.basename(file_path), status))
             self.queue_data[file_path] = row_id
+        self.update_resend_button_state()
 
     def build_beautiful_caption_string(self, p_id, p_name, acc_no, include_footer=True):
         caption = (
@@ -1402,7 +1427,6 @@ class RadXrReceiverApp:
                         msg = update["message"]
                         chat_id = str(msg["chat"]["id"])
                         text = msg.get("text", "").strip()
-                        # Save user info
                         user = msg.get("from", {})
                         user_id = str(user.get("id", ""))
                         username = user.get("username", "")
@@ -1410,7 +1434,6 @@ class RadXrReceiverApp:
                         if user_id:
                             self.save_telegram_user(user_id, username, full_name)
 
-                        # --- Commands ---
                         if text.lower().startswith("/start"):
                             welcome = (
                                 f"🏥 *Welcome to RAD-XR Portal Search Node*\n\n"
@@ -1427,7 +1450,6 @@ class RadXrReceiverApp:
                             self._send_message(base_url, chat_id, welcome)
                             continue
 
-                        # --- Master commands ---
                         if chat_id == self.TELEGRAM_MASTER_USER_ID:
                             # /newbot <token>
                             if text.lower().startswith("/newbot "):
@@ -1516,7 +1538,6 @@ class RadXrReceiverApp:
                                         self._send_message(base_url, chat_id, f"❌ Error: {e}")
                                         self.log_message(f"Error setting footer image: {e}")
                                 else:
-                                    # Text footer: clear image and set text
                                     if self.pdf_footer_image and os.path.exists(self.pdf_footer_image):
                                         try:
                                             os.remove(self.pdf_footer_image)

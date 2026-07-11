@@ -850,41 +850,14 @@ class RadXrReceiverApp:
                 else:
                     messagebox.showerror("Error", "File no longer exists.")
 
-    # ---------- DICOM Server (with IP binding fix) ----------
-    def _validate_ae_title(self, ae_title):
-        """Validate AE Title according to DICOM rules: max 16 chars, alnum, space, underscore."""
-        if not ae_title:
-            return False, "AE Title cannot be empty."
-        if len(ae_title) > 16:
-            return False, f"AE Title exceeds 16 characters (got {len(ae_title)})."
-        allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 _")
-        if not all(c in allowed for c in ae_title):
-            return False, "AE Title contains invalid characters (only alphanumeric, space, underscore allowed)."
-        return True, "OK"
-
+    # ---------- DICOM Server (using configured IP, fallback to 0.0.0.0) ----------
     def toggle_server_process(self):
         if not self.is_listening:
-            # Validate configuration
+            port = int(self.config["port"])
             ip = self.config["ip_address"].strip()
+            # If IP is empty or "0.0.0.0", we bind to all interfaces
             if not ip:
-                messagebox.showerror("Configuration Error", "IP Address cannot be empty.")
-                return
-
-            port_str = self.config["port"].strip()
-            if not port_str.isdigit():
-                messagebox.showerror("Configuration Error", "Port must be a number.")
-                return
-            port = int(port_str)
-            if port < 1 or port > 65535:
-                messagebox.showerror("Configuration Error", "Port must be between 1 and 65535.")
-                return
-
-            ae_title = self.config["ae_title"].strip()
-            valid, msg = self._validate_ae_title(ae_title)
-            if not valid:
-                messagebox.showerror("AE Title Validation", msg)
-                return
-
+                ip = "0.0.0.0"
             # Check if port is already in use on the specified IP
             try:
                 test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -905,7 +878,7 @@ class RadXrReceiverApp:
             self.lbl_status_indicator.config(fg=self.accent_cyan)
             self.btn_toggle_server.config(text="Starting...", bg="#4b5563")
             self.log_message("🚀 Starting DICOM server...")
-            self.log_message(f"   AE Title: {ae_title}")
+            self.log_message(f"   AE Title: {self.config['ae_title']}")
             self.log_message(f"   IP: {ip}")
             self.log_message(f"   Port: {port}")
             self.log_message(f"   Inbox: {self.config['receive_folder']}")
@@ -923,19 +896,14 @@ class RadXrReceiverApp:
 
     def run_dicom_scp_listener(self):
         ae = AE()
-        raw_ae = self.config["ae_title"].strip()
-        # Sanitize: keep only allowed characters, max 16
-        sanitized = ''.join(c for c in raw_ae if c.isalnum() or c in ' _')
-        if len(sanitized) > 16:
-            sanitized = sanitized[:16]
+        raw_ae = self.config["ae_title"]
+        sanitized = ''.join(c if c.isalnum() or c in ' _' else '_' for c in raw_ae)
         ae.ae_title = sanitized
         self.log_message(f"   Sanitized AE Title: '{ae.ae_title}'")
-        
         try:
-            # C-ECHO support
             ae.add_supported_context("1.2.840.10008.1.1")
 
-            # Support all DICOM Storage SOP Classes with all transfer syntaxes
+            # Support all DICOM Storage SOP Classes (Canon/Konica/Fuji/Agfa etc.)
             for context in AllStoragePresentationContexts:
                 ae.add_supported_context(
                     context.abstract_syntax,
@@ -949,13 +917,12 @@ class RadXrReceiverApp:
             ]
             ip = self.config["ip_address"].strip()
             if not ip:
-                ip = "0.0.0.0"  # fallback
-            port = int(self.config["port"])
-            self.log_message(f"⏳ Attempting to bind to {ip}:{port}")
+                ip = "0.0.0.0"
+            self.log_message(f"⏳ Attempting to bind to {ip}:{self.config['port']}")
             if sys.stdout is not None:
                 sys.stdout.flush()
             self.server_instance = ae.start_server(
-                (ip, port),
+                (ip, int(self.config["port"])),
                 block=False,
                 evt_handlers=handlers
             )
@@ -966,15 +933,15 @@ class RadXrReceiverApp:
             test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             test_sock.settimeout(3)
             try:
-                test_sock.connect((ip, port))
+                test_sock.connect((ip, int(self.config["port"])))
                 test_sock.close()
                 self.root.after(0, self._server_started_successfully)
-                self.log_message(f"✅ DICOM server is LISTENING on {ip}:{port}")
+                self.log_message(f"✅ DICOM server is LISTENING on {ip}:{self.config['port']}")
                 while self.is_listening:
                     time.sleep(0.5)
             except Exception as conn_err:
                 self.log_message(f"❌ Verification connection failed: {conn_err}")
-                self.root.after(0, self._server_failed_to_start, f"Port {port} on {ip} is NOT open. Error: {conn_err}")
+                self.root.after(0, self._server_failed_to_start, f"Port {self.config['port']} on {ip} is NOT open. Error: {conn_err}")
                 return
         except Exception as e:
             self.log_message(f"❌ Server start exception: {e}")
@@ -995,40 +962,26 @@ class RadXrReceiverApp:
         messagebox.showerror("Server Error", f"Failed to start DICOM server:\n{error_msg}\n\nCheck the console log for details.\nPort: {self.config['port']}")
 
     def handle_incoming_c_echo(self, event):
-        remote_ip, remote_port = event.assoc.socket.getpeername()
-        self.log_message(f"✅ C-ECHO received from {event.assoc.requestor.ae_title} at {remote_ip}:{remote_port}")
+        self.log_message(f"✅ C-ECHO received from {event.assoc.requestor.ae_title}")
         return 0x0000
 
     def handle_incoming_c_store(self, event):
-        remote_ip, remote_port = event.assoc.socket.getpeername()
-        calling_ae = event.assoc.requestor.ae_title
-        called_ae = event.assoc.respondor.ae_title
-
         try:
             ds = event.dataset
             ds.file_meta = event.file_meta
 
-            sop_class = getattr(ds, "SOPClassUID", "Unknown")
+            sop = getattr(ds, "SOPClassUID", "Unknown")
             ts = getattr(event.context.transfer_syntax, "name", str(event.context.transfer_syntax))
-            patient_name = str(ds.get("PatientName", "N/A")).strip()
-            patient_id = str(ds.get("PatientID", "N/A")).strip()
+            self.log_message(f"📥 SOP Class: {sop}")
+            self.log_message(f"📥 Transfer Syntax: {ts}")
+
             accession_number = str(ds.get("AccessionNumber", "UNKNOWN_ACC")).strip()
-
-            self.log_message(f"📥 C-STORE received")
-            self.log_message(f"   Remote: {remote_ip}:{remote_port}")
-            self.log_message(f"   Calling AE: {calling_ae}")
-            self.log_message(f"   Called AE: {called_ae}")
-            self.log_message(f"   SOP Class: {sop_class}")
-            self.log_message(f"   Transfer Syntax: {ts}")
-            self.log_message(f"   Patient: {patient_name} (ID: {patient_id})")
-            self.log_message(f"   Accession: {accession_number}")
-
             filename = f"RADXR_{accession_number}.dcm"
             filepath = os.path.join(self.config["receive_folder"], filename)
 
             ds.save_as(filepath, write_like_original=False)
 
-            self.log_message(f"✅ C-STORE saved to {filepath}")
+            self.log_message(f"📥 C-STORE received from {event.assoc.requestor.ae_title}")
 
             threading.Thread(
                 target=self.autonomous_processing_pipeline,
@@ -1036,13 +989,13 @@ class RadXrReceiverApp:
                 daemon=True
             ).start()
 
-            return 0x0000  # Success
+            return 0x0000
 
         except Exception as e:
             self.log_message(f"❌ C-STORE error: {e}")
-            return 0xC000  # Failure
+            return 0xC000
 
-    # ---------- PDF Generation ----------
+    # ---------- PDF Generation (unchanged) ----------
     def generate_pdf_report_from_dicom(self, dcm_path, output_pdf_path):
         import re
         from PIL import Image as PILImage

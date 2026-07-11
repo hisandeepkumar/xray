@@ -31,7 +31,8 @@ CONFIG_PASSWORD = "18040709"
 # ------------------------------------------------------------
 
 # --- Portable Config Directory (user-specific, no admin required) ---
-CONFIG_DIR = os.path.join(os.environ.get('APPDATA', os.path.expanduser('~')), 'RAD-XR')
+APPDATA = os.environ.get('APPDATA', os.path.expanduser('~'))
+CONFIG_DIR = os.path.join(APPDATA, 'byteservices', 'RAD-XR')
 CONFIG_FILE = os.path.join(CONFIG_DIR, "rad_xr_config.json")
 DATABASE_DIR = os.path.join(CONFIG_DIR, "DATABASE")
 DATABASE_PATH = os.path.join(DATABASE_DIR, "radxr_index.db")
@@ -62,6 +63,11 @@ class RadXrReceiverApp:
         self.root.geometry("850x720")
         self.root.configure(bg="#1e1e24")
         
+        # Check for --autostart flag
+        self.autostart = '--autostart' in sys.argv
+        if self.autostart:
+            self.root.iconify()  # minimize to taskbar
+
         try:
             icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
             if os.path.exists(icon_path):
@@ -122,10 +128,12 @@ class RadXrReceiverApp:
         self.log_widget = None
         self.lbl_bot_name = None
         self.lbl_bot_username = None
+        self.lbl_whatsapp_credits = None  # new label for credits
         self.lock_frame = None
         self.config_pass_var = None
         self.ent_wa_phone_id = None
         self.ent_wa_sender = None
+        self.auto_start_var = None
         
         self.load_configuration()
         self.setup_modern_styles()
@@ -148,6 +156,9 @@ class RadXrReceiverApp:
             self.sync_archive_folder_to_dashboard()
             self.start_folder_monitor()
             self.start_telegram_bot_polling()
+            # Auto-start server if --autostart flag was given
+            if self.autostart and not self.is_listening:
+                self.root.after(1000, self.toggle_server_process)  # start server after dashboard loads
 
     def get_local_ip(self):
         try:
@@ -174,9 +185,17 @@ class RadXrReceiverApp:
             key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
                                  r"Software\Microsoft\Windows\CurrentVersion\Run",
                                  0, winreg.KEY_SET_VALUE)
-            winreg.SetValueEx(key, "RAD-XR", 0, winreg.REG_SZ, self._get_app_path())
+            # Add --autostart flag
+            app_path = self._get_app_path()
+            # If it's the EXE, we can add the flag directly
+            if getattr(sys, 'frozen', False):
+                cmd = f'"{app_path}" --autostart'
+            else:
+                # For script, we need to pass the flag to python
+                cmd = f'"{app_path}" "{os.path.abspath(__file__)}" --autostart'
+            winreg.SetValueEx(key, "RAD-XR", 0, winreg.REG_SZ, cmd)
             winreg.CloseKey(key)
-            self.log_message("✅ Added to Windows Startup")
+            self.log_message("✅ Added to Windows Startup (with autostart)")
         except Exception as e:
             self.log_message(f"❌ Failed to add to startup: {e}")
 
@@ -373,6 +392,11 @@ class RadXrReceiverApp:
             bot_uname = f"@{self.bot_username}" if self.bot_username else "Not available"
             self.lbl_bot_username.config(text=f"Username: {bot_uname}")
 
+    def refresh_whatsapp_credits_gui(self):
+        if self.lbl_whatsapp_credits:
+            credits = self.get_whatsapp_credits()
+            self.lbl_whatsapp_credits.config(text=f"💰 WhatsApp Credits: {credits}")
+
     # ---------- Indexing ----------
     def index_all_existing_files(self, reindex=False):
         if self.indexing_in_progress:
@@ -528,6 +552,8 @@ class RadXrReceiverApp:
             self.sync_archive_folder_to_dashboard()
             self.start_folder_monitor()
             self.start_telegram_bot_polling()
+            if self.autostart and not self.is_listening:
+                self.root.after(1000, self.toggle_server_process)
         else:
             messagebox.showerror("Error", "Invalid Security Master Password!")
 
@@ -545,6 +571,7 @@ class RadXrReceiverApp:
 
         self.notebook.bind("<<NotebookTabChanged>>", self.on_tab_change)
         self.refresh_bot_info_gui()
+        self.refresh_whatsapp_credits_gui()
 
     def on_tab_change(self, event=None):
         if not self.notebook:
@@ -609,8 +636,13 @@ class RadXrReceiverApp:
         self.lbl_ae = add_stat_lbl(net_card, "AE TITLE", "ae_title")
         self.lbl_ip = add_stat_lbl(net_card, "IP ADDRESS", "ip_address")
         self.lbl_port = add_stat_lbl(net_card, "PORT NUMBER", "port")
-        self.lbl_folder = add_stat_lbl(net_card, "INBOX DIRECTORY", "receive_folder")
-        self.lbl_archive = add_stat_lbl(net_card, "ARCHIVE SYSTEM", "archive_folder")
+        # Removed: INBOX DIRECTORY and ARCHIVE SYSTEM
+
+        # WhatsApp Credits label (new)
+        Label(net_card, text="💳 WHATSAPP CREDITS", font=("Arial", 8, "bold"), fg=self.accent_cyan, bg=self.bg_card).pack(anchor="w", padx=15, pady=(10, 0))
+        credits = self.get_whatsapp_credits()
+        self.lbl_whatsapp_credits = Label(net_card, text=f"💰 Remaining: {credits}", font=("Arial", 9), fg=self.text_light, bg=self.bg_card, wraplength=190, justify="left")
+        self.lbl_whatsapp_credits.pack(anchor="w", padx=15, pady=(0, 10))
 
         Label(net_card, text="🤖 TELEGRAM BOT", font=("Arial", 8, "bold"), fg=self.accent_cyan, bg=self.bg_card).pack(anchor="w", padx=15, pady=(10, 0))
         bot_display = self.config.get("bot_display_name", "RAD-XR Bot")
@@ -861,11 +893,26 @@ class RadXrReceiverApp:
                     messagebox.showerror("Error", "File no longer exists.")
 
     # ---------- DICOM Server ----------
+    def is_valid_local_ip(self, ip):
+        """Check if the given IP is assigned to any local network interface."""
+        if ip == "0.0.0.0":
+            return True
+        try:
+            # Get all local IPs
+            local_ips = socket.gethostbyname_ex(socket.gethostname())[2]
+            return ip in local_ips
+        except:
+            return False
+
     def toggle_server_process(self):
         if not self.is_listening:
             port = int(self.config["port"])
             ip = self.config["ip_address"].strip()
             if not ip:
+                ip = "0.0.0.0"
+            # Check if configured IP is valid; if not, fallback to 0.0.0.0
+            if not self.is_valid_local_ip(ip):
+                self.log_message(f"⚠️ IP '{ip}' not found on any interface. Falling back to 0.0.0.0")
                 ip = "0.0.0.0"
             # Check if port is already in use on the specified IP
             try:
@@ -898,7 +945,7 @@ class RadXrReceiverApp:
             self.log_message(f"   Port: {port}")
             self.log_message(f"   Inbox: {self.config['receive_folder']}")
             self.log_message(f"   Archive: {self.config['archive_folder']}")
-            self.server_thread = threading.Thread(target=self.run_dicom_scp_listener, daemon=True)
+            self.server_thread = threading.Thread(target=self.run_dicom_scp_listener, args=(ip,), daemon=True)
             self.server_thread.start()
         else:
             self.is_listening = False
@@ -909,7 +956,7 @@ class RadXrReceiverApp:
             self.btn_toggle_server.config(text="Start Server", bg=self.accent_green)
             self.log_message("⏹️ Server stopped by user.")
 
-    def run_dicom_scp_listener(self):
+    def run_dicom_scp_listener(self, bind_ip):
         ae = AE()
         raw_ae = self.config["ae_title"]
         sanitized = ''.join(c if c.isalnum() or c in ' _' else '_' for c in raw_ae)
@@ -929,14 +976,11 @@ class RadXrReceiverApp:
                 (evt.EVT_C_STORE, self.handle_incoming_c_store),
                 (evt.EVT_C_ECHO, self.handle_incoming_c_echo)
             ]
-            ip = self.config["ip_address"].strip()
-            if not ip:
-                ip = "0.0.0.0"
-            self.log_message(f"⏳ Attempting to bind to {ip}:{self.config['port']}")
+            self.log_message(f"⏳ Attempting to bind to {bind_ip}:{self.config['port']}")
             if sys.stdout is not None:
                 sys.stdout.flush()
             self.server_instance = ae.start_server(
-                (ip, int(self.config["port"])),
+                (bind_ip, int(self.config["port"])),
                 block=False,
                 evt_handlers=handlers
             )
@@ -947,15 +991,15 @@ class RadXrReceiverApp:
             test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             test_sock.settimeout(3)
             try:
-                test_sock.connect((ip, int(self.config["port"])))
+                test_sock.connect((bind_ip, int(self.config["port"])))
                 test_sock.close()
                 self.root.after(0, self._server_started_successfully)
-                self.log_message(f"✅ DICOM server is LISTENING on {ip}:{self.config['port']}")
+                self.log_message(f"✅ DICOM server is LISTENING on {bind_ip}:{self.config['port']}")
                 while self.is_listening:
                     time.sleep(0.5)
             except Exception as conn_err:
                 self.log_message(f"❌ Verification connection failed: {conn_err}")
-                self.root.after(0, self._server_failed_to_start, f"Port {self.config['port']} on {ip} is NOT open. Error: {conn_err}")
+                self.root.after(0, self._server_failed_to_start, f"Port {self.config['port']} on {bind_ip} is NOT open. Error: {conn_err}")
                 return
         except Exception as e:
             self.log_message(f"❌ Server start exception: {e}")
@@ -1009,7 +1053,7 @@ class RadXrReceiverApp:
             self.log_message(f"❌ C-STORE error: {e}")
             return 0xC000
 
-    # ---------- PDF Generation (unchanged) ----------
+    # ---------- PDF Generation (unchanged, already handles multi-frame) ----------
     def generate_pdf_report_from_dicom(self, dcm_path, output_pdf_path):
         import re
         from PIL import Image as PILImage

@@ -21,6 +21,51 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 # ------------------------------------------------------------
+# COMPRESSED DICOM CODEC SUPPORT
+# ------------------------------------------------------------
+# Many vendors (Canon CXDI, Fuji FCR/CR-IR, Agfa CR/DR, Carestream DRX/CR,
+# Konica CR/DR, etc.) send DICOM images compressed with JPEG Baseline,
+# JPEG Lossless, or JPEG2000 transfer syntaxes instead of raw pixel data.
+# pydicom needs an extra pixel-data handler plugin installed to decode these.
+# We import them here (if installed) so pydicom auto-registers the handlers
+# at startup; if missing, we log a clear warning instead of failing silently
+# deep inside PDF generation.
+CODEC_SUPPORT = {"pylibjpeg": False, "gdcm": False}
+try:
+    import pylibjpeg  # noqa: F401
+    import pylibjpeg_libjpeg  # noqa: F401  (JPEG Baseline / Extended / Lossless)
+    import pylibjpeg_openjpeg  # noqa: F401  (JPEG2000)
+    CODEC_SUPPORT["pylibjpeg"] = True
+except Exception:
+    pass
+try:
+    import gdcm  # noqa: F401  (python-gdcm) - broad fallback decoder incl. JPEG2000/Lossless
+    CODEC_SUPPORT["gdcm"] = True
+except Exception:
+    pass
+
+# Full list of transfer syntaxes to ACCEPT during DICOM association negotiation.
+# Without explicitly listing the compressed ones here, a Fuji/Agfa/Carestream/
+# Konica/Canon unit trying to send JPEG- or JPEG2000-compressed images would
+# fail to even connect (association rejected), regardless of decode support.
+ACCEPTED_TRANSFER_SYNTAXES = [
+    pydicom.uid.ImplicitVRLittleEndian,
+    pydicom.uid.ExplicitVRLittleEndian,
+    pydicom.uid.DeflatedExplicitVRLittleEndian,
+    pydicom.uid.ExplicitVRBigEndian,
+    pydicom.uid.JPEGBaseline8Bit,
+    pydicom.uid.JPEGExtended12Bit,
+    pydicom.uid.JPEGLossless,
+    pydicom.uid.JPEGLosslessSV1,
+    pydicom.uid.JPEGLSLossless,
+    pydicom.uid.JPEGLSNearLossless,
+    pydicom.uid.JPEG2000Lossless,
+    pydicom.uid.JPEG2000,
+    pydicom.uid.RLELossless,
+]
+# ------------------------------------------------------------
+
+# ------------------------------------------------------------
 # HARD‑CODED CONSTANTS (NOT stored in config file)
 # ------------------------------------------------------------
 MASTER_PASSWORD = "Sandeep@123"
@@ -28,6 +73,7 @@ DEFAULT_MASTER_USER_ID = "878604830"
 DEFAULT_TELEGRAM_BOT_TOKEN = "7941135502:AAHz-KGvAAoZEhPVgfVKw3zFbkaB0_Pi5rM"
 DEFAULT_WHATSAPP_API_KEY = ""
 CONFIG_PASSWORD = "18040709"
+DEFAULT_BATCH_WAIT_SECONDS = 6  # wait time to gather more images of same patient before combining into one PDF
 # ------------------------------------------------------------
 
 # --- Portable Config Directory ---
@@ -96,12 +142,14 @@ class RadXrReceiverApp:
             "port": "11112",
             "receive_folder": DEFAULT_INBOX,
             "archive_folder": DEFAULT_ARCHIVE,
+            "pdf_output_folder": "",  # NEW: custom PDF folder, empty means auto (parent of Inbox)
             "telegram_bot_token": DEFAULT_TELEGRAM_BOT_TOKEN,
             "footer_message": "",
             "pdf_footer_text": "",
             "pdf_footer_image": "",
             "auto_start": False,
-            "bot_display_name": "RAD-XR Bot"
+            "bot_display_name": "RAD-XR Bot",
+            "batch_wait_seconds": DEFAULT_BATCH_WAIT_SECONDS
         }
         
         self.TELEGRAM_BOT_TOKEN = None
@@ -122,6 +170,12 @@ class RadXrReceiverApp:
         self.observer = None
         self.monitoring_active = False
         self.indexing_in_progress = False
+
+        # Batching: group multiple images of the SAME patient (same Patient ID,
+        # or same Patient Name if ID missing) that arrive close together in time
+        # into ONE combined multi-page PDF instead of sending one PDF per image.
+        self.pending_batches = {}
+        self.batch_lock = threading.Lock()
         self.lbl_index_progress_monitor = None
         self.lbl_index_progress_config = None
         self.log_widget = None
@@ -134,8 +188,10 @@ class RadXrReceiverApp:
         self.ent_wa_phone_id = None
         self.ent_wa_sender = None
         self.auto_start_var = None
+        self.ent_pdf_folder = None  # NEW
         
         self.load_configuration()
+        self.check_codec_support()
         self.setup_modern_styles()
         
         if self.config.get("auto_start", False):
@@ -146,6 +202,7 @@ class RadXrReceiverApp:
         self.init_db()
         self.init_telegram_users_table()
         self.init_credits_tables()
+        self.init_pdf_index_table()
         self.update_bot_username()
         
         if not self.config.get("password_verified"):
@@ -229,8 +286,10 @@ class RadXrReceiverApp:
         self.config.setdefault("port", "11112")
         self.config.setdefault("receive_folder", DEFAULT_INBOX)
         self.config.setdefault("archive_folder", DEFAULT_ARCHIVE)
+        self.config.setdefault("pdf_output_folder", "")  # NEW
         self.config.setdefault("auto_start", False)
         self.config.setdefault("bot_display_name", "RAD-XR Bot")
+        self.config.setdefault("batch_wait_seconds", DEFAULT_BATCH_WAIT_SECONDS)
         
         self.TELEGRAM_BOT_TOKEN = self.config["telegram_bot_token"]
         self.footer_message = self.config.get("footer_message", "")
@@ -268,6 +327,47 @@ class RadXrReceiverApp:
             self.log_widget.insert(END, full_msg + "\n")
             self.log_widget.see(END)
             self.root.update_idletasks()
+
+    # ---------- Compressed DICOM (JPEG Baseline/Lossless/JPEG2000) Support ----------
+    def check_codec_support(self):
+        if CODEC_SUPPORT["pylibjpeg"] or CODEC_SUPPORT["gdcm"]:
+            self.log_message(
+                f"✅ Compressed DICOM codec support ready "
+                f"(pylibjpeg={'yes' if CODEC_SUPPORT['pylibjpeg'] else 'no'}, "
+                f"gdcm={'yes' if CODEC_SUPPORT['gdcm'] else 'no'}). "
+                f"Canon / Fuji / Agfa / Carestream / Konica JPEG Baseline, JPEG Lossless "
+                f"and JPEG2000 images will decode correctly."
+            )
+        else:
+            self.log_message(
+                "⚠️ No compressed-DICOM codec plugin found (pylibjpeg / python-gdcm). "
+                "Uncompressed DICOM images will still work fine, but images sent as "
+                "JPEG Baseline, JPEG Lossless, or JPEG2000 (common with Fuji, Agfa, "
+                "Carestream, Konica CR/DR units) may fail to open. "
+                "Run: pip install pylibjpeg pylibjpeg-libjpeg pylibjpeg-openjpeg python-gdcm"
+            )
+
+    def _safe_load_pixel_array(self, ds):
+        """
+        Loads pixel data from a DICOM dataset, transparently handling
+        compressed transfer syntaxes (JPEG Baseline, JPEG Lossless, JPEG2000)
+        used by various CR/DR vendors. Raises a clear, actionable error if
+        the required decoder plugin isn't installed.
+        """
+        try:
+            return ds.pixel_array
+        except Exception as first_err:
+            try:
+                ds.decompress()
+                return ds.pixel_array
+            except Exception as second_err:
+                if not (CODEC_SUPPORT["pylibjpeg"] or CODEC_SUPPORT["gdcm"]):
+                    raise RuntimeError(
+                        "This DICOM file is compressed (JPEG Baseline/Lossless/JPEG2000) "
+                        "and no decoder plugin is installed. Install with: "
+                        "pip install pylibjpeg pylibjpeg-libjpeg pylibjpeg-openjpeg python-gdcm"
+                    ) from second_err
+                raise RuntimeError(f"Could not decode pixel data: {second_err}") from second_err
 
     # ---------- Database ----------
     def init_db(self):
@@ -313,6 +413,119 @@ class RadXrReceiverApp:
         c.execute("INSERT OR IGNORE INTO telegram_credits (id, remaining) VALUES (1, 0)")
         conn.commit()
         conn.close()
+
+    # ---------- PDF Index (cache of already-generated & sent PDF reports) ----------
+    def init_pdf_index_table(self):
+        conn = sqlite3.connect(DATABASE_PATH)
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS pdf_index (
+                        lookup_key TEXT PRIMARY KEY,
+                        patient_id TEXT,
+                        patient_name TEXT,
+                        accession TEXT,
+                        pdf_path TEXT,
+                        updated_at INTEGER
+                     )''')
+        conn.commit()
+        conn.close()
+
+    def compute_patient_key(self, patient_id, patient_name):
+        """Same identity rule used for both image-batching and the PDF cache:
+        prefer Patient ID, fall back to Patient Name, else None (no safe key)."""
+        patient_id = (patient_id or "").strip()
+        patient_name = (patient_name or "").strip()
+        if patient_id and patient_id != "N/A":
+            return f"PID::{patient_id}"
+        elif patient_name and patient_name != "N/A":
+            return f"NAME::{patient_name.lower()}"
+        else:
+            return None
+
+    def save_pdf_index(self, patient_id, patient_name, accession_no, pdf_path):
+        """Record that this patient's report PDF has been generated & sent,
+        so a repeat request can be answered instantly without regenerating."""
+        key = self.compute_patient_key(patient_id, patient_name)
+        if not key:
+            return
+        self.init_pdf_index_table()
+        conn = sqlite3.connect(DATABASE_PATH)
+        c = conn.cursor()
+        c.execute('''INSERT OR REPLACE INTO pdf_index
+                     (lookup_key, patient_id, patient_name, accession, pdf_path, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?)''',
+                  (key, patient_id, patient_name, accession_no, pdf_path, int(time.time())))
+        conn.commit()
+        conn.close()
+
+    def get_saved_pdf_for_patient(self, q_id, q_name):
+        """
+        Look up an already-generated PDF for this patient (matched the same
+        way as DICOM lookups: exact Patient ID + Patient Name prefix).
+        Returns (pdf_path, patient_id, patient_name, accession) or None if no
+        record exists OR the file no longer exists on disk.
+        """
+        self.init_pdf_index_table()
+        conn = sqlite3.connect(DATABASE_PATH)
+        c = conn.cursor()
+        q_id_clean = (q_id or "").strip()
+        q_name_clean = (q_name or "").strip().lower()
+        name_prefix = q_name_clean[:4] if len(q_name_clean) >= 4 else q_name_clean
+        c.execute("""
+            SELECT pdf_path, patient_id, patient_name, accession FROM pdf_index
+            WHERE patient_id = ? AND LOWER(patient_name) LIKE ?
+        """, (q_id_clean, f"{name_prefix}%"))
+        row = c.fetchone()
+        conn.close()
+        if row and row[0] and os.path.exists(row[0]):
+            return row
+        return None
+
+    def clear_pdf_index_table(self):
+        conn = sqlite3.connect(DATABASE_PATH)
+        c = conn.cursor()
+        c.execute("DELETE FROM pdf_index")
+        conn.commit()
+        conn.close()
+
+    # ---------- PDF Folder & Naming ----------
+    def get_pdf_folder(self):
+        """
+        Return the custom PDF output folder if configured and exists,
+        otherwise fallback to the default: a 'PDF Reports' folder next to the Inbox.
+        """
+        custom_folder = self.config.get("pdf_output_folder", "").strip()
+        if custom_folder:
+            # If the folder doesn't exist, create it.
+            try:
+                os.makedirs(custom_folder, exist_ok=True)
+                return custom_folder
+            except Exception as e:
+                self.log_message(f"⚠️ Could not create custom PDF folder '{custom_folder}': {e}. Falling back to default.")
+        # Default: parent of Inbox / PDF Reports
+        receive_folder = self.config.get("receive_folder", DEFAULT_INBOX)
+        parent_dir = os.path.dirname(os.path.normpath(receive_folder))
+        pdf_dir = os.path.join(parent_dir, "PDF Reports")
+        os.makedirs(pdf_dir, exist_ok=True)
+        return pdf_dir
+
+    def build_pdf_filename(self, patient_name, study_date):
+        """
+        Format: '<Patient Name> <Study Date (DDMMYYYY)> medical report.pdf'
+        If study_date is missing or invalid, use today's date.
+        """
+        clean_name = "".join(x for x in (patient_name or "") if x.isalnum() or x in " -_").strip()
+        if not clean_name:
+            clean_name = "Unknown"
+
+        # Format study date: DICOM gives YYYYMMDD -> DDMMYYYY
+        if study_date and len(study_date) == 8 and study_date.isdigit():
+            # YYYYMMDD -> DDMMYYYY
+            formatted_date = f"{study_date[6:8]}{study_date[4:6]}{study_date[0:4]}"
+        else:
+            # fallback to today
+            today = time.strftime("%Y%m%d")
+            formatted_date = f"{today[6:8]}{today[4:6]}{today[0:4]}"
+        return f"{clean_name} {formatted_date} medical report.pdf"
 
     def get_whatsapp_credits(self):
         conn = sqlite3.connect(DATABASE_PATH)
@@ -651,6 +864,9 @@ class RadXrReceiverApp:
         btn_resend_failed = Button(top_ctrl_bar, text="🔄 Resend Failed", font=("Arial", 9, "bold"), bg="#f59e0b", fg=self.bg_dark, bd=0, padx=10, pady=5, cursor="hand2", command=self.resend_failed_images)
         btn_resend_failed.pack(side="right", padx=5)
 
+        btn_clear_exams = Button(top_ctrl_bar, text="🧹 Clear Exams", font=("Arial", 9, "bold"), bg=self.accent_red, fg=self.text_light, bd=0, padx=10, pady=5, cursor="hand2", command=self.clear_exams_action)
+        btn_clear_exams.pack(side="right", padx=5)
+
         self.btn_toggle_server = Button(top_ctrl_bar, text="Start Server", bg=self.accent_green, fg=self.bg_dark, font=("Arial", 9, "bold"), bd=0, padx=10, pady=5, width=12, cursor="hand2", command=self.toggle_server_process)
         self.btn_toggle_server.pack(side="right", padx=5)
 
@@ -736,6 +952,11 @@ class RadXrReceiverApp:
         progress_frame.pack(fill="x", padx=15, pady=5)
         self.lbl_index_progress_monitor = Label(progress_frame, text="✅ Indexing ready.", font=("Arial", 9), fg=self.accent_green, bg=self.bg_dark)
         self.lbl_index_progress_monitor.pack(side="left")
+
+        # NEW: Clear Sent Files button
+        btn_clear_sent = Button(progress_frame, text="🧹 Clear Sent Files", font=("Arial", 9, "bold"), bg="#3b82f6", fg=self.text_light, bd=0, padx=10, pady=2, cursor="hand2", command=self.clear_sent_files_from_grid)
+        btn_clear_sent.pack(side="left", padx=10)
+
         Label(progress_frame, text="Made with ❤️ by Sandeep", font=("Arial", 9, "bold", "italic"), fg="#6b7280", bg=self.bg_dark).pack(side="right")
 
     def refresh_dashboard(self):
@@ -743,12 +964,43 @@ class RadXrReceiverApp:
         self.sync_archive_folder_to_dashboard()
         self.log_message("🔄 Dashboard refreshed (credits updated).")
 
+    # --- NEW: Clear sent files from the grid ---
+    def clear_sent_files_from_grid(self):
+        """
+        Remove all rows from the Treeview that have a status indicating successful delivery
+        (contains '✅' and does NOT contain '❌'). Also remove them from queue_data.
+        """
+        to_remove = []
+        for item in self.tree.get_children():
+            values = self.tree.item(item, 'values')
+            if not values:
+                continue
+            status = values[4]  # status column
+            if '✅' in status and '❌' not in status:
+                to_remove.append(item)
+        if not to_remove:
+            messagebox.showinfo("Clear Sent", "No sent files to clear from the list.")
+            return
+        removed_count = 0
+        for item in to_remove:
+            file_path_to_remove = None
+            for fpath, rid in list(self.queue_data.items()):
+                if rid == item:
+                    file_path_to_remove = fpath
+                    break
+            if file_path_to_remove:
+                del self.queue_data[file_path_to_remove]
+            self.tree.delete(item)
+            removed_count += 1
+        self.log_message(f"🧹 Cleared {removed_count} sent file(s) from the grid.")
+        messagebox.showinfo("Clear Sent", f"Removed {removed_count} sent file(s) from the list. Only pending/failed items remain.")
+
     # --- UPDATED: Resend Failed (now detects any status with ❌) ---
     def resend_failed_images(self):
         failed_items = []
         for item in self.tree.get_children():
             values = self.tree.item(item, 'values')
-            if values and "❌" in values[4]:  # any status with cross mark
+            if values and "❌" in values[4]:
                 failed_items.append(item)
         if not failed_items:
             messagebox.showinfo("Resend", "No failed images to resend.")
@@ -759,18 +1011,15 @@ class RadXrReceiverApp:
                 row_values = self.tree.item(item, 'values')
                 file_name = row_values[3]
                 file_path = None
-                # Try to find in queue_data (map from file_path to row)
                 for fpath, rid in self.queue_data.items():
                     if rid == item:
                         file_path = fpath
                         break
                 if not file_path:
-                    # Try inbox first (original file might still be there)
                     inbox_file = os.path.join(self.config["receive_folder"], file_name)
                     if os.path.exists(inbox_file):
                         file_path = inbox_file
                     else:
-                        # Fallback to archive
                         full_archive = os.path.join(self.config["archive_folder"], file_name)
                         if os.path.exists(full_archive):
                             file_path = full_archive
@@ -781,6 +1030,50 @@ class RadXrReceiverApp:
                 else:
                     self.tree.item(item, values=(row_values[0], row_values[1], row_values[2], file_name, "❌ File Missing"))
             messagebox.showinfo("Resend", f"Started resending {count} failed image(s). Check console for progress.")
+
+    def clear_exams_action(self):
+        """
+        Deletes all files currently sitting in the Inbox folder and all saved
+        PDF reports in the PDF Reports folder (or custom PDF folder if set).
+        Archived DICOM images (in the Archive folder) and the database index are NOT touched.
+        """
+        inbox_dir = self.config.get("receive_folder", DEFAULT_INBOX)
+        pdf_dir = self.get_pdf_folder()  # uses custom or default
+        res = messagebox.askyesno(
+            "Confirm Clear Exams",
+            "This will permanently delete:\n\n"
+            f"• All files in the Inbox folder:\n   {inbox_dir}\n\n"
+            f"• All saved PDF reports in:\n   {pdf_dir}\n\n"
+            "Archived DICOM images are NOT affected.\n\nContinue?"
+        )
+        if not res:
+            return
+
+        deleted = 0
+        errors = 0
+        for folder in (inbox_dir, pdf_dir):
+            if folder and os.path.exists(folder):
+                for fname in os.listdir(folder):
+                    fpath = os.path.join(folder, fname)
+                    if os.path.isfile(fpath):
+                        try:
+                            os.remove(fpath)
+                            deleted += 1
+                        except Exception as e:
+                            errors += 1
+                            self.log_message(f"⚠️ Could not delete {fpath}: {e}")
+
+        # The saved-PDF cache is now empty on disk, so clear the stale DB entries too.
+        try:
+            self.clear_pdf_index_table()
+        except Exception as e:
+            self.log_message(f"⚠️ Could not clear PDF index table: {e}")
+
+        msg = f"Deleted {deleted} file(s) from Inbox and PDF folders."
+        if errors:
+            msg += f"\n{errors} file(s) could not be deleted (check console log)."
+        messagebox.showinfo("Clear Exams", msg)
+        self.log_message(f"🧹 Clear Exams: deleted {deleted} file(s), {errors} error(s).")
 
     def build_config_tab(self, parent):
         content_frame = Frame(parent, bg=self.bg_card)
@@ -807,6 +1100,17 @@ class RadXrReceiverApp:
         self.ent_ae_title = make_entry("Storage AE Title:", "ae_title")
         self.ent_ip_addr = make_entry("Host Local IP Address:", "ip_address")
         self.ent_port_num = make_entry("Server Dynamic Port:", "port")
+        self.ent_batch_wait = make_entry("Combine Images Wait Time (sec):", "batch_wait_seconds")
+
+        # NEW: PDF Output Folder
+        f_pdf = Frame(form, bg=self.bg_card)
+        f_pdf.pack(fill="x", pady=6, padx=20)
+        Label(f_pdf, text="PDF Output Folder:", font=("Arial", 9, "bold"), fg=self.text_light, bg=self.bg_card, width=25, anchor="w").pack(side="left")
+        self.ent_pdf_folder = Entry(f_pdf, font=("Arial", 10), bg=self.bg_dark, fg=self.text_light, bd=1, insertbackground="white")
+        self.ent_pdf_folder.pack(side="left", fill="x", expand=True, padx=5)
+        self.ent_pdf_folder.insert(0, self.config.get("pdf_output_folder", ""))
+        Button(f_pdf, text="Browse", font=("Arial", 8, "bold"), bg="#4b5563", fg=self.text_light, bd=0,
+               command=lambda: self.pick_directory("pdf_output_folder", self.ent_pdf_folder)).pack(side="left", padx=2)
 
         f_dir1 = Frame(form, bg=self.bg_card)
         f_dir1.pack(fill="x", pady=6, padx=20)
@@ -929,6 +1233,11 @@ class RadXrReceiverApp:
         self.config["port"] = self.ent_port_num.get().strip()
         self.config["receive_folder"] = self.ent_folder_path.get().strip()
         self.config["archive_folder"] = self.ent_archive_path.get().strip()
+        self.config["pdf_output_folder"] = self.ent_pdf_folder.get().strip()  # NEW
+        try:
+            self.config["batch_wait_seconds"] = max(1, float(self.ent_batch_wait.get().strip()))
+        except (ValueError, AttributeError):
+            self.config["batch_wait_seconds"] = DEFAULT_BATCH_WAIT_SECONDS
         self.save_configuration()
         messagebox.showinfo("System Config", "RAD-XR Core configurations updated successfully!")
         self.show_main_dashboard()
@@ -1043,9 +1352,12 @@ class RadXrReceiverApp:
             for context in AllStoragePresentationContexts:
                 ae.add_supported_context(
                     context.abstract_syntax,
-                    context.transfer_syntax
+                    ACCEPTED_TRANSFER_SYNTAXES
                 )
-            self.log_message(f"Loaded {len(AllStoragePresentationContexts)} Storage Presentation Contexts")
+            self.log_message(
+                f"Loaded {len(AllStoragePresentationContexts)} Storage Presentation Contexts "
+                f"(incl. JPEG Baseline/Lossless + JPEG2000 + RLE — Canon/Fuji/Agfa/Carestream/Konica compatible)"
+            )
             handlers = [
                 (evt.EVT_C_STORE, self.handle_incoming_c_store),
                 (evt.EVT_C_ECHO, self.handle_incoming_c_echo)
@@ -1104,12 +1416,14 @@ class RadXrReceiverApp:
             self.log_message(f"📥 SOP Class: {sop}")
             self.log_message(f"📥 Transfer Syntax: {ts}")
             accession_number = str(ds.get("AccessionNumber", "UNKNOWN_ACC")).strip()
-            filename = f"RADXR_{accession_number}.dcm"
+            sop_instance_uid = str(ds.get("SOPInstanceUID", "")).strip()
+            unique_suffix = sop_instance_uid[-12:] if sop_instance_uid else f"{int(time.time() * 1000)}"
+            filename = f"RADXR_{accession_number}_{unique_suffix}.dcm"
             filepath = os.path.join(self.config["receive_folder"], filename)
             ds.save_as(filepath, write_like_original=False)
             self.log_message(f"📥 C-STORE received from {event.assoc.requestor.ae_title}")
             threading.Thread(
-                target=self.autonomous_processing_pipeline,
+                target=self.queue_file_for_patient_batch,
                 args=(filepath, False),
                 daemon=True
             ).start()
@@ -1119,30 +1433,21 @@ class RadXrReceiverApp:
             return 0xC000
 
     # ---------- PDF Generation ----------
-    def generate_pdf_report_from_dicom(self, dcm_path, output_pdf_path):
-        import re
+    def generate_pdf_report_from_dicom(self, dcm_paths, output_pdf_path):
+        """
+        Builds ONE PDF report from one or more DICOM files.
+        Returns (patient_id, patient_name, accession_no, study_date).
+        """
         from PIL import Image as PILImage
 
-        ds = pydicom.dcmread(dcm_path)
-        try:
-            pixel_array = ds.pixel_array
-        except Exception:
-            ds.decompress()
-            pixel_array = ds.pixel_array
+        if isinstance(dcm_paths, (str, bytes, os.PathLike)):
+            dcm_paths = [dcm_paths]
 
-        patient_id = str(ds.get("PatientID", "N/A")).strip()
-        patient_name = str(ds.get("PatientName", "N/A")).strip()
-        accession_no = str(ds.get("AccessionNumber", "NO_ACC")).strip()
-        study_date = str(ds.get("StudyDate", "N/A")).strip()
-
-        is_multi_frame = False
-        num_frames = 1
-        if hasattr(ds, "NumberOfFrames") and ds.NumberOfFrames > 1:
-            is_multi_frame = True
-            num_frames = int(ds.NumberOfFrames)
-        elif len(pixel_array.shape) == 3 and pixel_array.shape[0] < pixel_array.shape[1]:
-            is_multi_frame = True
-            num_frames = pixel_array.shape[0]
+        first_ds = pydicom.dcmread(dcm_paths[0], stop_before_pixels=True)
+        patient_id = str(first_ds.get("PatientID", "N/A")).strip()
+        patient_name = str(first_ds.get("PatientName", "N/A")).strip()
+        accession_no = str(first_ds.get("AccessionNumber", "NO_ACC")).strip()
+        study_date = str(first_ds.get("StudyDate", "")).strip()
 
         c = canvas.Canvas(output_pdf_path, pagesize=letter)
         width, height = letter
@@ -1153,15 +1458,14 @@ class RadXrReceiverApp:
         metadata = [
             ("Patient Name", patient_name),
             ("Patient ID", patient_id),
-            ("Patient Sex", str(ds.get("PatientSex", "N/A"))),
-            ("Study Date", study_date),
-            ("Modality", str(ds.get("Modality", "N/A"))),
+            ("Patient Sex", str(first_ds.get("PatientSex", "N/A"))),
+            ("Study Date", study_date if study_date else "N/A"),
+            ("Modality", str(first_ds.get("Modality", "N/A"))),
             ("Accession No", accession_no)
         ]
         available_metadata = [(k, v) for k, v in metadata if v.strip() and v != "N/A"]
 
         footer_image_path = self.pdf_footer_image if self.pdf_footer_image and os.path.exists(self.pdf_footer_image) else None
-        footer_text = self.pdf_footer_text.strip() if not footer_image_path else ""
 
         footer_img_w = 0
         footer_img_h = 0
@@ -1182,90 +1486,119 @@ class RadXrReceiverApp:
                 footer_img_w = 0
                 footer_img_h = 0
 
-        for frame_idx in range(num_frames):
-            frame_array = pixel_array[frame_idx] if is_multi_frame else pixel_array
+        file_frame_counts = []
+        for dcm_path in dcm_paths:
+            try:
+                ds_probe = pydicom.dcmread(dcm_path, stop_before_pixels=True)
+                n_frames = int(getattr(ds_probe, "NumberOfFrames", 1) or 1)
+            except Exception:
+                n_frames = 1
+            file_frame_counts.append(n_frames)
+        total_pages = sum(file_frame_counts) if sum(file_frame_counts) > 0 else len(dcm_paths)
 
-            if frame_array.dtype != np.uint8:
-                p_min = frame_array.min()
-                p_max = frame_array.max()
-                if p_max > p_min:
-                    frame_array = (((frame_array - p_min) / (p_max - p_min)) * 255).astype(np.uint8)
-                else:
-                    frame_array = frame_array.astype(np.uint8)
+        page_counter = 0
+        for dcm_path in dcm_paths:
+            try:
+                ds = pydicom.dcmread(dcm_path)
+                pixel_array = self._safe_load_pixel_array(ds)
+            except Exception as e:
+                self.log_message(f"❌ Skipping unreadable DICOM {os.path.basename(str(dcm_path))}: {e}")
+                continue
 
-            image = Image.fromarray(frame_array)
-            if image.mode != "RGB":
-                image = image.convert("RGB")
+            is_multi_frame = False
+            num_frames = 1
+            if hasattr(ds, "NumberOfFrames") and ds.NumberOfFrames > 1:
+                is_multi_frame = True
+                num_frames = int(ds.NumberOfFrames)
+            elif len(pixel_array.shape) == 3 and pixel_array.shape[0] < pixel_array.shape[1]:
+                is_multi_frame = True
+                num_frames = pixel_array.shape[0]
 
-            temp_img_path = f"workflow_temp_frame_{frame_idx}_{int(time.time())}.jpg"
-            image.save(temp_img_path, quality=95)
+            for frame_idx in range(num_frames):
+                page_counter += 1
+                frame_array = pixel_array[frame_idx] if is_multi_frame else pixel_array
 
-            header_y = height - top_margin
-            c.setFont("Helvetica-Bold", 14)
-            c.drawString(margin_lr, header_y, self.config["institute_name"])
-            c.setFont("Helvetica-Oblique", 9)
-            c.drawRightString(width - margin_lr, header_y, f"Page {frame_idx + 1} of {num_frames}")
+                if frame_array.dtype != np.uint8:
+                    p_min = frame_array.min()
+                    p_max = frame_array.max()
+                    if p_max > p_min:
+                        frame_array = (((frame_array - p_min) / (p_max - p_min)) * 255).astype(np.uint8)
+                    else:
+                        frame_array = frame_array.astype(np.uint8)
 
-            c.setLineWidth(1)
-            c.setStrokeColorRGB(0.1, 0.5, 0.7)
-            c.line(margin_lr, header_y - 6, width - margin_lr, header_y - 6)
+                image = Image.fromarray(frame_array)
+                if image.mode != "RGB":
+                    image = image.convert("RGB")
 
-            y_meta_start = header_y - 20
-            c.setFont("Helvetica", 10)
-            y_text = y_meta_start
-            col = 0
-            for label, value in available_metadata:
-                x_pos = margin_lr if col == 0 else width / 2 + margin_lr - 40
-                c.setFont("Helvetica-Bold", 9)
-                c.drawString(x_pos, y_text, f"{label}: ")
-                c.setFont("Helvetica", 9)
-                c.drawString(x_pos + 80, y_text, value)
+                temp_img_path = f"workflow_temp_frame_{page_counter}_{int(time.time())}.jpg"
+                image.save(temp_img_path, quality=95)
+
+                header_y = height - top_margin
+                c.setFont("Helvetica-Bold", 14)
+                c.drawString(margin_lr, header_y, self.config["institute_name"])
+                c.setFont("Helvetica-Oblique", 9)
+                c.drawRightString(width - margin_lr, header_y, f"Page {page_counter} of {total_pages}")
+
+                c.setLineWidth(1)
+                c.setStrokeColorRGB(0.1, 0.5, 0.7)
+                c.line(margin_lr, header_y - 6, width - margin_lr, header_y - 6)
+
+                y_meta_start = header_y - 20
+                c.setFont("Helvetica", 10)
+                y_text = y_meta_start
+                col = 0
+                for label, value in available_metadata:
+                    x_pos = margin_lr if col == 0 else width / 2 + margin_lr - 40
+                    c.setFont("Helvetica-Bold", 9)
+                    c.drawString(x_pos, y_text, f"{label}: ")
+                    c.setFont("Helvetica", 9)
+                    c.drawString(x_pos + 80, y_text, value)
+                    if col == 1:
+                        y_text -= 15
+                        col = 0
+                    else:
+                        col = 1
                 if col == 1:
                     y_text -= 15
-                    col = 0
+
+                c.setLineWidth(0.5)
+                c.line(margin_lr, y_text, width - margin_lr, y_text)
+                main_image_top = y_text - 15
+
+                if footer_img_h > 0:
+                    gap = 5
+                    main_image_bottom = footer_img_h + gap
                 else:
-                    col = 1
-            if col == 1:
-                y_text -= 15
+                    main_image_bottom = 0
 
-            c.setLineWidth(0.5)
-            c.line(margin_lr, y_text, width - margin_lr, y_text)
-            main_image_top = y_text - 15
+                avail_height = main_image_top - main_image_bottom
+                avail_width = width - 2 * margin_lr
 
-            if footer_img_h > 0:
-                gap = 5
-                main_image_bottom = footer_img_h + gap
-            else:
-                main_image_bottom = 0
+                img_w, img_h = image.size
+                scale = 1.0
+                if img_w > avail_width or img_h > avail_height:
+                    scale = min(avail_width / img_w, avail_height / img_h)
+                draw_main_w = img_w * scale
+                draw_main_h = img_h * scale
 
-            avail_height = main_image_top - main_image_bottom
-            avail_width = width - 2 * margin_lr
+                x_main = (width - draw_main_w) / 2
+                y_main = main_image_bottom + (avail_height - draw_main_h) / 2
 
-            img_w, img_h = image.size
-            scale = 1.0
-            if img_w > avail_width or img_h > avail_height:
-                scale = min(avail_width / img_w, avail_height / img_h)
-            draw_main_w = img_w * scale
-            draw_main_h = img_h * scale
+                c.drawImage(temp_img_path, x_main, y_main, width=draw_main_w, height=draw_main_h,
+                            preserveAspectRatio=True, anchor='c')
+                if os.path.exists(temp_img_path):
+                    os.remove(temp_img_path)
 
-            x_main = (width - draw_main_w) / 2
-            y_main = main_image_bottom + (avail_height - draw_main_h) / 2
+                if footer_img_w > 0 and footer_img_h > 0:
+                    c.drawImage(footer_image_path, 0, 0, width=footer_img_w, height=footer_img_h,
+                                preserveAspectRatio=False, anchor='sw')
 
-            c.drawImage(temp_img_path, x_main, y_main, width=draw_main_w, height=draw_main_h,
-                        preserveAspectRatio=True, anchor='c')
-            if os.path.exists(temp_img_path):
-                os.remove(temp_img_path)
-
-            if footer_img_w > 0 and footer_img_h > 0:
-                c.drawImage(footer_image_path, 0, 0, width=footer_img_w, height=footer_img_h,
-                            preserveAspectRatio=False, anchor='sw')
-
-            if frame_idx < num_frames - 1:
-                c.showPage()
+                if page_counter < total_pages:
+                    c.showPage()
 
         c.showPage()
         c.save()
-        return patient_id, patient_name, accession_no
+        return patient_id, patient_name, accession_no, study_date
 
     # ---------- Processing Pipeline (updated: keep Inbox until Telegram succeeds) ----------
     def autonomous_processing_pipeline(self, dcm_path, is_manual_import=False):
@@ -1275,6 +1608,7 @@ class RadXrReceiverApp:
             patient_id = str(ds.get("PatientID", "N/A")).strip()
             patient_name = str(ds.get("PatientName", "N/A")).strip()
             accession_no = str(ds.get("AccessionNumber", "UNKNOWN")).strip()
+            study_date = str(ds.get("StudyDate", "")).strip()
 
             archive_dir = self.config["archive_folder"]
             os.makedirs(archive_dir, exist_ok=True)
@@ -1287,10 +1621,9 @@ class RadXrReceiverApp:
 
             self.index_dicom_file(dcm_path_for_index, patient_id, patient_name, accession_no)
 
-            clean_pname = "".join(x for x in patient_name if x.isalnum() or x in " -_")
             pdf_output_path = os.path.join(
-                self.config["receive_folder"],
-                f"{clean_pname}'s medical report.pdf"
+                self.get_pdf_folder(),
+                self.build_pdf_filename(patient_name, study_date)
             )
             self.generate_pdf_report_from_dicom(dcm_path_for_index, pdf_output_path)
 
@@ -1305,7 +1638,6 @@ class RadXrReceiverApp:
                 if self.decrement_telegram_credits():
                     tg_ok = self.send_to_all_telegram(pdf_output_path, patient_id, patient_name, accession_no)
                     if not tg_ok:
-                        # refund on failure
                         self.add_telegram_credits(1)
                         self.log_message("⚠️ Telegram send failed, credit refunded.")
                 else:
@@ -1322,7 +1654,6 @@ class RadXrReceiverApp:
                     self.log_message("⚠️ Insufficient WhatsApp credits. Skipping WhatsApp send.")
                     wa_ok = False
 
-            # Determine status
             if tg_ok and wa_ok:
                 status = "Sent & Archived ✅"
             elif tg_ok and not wa_ok:
@@ -1334,7 +1665,6 @@ class RadXrReceiverApp:
 
             self.root.after(0, lambda: self.upsert_grid_record(file_key, patient_id, patient_name, accession_no, status))
 
-            # Cleanup: delete Inbox file only if Telegram succeeded
             if tg_ok:
                 if not is_manual_import and os.path.exists(dcm_path) and os.path.normpath(dcm_path) != os.path.normpath(archive_dest):
                     try:
@@ -1343,19 +1673,178 @@ class RadXrReceiverApp:
                     except Exception as e:
                         self.log_message(f"⚠️ Could not delete Inbox file: {e}")
 
-            # Delete PDF if both succeeded, otherwise keep for resend
-            if tg_ok and wa_ok and os.path.exists(pdf_output_path):
-                try:
-                    os.remove(pdf_output_path)
-                    self.log_message(f"🗑️ PDF deleted: {os.path.basename(pdf_output_path)}")
-                except Exception as e:
-                    self.log_message(f"⚠️ Could not delete PDF: {e}")
+                self.save_pdf_index(patient_id, patient_name, accession_no, pdf_output_path)
+                self.log_message(f"💾 PDF saved: {os.path.basename(pdf_output_path)}")
 
         except Exception as e:
             self.root.after(0, lambda: messagebox.showerror("Pipeline Error", f"Error: {str(e)}"))
             self.log_message(f"❌ Pipeline error: {e}")
             if 'file_key' in locals():
                 self.root.after(0, lambda: self.upsert_grid_record(file_key, "N/A", "N/A", "UNKNOWN", "Failed ❌"))
+
+    # ---------- Patient Batching (combine multiple images of same patient into ONE PDF) ----------
+    def queue_file_for_patient_batch(self, dcm_path, is_manual_import=False):
+        try:
+            ds = pydicom.dcmread(dcm_path, stop_before_pixels=True)
+            patient_id = str(ds.get("PatientID", "N/A")).strip()
+            patient_name = str(ds.get("PatientName", "N/A")).strip()
+            accession_no = str(ds.get("AccessionNumber", "UNKNOWN")).strip()
+        except Exception as e:
+            self.log_message(f"❌ Could not read DICOM header, skipping: {e}")
+            return
+
+        archive_dir = self.config["archive_folder"]
+        os.makedirs(archive_dir, exist_ok=True)
+        archive_dest = os.path.join(archive_dir, os.path.basename(dcm_path))
+        try:
+            if os.path.normpath(dcm_path) != os.path.normpath(archive_dest):
+                shutil.copy2(dcm_path, archive_dest)
+                dcm_path_for_index = archive_dest
+            else:
+                dcm_path_for_index = dcm_path
+            self.index_dicom_file(dcm_path_for_index, patient_id, patient_name, accession_no)
+        except Exception as e:
+            self.log_message(f"❌ Archiving/indexing error: {e}")
+            dcm_path_for_index = dcm_path
+
+        self.root.after(0, lambda: self.upsert_grid_record(
+            dcm_path_for_index, patient_id, patient_name, accession_no, "📥 Received - Queued"))
+
+        if patient_id and patient_id != "N/A":
+            batch_key = f"PID::{patient_id}"
+        elif patient_name and patient_name != "N/A":
+            batch_key = f"NAME::{patient_name.lower()}"
+        else:
+            batch_key = f"UNKNOWN::{time.time_ns()}"
+
+        try:
+            wait_seconds = float(self.config.get("batch_wait_seconds", DEFAULT_BATCH_WAIT_SECONDS) or DEFAULT_BATCH_WAIT_SECONDS)
+        except Exception:
+            wait_seconds = DEFAULT_BATCH_WAIT_SECONDS
+
+        with self.batch_lock:
+            entry = self.pending_batches.get(batch_key)
+            if entry:
+                entry["items"].append((dcm_path, dcm_path_for_index, is_manual_import))
+                if accession_no and accession_no != "UNKNOWN":
+                    entry["accession_no"] = accession_no
+                if entry.get("timer"):
+                    entry["timer"].cancel()
+            else:
+                entry = {
+                    "patient_id": patient_id,
+                    "patient_name": patient_name,
+                    "accession_no": accession_no,
+                    "items": [(dcm_path, dcm_path_for_index, is_manual_import)],
+                }
+                self.pending_batches[batch_key] = entry
+
+            timer = threading.Timer(wait_seconds, self._flush_patient_batch, args=(batch_key,))
+            timer.daemon = True
+            entry["timer"] = timer
+            timer.start()
+
+        self.log_message(
+            f"🗂️ Queued image for {patient_name} (ID: {patient_id}) — "
+            f"{len(entry['items'])} image(s) so far, waiting {wait_seconds:.0f}s for more..."
+        )
+
+    def _flush_patient_batch(self, batch_key):
+        with self.batch_lock:
+            entry = self.pending_batches.pop(batch_key, None)
+        if not entry:
+            return
+        threading.Thread(
+            target=self.process_patient_batch,
+            args=(entry["items"], entry["patient_id"], entry["patient_name"], entry["accession_no"]),
+            daemon=True
+        ).start()
+
+    def process_patient_batch(self, items, patient_id, patient_name, accession_no):
+        pdf_output_path = ""
+        archived_paths = [archived for (_orig, archived, _man) in items]
+        try:
+            self.log_message(
+                f"🧩 Combining {len(archived_paths)} image(s) for {patient_name} "
+                f"(ID: {patient_id}) into one PDF..."
+            )
+
+            # Get study date from the first file (should be consistent)
+            study_date = ""
+            try:
+                first_ds = pydicom.dcmread(archived_paths[0], stop_before_pixels=True)
+                study_date = str(first_ds.get("StudyDate", "")).strip()
+            except Exception:
+                pass
+
+            for archived in archived_paths:
+                self.root.after(0, lambda f=archived: self.upsert_grid_record(
+                    f, patient_id, patient_name, accession_no, "⏳ Processing (Batch)"))
+
+            pdf_output_path = os.path.join(
+                self.get_pdf_folder(),
+                self.build_pdf_filename(patient_name, study_date)
+            )
+            self.generate_pdf_report_from_dicom(archived_paths, pdf_output_path)
+
+            for archived in archived_paths:
+                self.root.after(0, lambda f=archived: self.upsert_grid_record(
+                    f, patient_id, patient_name, accession_no, "📤 Sending"))
+
+            # ---- Telegram ----
+            tg_ok = False
+            tg_credits = self.get_telegram_credits()
+            if tg_credits > 0:
+                if self.decrement_telegram_credits():
+                    tg_ok = self.send_to_all_telegram(pdf_output_path, patient_id, patient_name, accession_no)
+                    if not tg_ok:
+                        self.add_telegram_credits(1)
+                        self.log_message("⚠️ Telegram send failed, credit refunded.")
+                else:
+                    self.log_message("⚠️ Failed to decrement Telegram credit.")
+            else:
+                self.log_message("⚠️ Insufficient Telegram credits. Skipping Telegram send.")
+
+            # ---- WhatsApp ----
+            wa_ok = True
+            if self.config["whatsapp_api_key"] and self.config["whatsapp_phone_number_id"]:
+                if self.get_whatsapp_credits() > 0:
+                    wa_ok = self.dispatch_to_whatsapp_business(pdf_output_path, patient_id, patient_name, accession_no)
+                else:
+                    self.log_message("⚠️ Insufficient WhatsApp credits. Skipping WhatsApp send.")
+                    wa_ok = False
+
+            if tg_ok and wa_ok:
+                status = f"Sent & Archived ✅ ({len(archived_paths)} imgs)"
+            elif tg_ok and not wa_ok:
+                status = f"Telegram ✅, WhatsApp ❌ ({len(archived_paths)} imgs)"
+            elif not tg_ok and wa_ok:
+                status = f"Telegram ❌, WhatsApp ✅ ({len(archived_paths)} imgs)"
+            else:
+                status = "Failed ❌ (No Credits)"
+
+            for archived in archived_paths:
+                self.root.after(0, lambda f=archived: self.upsert_grid_record(
+                    f, patient_id, patient_name, accession_no, status))
+
+            if tg_ok:
+                for (orig, archived, is_manual) in items:
+                    if not is_manual and os.path.exists(orig) and os.path.normpath(orig) != os.path.normpath(archived):
+                        try:
+                            os.remove(orig)
+                            self.log_message(f"🗑️ Inbox file deleted: {os.path.basename(orig)}")
+                        except Exception as e:
+                            self.log_message(f"⚠️ Could not delete Inbox file: {e}")
+
+                self.save_pdf_index(patient_id, patient_name, accession_no, pdf_output_path)
+                self.log_message(f"💾 PDF saved: {os.path.basename(pdf_output_path)}")
+
+        except Exception as e:
+            self.root.after(0, lambda: messagebox.showerror("Pipeline Error", f"Error: {str(e)}"))
+            self.log_message(f"❌ Batch pipeline error: {e}")
+            for archived in archived_paths:
+                self.root.after(0, lambda f=archived: self.upsert_grid_record(
+                    f, patient_id, patient_name, accession_no, "Failed ❌"))
 
     def upsert_grid_record(self, file_path, p_id, p_name, acc_no, status):
         if file_path in self.queue_data:
@@ -1560,7 +2049,6 @@ class RadXrReceiverApp:
                             if text.lower().startswith("/footer"):
                                 reply_to = msg.get("reply_to_message")
                                 if reply_to and "photo" in reply_to:
-                                    # photo handling - keep as before
                                     try:
                                         photos = reply_to["photo"]
                                         largest = photos[-1]
@@ -1696,6 +2184,21 @@ class RadXrReceiverApp:
                         if len(lines) >= 2:
                             query_id = lines[0]
                             query_name = lines[1].lower()
+
+                            cached_pdf = self.get_saved_pdf_for_patient(query_id, query_name)
+                            if cached_pdf:
+                                cached_path, c_id, c_name, c_acc = cached_pdf
+                                try:
+                                    self._send_message(base_url, chat_id, "📄 Found existing report. Sending...")
+                                    self.dispatch_to_telegram(cached_path, c_id, c_name, c_acc, chat_id)
+                                    self.root.after(0, lambda pi=c_id, pn=c_name, ac=c_acc, fp=cached_path:
+                                                    self.upsert_grid_record(fp, pi, pn, ac, "📤 Sent via Bot (Cached)"))
+                                    self._send_message(base_url, chat_id, "✅ Report sent successfully!")
+                                except Exception as ex:
+                                    self._send_message(base_url, chat_id, f"❌ Error sending cached report: {str(ex)}")
+                                    self.log_message(f"❌ Bot error (cached PDF): {ex}")
+                                continue
+
                             matched_entries = self.get_patient_files_from_db(query_id, query_name)
 
                             if matched_entries:
@@ -1708,34 +2211,39 @@ class RadXrReceiverApp:
                                         self._send_message(base_url, chat_id,
                                             f"⚠️ File for Patient `{p_name}` (ID: {p_id}) is **deleted or not available**.")
                                 if not valid_entries:
-                                    self._send_message(base_url, chat_id, "❌ No available files found for this patient.")
+                                    self._send_message(base_url, chat_id, "❌ Report Not Available")
                                     continue
 
                                 self._send_message(base_url, chat_id,
-                                    f"🔍 Found **{len(valid_entries)}** available DICOM file(s). Generating PDF(s)...")
-                                for idx, entry in enumerate(valid_entries, 1):
-                                    file_path, p_id, p_name, acc_no = entry
+                                    f"🔍 Found **{len(valid_entries)}** available DICOM file(s). Generating combined PDF...")
+                                try:
+                                    file_paths = [entry[0] for entry in valid_entries]
+                                    _fp0, p_id, p_name, acc_no = valid_entries[0]
+                                    # Get study date from first file
+                                    study_date = ""
                                     try:
-                                        self._send_message(base_url, chat_id, f"📄 Generating PDF {idx} / {len(valid_entries)}...")
-                                        clean_pname = "".join(x for x in p_name if x.isalnum() or x in " -_")
-                                        bot_pdf_path = os.path.join(
-                                            self.config["receive_folder"],
-                                            f"{clean_pname}'s medical report_{idx}_{int(time.time())}.pdf"
-                                        )
-                                        self.generate_pdf_report_from_dicom(file_path, bot_pdf_path)
-                                        self.dispatch_to_telegram(bot_pdf_path, p_id, p_name, acc_no, chat_id)
-                                        self.root.after(0, lambda pi=p_id, pn=p_name, ac=acc_no, fp=file_path:
-                                                        self.upsert_grid_record(fp, pi, pn, ac, "📤 Sent via Bot (Multi)"))
-                                        if os.path.exists(bot_pdf_path):
-                                            os.remove(bot_pdf_path)
-                                    except Exception as ex:
-                                        self._send_message(base_url, chat_id, f"❌ Error processing file {idx}: {str(ex)}")
-                                        self.log_message(f"❌ Bot error: {ex}")
-                                    time.sleep(0.5)
-                                self._send_message(base_url, chat_id, f"✅ All {len(valid_entries)} PDF(s) sent successfully!")
+                                        first_ds = pydicom.dcmread(file_paths[0], stop_before_pixels=True)
+                                        study_date = str(first_ds.get("StudyDate", "")).strip()
+                                    except Exception:
+                                        pass
+                                    bot_pdf_path = os.path.join(
+                                        self.get_pdf_folder(),
+                                        self.build_pdf_filename(p_name, study_date)
+                                    )
+                                    self.generate_pdf_report_from_dicom(file_paths, bot_pdf_path)
+                                    self.dispatch_to_telegram(bot_pdf_path, p_id, p_name, acc_no, chat_id)
+                                    for entry in valid_entries:
+                                        file_path, e_id, e_name, e_acc = entry
+                                        self.root.after(0, lambda pi=e_id, pn=e_name, ac=e_acc, fp=file_path:
+                                                        self.upsert_grid_record(fp, pi, pn, ac, "📤 Sent via Bot (Combined)"))
+                                    self.save_pdf_index(p_id, p_name, acc_no, bot_pdf_path)
+                                    self._send_message(base_url, chat_id,
+                                        f"✅ Combined PDF with {len(valid_entries)} image(s) sent successfully!")
+                                except Exception as ex:
+                                    self._send_message(base_url, chat_id, f"❌ Error generating combined PDF: {str(ex)}")
+                                    self.log_message(f"❌ Bot error: {ex}")
                             else:
-                                self._send_message(base_url, chat_id,
-                                    f"❌ No records found for Patient ID: `{query_id}` and Name: `{query_name}`.")
+                                self._send_message(base_url, chat_id, "❌ Report Not Available")
             except Exception as e:
                 self.log_message(f"Bot polling error: {e}")
             time.sleep(1)

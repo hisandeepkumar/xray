@@ -1945,7 +1945,7 @@ class RadXrReceiverApp:
         # Retry with exponential backoff
         max_attempts = 5
         base_delay = 1  # seconds
-        timeout = 60  # increased upload timeout
+        timeout = 300  # increased upload timeout
 
         for attempt in range(1, max_attempts + 1):
             try:

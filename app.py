@@ -15,6 +15,7 @@ from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 import requests
 import gc
+import re
 
 from pynetdicom import AE, evt, sop_class
 from pynetdicom.presentation import AllStoragePresentationContexts
@@ -162,6 +163,9 @@ class RadXrReceiverApp:
 
         self.pending_batches = {}
         self.batch_lock = threading.Lock()
+        # Global processing lock to ensure sequential processing
+        self.processing_lock = threading.Lock()
+        
         self.lbl_index_progress_monitor = None
         self.lbl_index_progress_config = None
         self.log_widget = None
@@ -344,6 +348,14 @@ class RadXrReceiverApp:
                     ) from second_err
                 raise RuntimeError(f"Could not decode pixel data: {second_err}") from second_err
 
+    # ---------- Helper to normalize strings (remove extra spaces) ----------
+    def _normalize_string(self, s):
+        if not s:
+            return ""
+        s = str(s).strip()
+        # Replace multiple spaces with a single space
+        return re.sub(r'\s+', ' ', s)
+
     # ---------- Database ----------
     def init_db(self):
         os.makedirs(os.path.dirname(DATABASE_PATH), exist_ok=True)
@@ -405,8 +417,8 @@ class RadXrReceiverApp:
         conn.close()
 
     def compute_patient_key(self, patient_id, patient_name):
-        patient_id = (patient_id or "").strip()
-        patient_name = (patient_name or "").strip()
+        patient_id = self._normalize_string(patient_id)
+        patient_name = self._normalize_string(patient_name)
         if patient_id and patient_id != "N/A":
             return f"PID::{patient_id}"
         elif patient_name and patient_name != "N/A":
@@ -415,6 +427,9 @@ class RadXrReceiverApp:
             return None
 
     def save_pdf_index(self, patient_id, patient_name, accession_no, pdf_path):
+        patient_id = self._normalize_string(patient_id)
+        patient_name = self._normalize_string(patient_name)
+        accession_no = self._normalize_string(accession_no)
         key = self.compute_patient_key(patient_id, patient_name)
         if not key:
             return
@@ -432,8 +447,8 @@ class RadXrReceiverApp:
         self.init_pdf_index_table()
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
-        q_id_clean = (q_id or "").strip()
-        q_name_clean = (q_name or "").strip().lower()
+        q_id_clean = self._normalize_string(q_id)
+        q_name_clean = self._normalize_string(q_name).lower()
         name_prefix = q_name_clean[:4] if len(q_name_clean) >= 4 else q_name_clean
         c.execute("""
             SELECT pdf_path, patient_id, patient_name, accession FROM pdf_index
@@ -468,15 +483,17 @@ class RadXrReceiverApp:
         return pdf_dir
 
     def build_pdf_filename(self, patient_name, study_date):
-        clean_name = "".join(x for x in (patient_name or "") if x.isalnum() or x in " -_").strip()
-        if not clean_name:
-            clean_name = "Unknown"
+        patient_name = self._normalize_string(patient_name)
+        if not patient_name:
+            patient_name = "Unknown"
         if study_date and len(study_date) == 8 and study_date.isdigit():
             formatted_date = f"{study_date[6:8]}{study_date[4:6]}{study_date[0:4]}"
         else:
             today = time.strftime("%Y%m%d")
             formatted_date = f"{today[6:8]}{today[4:6]}{today[0:4]}"
-        return f"{clean_name} {formatted_date} medical report.pdf"
+        # Clean filename: replace spaces with underscores for safety, but we'll keep spaces as allowed
+        safe_name = "".join(c for c in patient_name if c.isalnum() or c in " -_")
+        return f"{safe_name} {formatted_date} medical report.pdf"
 
     # ---------- Credits ----------
     def get_whatsapp_credits(self):
@@ -635,9 +652,9 @@ class RadXrReceiverApp:
                         self.root.after(0, self.update_index_progress, processed, total)
                         continue
                 ds = pydicom.dcmread(full_path, stop_before_pixels=True)
-                accession = str(ds.get("AccessionNumber", "UNKNOWN")).strip()
-                patient_id = str(ds.get("PatientID", "N/A")).strip()
-                patient_name = str(ds.get("PatientName", "N/A")).strip()
+                accession = self._normalize_string(ds.get("AccessionNumber", "UNKNOWN"))
+                patient_id = self._normalize_string(ds.get("PatientID", "N/A"))
+                patient_name = self._normalize_string(ds.get("PatientName", "N/A"))
                 c.execute("INSERT OR IGNORE INTO dicom_index (file_path, accession, patient_id, patient_name, created_at) VALUES (?,?,?,?,?)",
                           (full_path, accession, patient_id, patient_name, int(os.path.getctime(full_path))))
             except Exception as e:
@@ -664,6 +681,9 @@ class RadXrReceiverApp:
     def index_dicom_file(self, dcm_path, patient_id, patient_name, accession_no):
         if not os.path.exists(dcm_path):
             return
+        patient_id = self._normalize_string(patient_id)
+        patient_name = self._normalize_string(patient_name)
+        accession_no = self._normalize_string(accession_no)
         self.init_db()
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
@@ -684,12 +704,14 @@ class RadXrReceiverApp:
         self.init_db()
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
-        name_prefix = q_name[:4].lower() if len(q_name) >= 4 else q_name.lower()
+        q_id_clean = self._normalize_string(q_id)
+        q_name_clean = self._normalize_string(q_name).lower()
+        name_prefix = q_name_clean[:4] if len(q_name_clean) >= 4 else q_name_clean
         c.execute("""
             SELECT file_path, patient_id, patient_name, accession
             FROM dicom_index
             WHERE patient_id = ? AND LOWER(patient_name) LIKE ?
-        """, (q_id.strip(), f"{name_prefix}%"))
+        """, (q_id_clean, f"{name_prefix}%"))
         results = c.fetchall()
         conn.close()
         return results
@@ -724,9 +746,9 @@ class RadXrReceiverApp:
             if not os.path.exists(file_path):
                 return
             ds = pydicom.dcmread(file_path, stop_before_pixels=True)
-            patient_id = str(ds.get("PatientID", "N/A")).strip()
-            patient_name = str(ds.get("PatientName", "N/A")).strip()
-            accession_no = str(ds.get("AccessionNumber", "UNKNOWN")).strip()
+            patient_id = self._normalize_string(ds.get("PatientID", "N/A"))
+            patient_name = self._normalize_string(ds.get("PatientName", "N/A"))
+            accession_no = self._normalize_string(ds.get("AccessionNumber", "UNKNOWN"))
             self.index_dicom_file(file_path, patient_id, patient_name, accession_no)
             self.root.after(0, lambda: self.upsert_grid_record(file_path, patient_id, patient_name, accession_no, "Archived (External) 📁"))
             self.log_message(f"✅ External DICOM indexed: {os.path.basename(file_path)}")
@@ -980,6 +1002,7 @@ class RadXrReceiverApp:
                         continue
                 if file_path and os.path.exists(file_path):
                     self.tree.item(item, values=(row_values[0], row_values[1], row_values[2], file_name, "⚡ Resending..."))
+                    # Acquire processing lock to ensure sequential resend
                     th = threading.Thread(target=self.resend_single_file, args=(file_path, item), daemon=True)
                     th.start()
                 else:
@@ -987,73 +1010,74 @@ class RadXrReceiverApp:
             messagebox.showinfo("Resend", f"Started resending {count} failed image(s). Check console.")
 
     def resend_single_file(self, file_path, item_id):
-        row_values = self.tree.item(item_id, 'values')
-        status_str = row_values[4]
-        tg_enabled = bool(self.TELEGRAM_BOT_TOKEN)
-        wa_enabled = bool(self.config.get("whatsapp_api_key") and self.config.get("whatsapp_phone_number_id"))
-        tg_ok = "Telegram ✅" in status_str
-        wa_ok = "WhatsApp ✅" in status_str
-        if not tg_enabled:
-            tg_ok = True
-        if not wa_enabled:
-            wa_ok = True
+        with self.processing_lock:  # Ensure sequential processing
+            row_values = self.tree.item(item_id, 'values')
+            status_str = row_values[4]
+            tg_enabled = bool(self.TELEGRAM_BOT_TOKEN)
+            wa_enabled = bool(self.config.get("whatsapp_api_key") and self.config.get("whatsapp_phone_number_id"))
+            tg_ok = "Telegram ✅" in status_str
+            wa_ok = "WhatsApp ✅" in status_str
+            if not tg_enabled:
+                tg_ok = True
+            if not wa_enabled:
+                wa_ok = True
 
-        try:
-            ds = pydicom.dcmread(file_path)
-            patient_id = str(ds.get("PatientID", "N/A")).strip()
-            patient_name = str(ds.get("PatientName", "N/A")).strip()
-            accession_no = str(ds.get("AccessionNumber", "UNKNOWN")).strip()
-            study_date = str(ds.get("StudyDate", "")).strip()
+            try:
+                ds = pydicom.dcmread(file_path)
+                patient_id = self._normalize_string(ds.get("PatientID", "N/A"))
+                patient_name = self._normalize_string(ds.get("PatientName", "N/A"))
+                accession_no = self._normalize_string(ds.get("AccessionNumber", "UNKNOWN"))
+                study_date = self._normalize_string(ds.get("StudyDate", ""))
 
-            pdf_folder = self.get_pdf_folder()
-            pdf_path = os.path.join(pdf_folder, self.build_pdf_filename(patient_name, study_date))
-            self.generate_pdf_report_from_dicom([file_path], pdf_path)
+                pdf_folder = self.get_pdf_folder()
+                pdf_path = os.path.join(pdf_folder, self.build_pdf_filename(patient_name, study_date))
+                self.generate_pdf_report_from_dicom([file_path], pdf_path)
 
-            new_tg_ok = tg_ok
-            new_wa_ok = wa_ok
-            if not tg_ok and tg_enabled:
-                if self.decrement_telegram_credits():
-                    if self.send_to_all_telegram(pdf_path, patient_id, patient_name, accession_no):
-                        new_tg_ok = True
+                new_tg_ok = tg_ok
+                new_wa_ok = wa_ok
+                if not tg_ok and tg_enabled:
+                    if self.decrement_telegram_credits():
+                        if self.send_to_all_telegram(pdf_path, patient_id, patient_name, accession_no):
+                            new_tg_ok = True
+                        else:
+                            self.add_telegram_credits(1)
                     else:
-                        self.add_telegram_credits(1)
-                else:
-                    self.log_message("⚠️ No Telegram credits for resend.")
-            if not wa_ok and wa_enabled:
-                if self.decrement_whatsapp_credits():
-                    if self.dispatch_to_whatsapp_business(pdf_path, patient_id, patient_name, accession_no):
-                        new_wa_ok = True
+                        self.log_message("⚠️ No Telegram credits for resend.")
+                if not wa_ok and wa_enabled:
+                    if self.decrement_whatsapp_credits():
+                        if self.dispatch_to_whatsapp_business(pdf_path, patient_id, patient_name, accession_no):
+                            new_wa_ok = True
+                        else:
+                            self.add_whatsapp_credits(1)
                     else:
-                        self.add_whatsapp_credits(1)
+                        self.log_message("⚠️ No WhatsApp credits for resend.")
+
+                status_parts = []
+                if tg_enabled:
+                    status_parts.append(f"Telegram {'✅' if new_tg_ok else '❌'}")
+                if wa_enabled:
+                    status_parts.append(f"WhatsApp {'✅' if new_wa_ok else '❌'}")
+                if not status_parts:
+                    status_parts.append("No platforms configured")
+                new_status = ", ".join(status_parts)
+
+                self.root.after(0, lambda: self.tree.item(item_id, values=(patient_id, patient_name, accession_no, os.path.basename(file_path), new_status)))
+
+                if (not tg_enabled or new_tg_ok) and (not wa_enabled or new_wa_ok):
+                    try:
+                        if os.path.exists(file_path):
+                            os.remove(file_path)
+                            self.remove_from_index(file_path)
+                            self.log_message(f"🗑️ Deleted DICOM after successful resend: {os.path.basename(file_path)}")
+                    except Exception as e:
+                        self.log_message(f"⚠️ Could not delete DICOM: {e}")
+                    self.save_pdf_index(patient_id, patient_name, accession_no, pdf_path)
                 else:
-                    self.log_message("⚠️ No WhatsApp credits for resend.")
+                    self.log_message(f"⚠️ Resend partial success: {new_status}")
 
-            status_parts = []
-            if tg_enabled:
-                status_parts.append(f"Telegram {'✅' if new_tg_ok else '❌'}")
-            if wa_enabled:
-                status_parts.append(f"WhatsApp {'✅' if new_wa_ok else '❌'}")
-            if not status_parts:
-                status_parts.append("No platforms configured")
-            new_status = ", ".join(status_parts)
-
-            self.root.after(0, lambda: self.tree.item(item_id, values=(patient_id, patient_name, accession_no, os.path.basename(file_path), new_status)))
-
-            if (not tg_enabled or new_tg_ok) and (not wa_enabled or new_wa_ok):
-                try:
-                    if os.path.exists(file_path):
-                        os.remove(file_path)
-                        self.remove_from_index(file_path)
-                        self.log_message(f"🗑️ Deleted DICOM after successful resend: {os.path.basename(file_path)}")
-                except Exception as e:
-                    self.log_message(f"⚠️ Could not delete DICOM: {e}")
-                self.save_pdf_index(patient_id, patient_name, accession_no, pdf_path)
-            else:
-                self.log_message(f"⚠️ Resend partial success: {new_status}")
-
-        except Exception as e:
-            self.log_message(f"❌ Resend error: {e}")
-            self.root.after(0, lambda: self.tree.item(item_id, values=(row_values[0], row_values[1], row_values[2], os.path.basename(file_path), f"Error: {str(e)[:30]}")))
+            except Exception as e:
+                self.log_message(f"❌ Resend error: {e}")
+                self.root.after(0, lambda: self.tree.item(item_id, values=(row_values[0], row_values[1], row_values[2], os.path.basename(file_path), f"Error: {str(e)[:30]}")))
 
     # --- Clear Exams (delete Inbox and PDFs) ---
     def clear_exams_action(self):
@@ -1243,9 +1267,9 @@ class RadXrReceiverApp:
                     full_path = os.path.join(archive_dir, file)
                     try:
                         ds = pydicom.dcmread(full_path, stop_before_pixels=True)
-                        patient_id = str(ds.get("PatientID", "N/A")).strip()
-                        patient_name = str(ds.get("PatientName", "N/A")).strip()
-                        accession_no = str(ds.get("AccessionNumber", "NO_ACC")).strip()
+                        patient_id = self._normalize_string(ds.get("PatientID", "N/A"))
+                        patient_name = self._normalize_string(ds.get("PatientName", "N/A"))
+                        accession_no = self._normalize_string(ds.get("AccessionNumber", "NO_ACC"))
                         self.root.after(0, lambda p=patient_id, n=patient_name, a=accession_no, f=file:
                                         self.upsert_grid_record(full_path, p, n, a, "Archived (External) 📁"))
                     except Exception:
@@ -1443,8 +1467,8 @@ class RadXrReceiverApp:
         try:
             ds = event.dataset
             ds.file_meta = event.file_meta
-            accession_number = str(ds.get("AccessionNumber", "UNKNOWN_ACC")).strip()
-            sop_instance_uid = str(ds.get("SOPInstanceUID", "")).strip()
+            accession_number = self._normalize_string(ds.get("AccessionNumber", "UNKNOWN_ACC"))
+            sop_instance_uid = self._normalize_string(ds.get("SOPInstanceUID", ""))
             unique_suffix = sop_instance_uid[-12:] if sop_instance_uid else f"{int(time.time() * 1000)}"
             filename = f"RADXR_{accession_number}_{unique_suffix}.dcm"
             filepath = os.path.join(self.config["receive_folder"], filename)
@@ -1474,10 +1498,10 @@ class RadXrReceiverApp:
 
         # Read first file for metadata
         first_ds = pydicom.dcmread(dcm_paths[0], stop_before_pixels=True)
-        patient_id = str(first_ds.get("PatientID", "N/A")).strip()
-        patient_name = str(first_ds.get("PatientName", "N/A")).strip()
-        accession_no = str(first_ds.get("AccessionNumber", "NO_ACC")).strip()
-        study_date = str(first_ds.get("StudyDate", "")).strip()
+        patient_id = self._normalize_string(first_ds.get("PatientID", "N/A"))
+        patient_name = self._normalize_string(first_ds.get("PatientName", "N/A"))
+        accession_no = self._normalize_string(first_ds.get("AccessionNumber", "NO_ACC"))
+        study_date = self._normalize_string(first_ds.get("StudyDate", ""))
 
         # Create canvas
         c = canvas.Canvas(output_pdf_path, pagesize=letter)
@@ -1490,9 +1514,9 @@ class RadXrReceiverApp:
         metadata = [
             ("Patient Name", patient_name),
             ("Patient ID", patient_id),
-            ("Patient Sex", str(first_ds.get("PatientSex", "N/A"))),
+            ("Patient Sex", self._normalize_string(first_ds.get("PatientSex", "N/A"))),
             ("Study Date", study_date if study_date else "N/A"),
-            ("Modality", str(first_ds.get("Modality", "N/A"))),
+            ("Modality", self._normalize_string(first_ds.get("Modality", "N/A"))),
             ("Accession No", accession_no)
         ]
         available_metadata = [(k, v) for k, v in metadata if v.strip() and v != "N/A"]
@@ -1568,6 +1592,9 @@ class RadXrReceiverApp:
                 if image.mode != "RGB":
                     image = image.convert("RGB")
 
+                # Get image dimensions BEFORE closing
+                img_w, img_h = image.size
+
                 # Save temporary image (high quality JPEG)
                 temp_img_path = f"workflow_temp_frame_{page_counter}_{int(time.time())}.jpg"
                 image.save(temp_img_path, quality=95)
@@ -1620,7 +1647,6 @@ class RadXrReceiverApp:
                 # ---- Draw Image ----
                 avail_height = main_image_top - main_image_bottom
                 avail_width = width - 2 * margin_lr
-                img_w, img_h = image.size  # image already closed, but we have saved the file
                 scale = 1.0
                 if img_w > avail_width or img_h > avail_height:
                     scale = min(avail_width / img_w, avail_height / img_h)
@@ -1666,92 +1692,93 @@ class RadXrReceiverApp:
                 else:
                     self.log_message(f"⚠️ Could not delete {file_path} after {max_retries} attempts: {e}")
 
-    # ---------- Processing Pipeline (no archive copy) ----------
+    # ---------- Processing Pipeline (with sequential lock) ----------
     def autonomous_processing_pipeline(self, dcm_path, is_manual_import=False):
-        pdf_output_path = ""
-        try:
-            ds = pydicom.dcmread(dcm_path)
-            patient_id = str(ds.get("PatientID", "N/A")).strip()
-            patient_name = str(ds.get("PatientName", "N/A")).strip()
-            accession_no = str(ds.get("AccessionNumber", "UNKNOWN")).strip()
-            study_date = str(ds.get("StudyDate", "")).strip()
+        with self.processing_lock:  # Ensure sequential processing
+            pdf_output_path = ""
+            try:
+                ds = pydicom.dcmread(dcm_path)
+                patient_id = self._normalize_string(ds.get("PatientID", "N/A"))
+                patient_name = self._normalize_string(ds.get("PatientName", "N/A"))
+                accession_no = self._normalize_string(ds.get("AccessionNumber", "UNKNOWN"))
+                study_date = self._normalize_string(ds.get("StudyDate", ""))
 
-            self.index_dicom_file(dcm_path, patient_id, patient_name, accession_no)
+                self.index_dicom_file(dcm_path, patient_id, patient_name, accession_no)
 
-            pdf_output_path = os.path.join(
-                self.get_pdf_folder(),
-                self.build_pdf_filename(patient_name, study_date)
-            )
-            self.generate_pdf_report_from_dicom([dcm_path], pdf_output_path)
+                pdf_output_path = os.path.join(
+                    self.get_pdf_folder(),
+                    self.build_pdf_filename(patient_name, study_date)
+                )
+                self.generate_pdf_report_from_dicom([dcm_path], pdf_output_path)
 
-            file_key = dcm_path
-            self.root.after(0, lambda: self.upsert_grid_record(file_key, patient_id, patient_name, accession_no, "⏳ Processing"))
-            self.root.after(0, lambda: self.upsert_grid_record(file_key, patient_id, patient_name, accession_no, "📤 Sending"))
+                file_key = dcm_path
+                self.root.after(0, lambda: self.upsert_grid_record(file_key, patient_id, patient_name, accession_no, "⏳ Processing"))
+                self.root.after(0, lambda: self.upsert_grid_record(file_key, patient_id, patient_name, accession_no, "📤 Sending"))
 
-            tg_enabled = bool(self.TELEGRAM_BOT_TOKEN)
-            wa_enabled = bool(self.config.get("whatsapp_api_key") and self.config.get("whatsapp_phone_number_id"))
+                tg_enabled = bool(self.TELEGRAM_BOT_TOKEN)
+                wa_enabled = bool(self.config.get("whatsapp_api_key") and self.config.get("whatsapp_phone_number_id"))
 
-            tg_ok = False
-            wa_ok = False
+                tg_ok = False
+                wa_ok = False
 
-            if tg_enabled:
-                if self.decrement_telegram_credits():
-                    tg_ok = self.send_to_all_telegram(pdf_output_path, patient_id, patient_name, accession_no)
-                    if not tg_ok:
-                        self.add_telegram_credits(1)
-                        self.log_message("⚠️ Telegram send failed, credit refunded.")
+                if tg_enabled:
+                    if self.decrement_telegram_credits():
+                        tg_ok = self.send_to_all_telegram(pdf_output_path, patient_id, patient_name, accession_no)
+                        if not tg_ok:
+                            self.add_telegram_credits(1)
+                            self.log_message("⚠️ Telegram send failed, credit refunded.")
+                    else:
+                        self.log_message("⚠️ Insufficient Telegram credits.")
+
+                if wa_enabled:
+                    if self.decrement_whatsapp_credits():
+                        wa_ok = self.dispatch_to_whatsapp_business(pdf_output_path, patient_id, patient_name, accession_no)
+                        if not wa_ok:
+                            self.add_whatsapp_credits(1)
+                            self.log_message("⚠️ WhatsApp send failed, credit refunded.")
+                    else:
+                        self.log_message("⚠️ Insufficient WhatsApp credits.")
+
+                status_parts = []
+                if tg_enabled:
+                    status_parts.append(f"Telegram {'✅' if tg_ok else '❌'}")
+                if wa_enabled:
+                    status_parts.append(f"WhatsApp {'✅' if wa_ok else '❌'}")
+                if not status_parts:
+                    status_parts.append("No platforms configured")
+                status_str = ", ".join(status_parts)
+
+                self.root.after(0, lambda: self.upsert_grid_record(file_key, patient_id, patient_name, accession_no, status_str))
+
+                all_ok = (not tg_enabled or tg_ok) and (not wa_enabled or wa_ok)
+                if all_ok:
+                    # Save PDF index before deleting DICOM
+                    self.save_pdf_index(patient_id, patient_name, accession_no, pdf_output_path)
+                    self.log_message(f"💾 PDF saved and indexed: {os.path.basename(pdf_output_path)}")
+                    # Now safe to delete DICOM
+                    try:
+                        if os.path.exists(dcm_path):
+                            os.remove(dcm_path)
+                            self.remove_from_index(dcm_path)
+                            self.log_message(f"🗑️ Deleted DICOM after successful send: {os.path.basename(dcm_path)}")
+                    except Exception as e:
+                        self.log_message(f"⚠️ Could not delete DICOM: {e}")
                 else:
-                    self.log_message("⚠️ Insufficient Telegram credits.")
+                    self.log_message(f"⚠️ Not all platforms succeeded, DICOM kept: {os.path.basename(dcm_path)}")
 
-            if wa_enabled:
-                if self.decrement_whatsapp_credits():
-                    wa_ok = self.dispatch_to_whatsapp_business(pdf_output_path, patient_id, patient_name, accession_no)
-                    if not wa_ok:
-                        self.add_whatsapp_credits(1)
-                        self.log_message("⚠️ WhatsApp send failed, credit refunded.")
-                else:
-                    self.log_message("⚠️ Insufficient WhatsApp credits.")
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("Pipeline Error", f"Error: {str(e)}"))
+                self.log_message(f"❌ Pipeline error: {e}")
+                if 'file_key' in locals():
+                    self.root.after(0, lambda: self.upsert_grid_record(file_key, "N/A", "N/A", "UNKNOWN", f"Error: {str(e)[:30]}"))
 
-            status_parts = []
-            if tg_enabled:
-                status_parts.append(f"Telegram {'✅' if tg_ok else '❌'}")
-            if wa_enabled:
-                status_parts.append(f"WhatsApp {'✅' if wa_ok else '❌'}")
-            if not status_parts:
-                status_parts.append("No platforms configured")
-            status_str = ", ".join(status_parts)
-
-            self.root.after(0, lambda: self.upsert_grid_record(file_key, patient_id, patient_name, accession_no, status_str))
-
-            all_ok = (not tg_enabled or tg_ok) and (not wa_enabled or wa_ok)
-            if all_ok:
-                # Save PDF index before deleting DICOM
-                self.save_pdf_index(patient_id, patient_name, accession_no, pdf_output_path)
-                self.log_message(f"💾 PDF saved and indexed: {os.path.basename(pdf_output_path)}")
-                # Now safe to delete DICOM
-                try:
-                    if os.path.exists(dcm_path):
-                        os.remove(dcm_path)
-                        self.remove_from_index(dcm_path)
-                        self.log_message(f"🗑️ Deleted DICOM after successful send: {os.path.basename(dcm_path)}")
-                except Exception as e:
-                    self.log_message(f"⚠️ Could not delete DICOM: {e}")
-            else:
-                self.log_message(f"⚠️ Not all platforms succeeded, DICOM kept: {os.path.basename(dcm_path)}")
-
-        except Exception as e:
-            self.root.after(0, lambda: messagebox.showerror("Pipeline Error", f"Error: {str(e)}"))
-            self.log_message(f"❌ Pipeline error: {e}")
-            if 'file_key' in locals():
-                self.root.after(0, lambda: self.upsert_grid_record(file_key, "N/A", "N/A", "UNKNOWN", f"Error: {str(e)[:30]}"))
-
-    # ---------- Patient Batching (no archive copy) ----------
+    # ---------- Patient Batching (with sequential lock) ----------
     def queue_file_for_patient_batch(self, dcm_path, is_manual_import=False):
         try:
             ds = pydicom.dcmread(dcm_path, stop_before_pixels=True)
-            patient_id = str(ds.get("PatientID", "N/A")).strip()
-            patient_name = str(ds.get("PatientName", "N/A")).strip()
-            accession_no = str(ds.get("AccessionNumber", "UNKNOWN")).strip()
+            patient_id = self._normalize_string(ds.get("PatientID", "N/A"))
+            patient_name = self._normalize_string(ds.get("PatientName", "N/A"))
+            accession_no = self._normalize_string(ds.get("AccessionNumber", "UNKNOWN"))
         except Exception as e:
             self.log_message(f"❌ Could not read DICOM header, skipping: {e}")
             return
@@ -1812,94 +1839,95 @@ class RadXrReceiverApp:
         ).start()
 
     def process_patient_batch(self, items, patient_id, patient_name, accession_no):
-        pdf_output_path = ""
-        dcm_paths = [dcm for dcm, _ in items]
-        try:
-            self.log_message(
-                f"🧩 Combining {len(dcm_paths)} image(s) for {patient_name} "
-                f"(ID: {patient_id}) into one PDF..."
-            )
-
-            study_date = ""
+        with self.processing_lock:  # Ensure sequential processing
+            pdf_output_path = ""
+            dcm_paths = [dcm for dcm, _ in items]
             try:
-                first_ds = pydicom.dcmread(dcm_paths[0], stop_before_pixels=True)
-                study_date = str(first_ds.get("StudyDate", "")).strip()
-            except Exception:
-                pass
+                self.log_message(
+                    f"🧩 Combining {len(dcm_paths)} image(s) for {patient_name} "
+                    f"(ID: {patient_id}) into one PDF..."
+                )
 
-            for dcm in dcm_paths:
-                self.root.after(0, lambda f=dcm: self.upsert_grid_record(
-                    f, patient_id, patient_name, accession_no, "⏳ Processing (Batch)"))
+                study_date = ""
+                try:
+                    first_ds = pydicom.dcmread(dcm_paths[0], stop_before_pixels=True)
+                    study_date = self._normalize_string(first_ds.get("StudyDate", ""))
+                except Exception:
+                    pass
 
-            pdf_output_path = os.path.join(
-                self.get_pdf_folder(),
-                self.build_pdf_filename(patient_name, study_date)
-            )
-            self.generate_pdf_report_from_dicom(dcm_paths, pdf_output_path)
-
-            for dcm in dcm_paths:
-                self.root.after(0, lambda f=dcm: self.upsert_grid_record(
-                    f, patient_id, patient_name, accession_no, "📤 Sending"))
-
-            tg_enabled = bool(self.TELEGRAM_BOT_TOKEN)
-            wa_enabled = bool(self.config.get("whatsapp_api_key") and self.config.get("whatsapp_phone_number_id"))
-
-            tg_ok = False
-            wa_ok = False
-
-            if tg_enabled:
-                if self.decrement_telegram_credits():
-                    tg_ok = self.send_to_all_telegram(pdf_output_path, patient_id, patient_name, accession_no)
-                    if not tg_ok:
-                        self.add_telegram_credits(1)
-                        self.log_message("⚠️ Telegram send failed, credit refunded.")
-                else:
-                    self.log_message("⚠️ Insufficient Telegram credits.")
-
-            if wa_enabled:
-                if self.decrement_whatsapp_credits():
-                    wa_ok = self.dispatch_to_whatsapp_business(pdf_output_path, patient_id, patient_name, accession_no)
-                    if not wa_ok:
-                        self.add_whatsapp_credits(1)
-                        self.log_message("⚠️ WhatsApp send failed, credit refunded.")
-                else:
-                    self.log_message("⚠️ Insufficient WhatsApp credits.")
-
-            status_parts = []
-            if tg_enabled:
-                status_parts.append(f"Telegram {'✅' if tg_ok else '❌'}")
-            if wa_enabled:
-                status_parts.append(f"WhatsApp {'✅' if wa_ok else '❌'}")
-            if not status_parts:
-                status_parts.append("No platforms configured")
-            status_str = ", ".join(status_parts)
-
-            for dcm in dcm_paths:
-                self.root.after(0, lambda f=dcm: self.upsert_grid_record(
-                    f, patient_id, patient_name, accession_no, status_str))
-
-            all_ok = (not tg_enabled or tg_ok) and (not wa_enabled or wa_ok)
-            if all_ok:
-                # Save PDF index before deleting DICOMs
-                self.save_pdf_index(patient_id, patient_name, accession_no, pdf_output_path)
-                self.log_message(f"💾 PDF saved and indexed: {os.path.basename(pdf_output_path)}")
                 for dcm in dcm_paths:
-                    try:
-                        if os.path.exists(dcm):
-                            os.remove(dcm)
-                            self.remove_from_index(dcm)
-                            self.log_message(f"🗑️ Deleted DICOM after batch send: {os.path.basename(dcm)}")
-                    except Exception as e:
-                        self.log_message(f"⚠️ Could not delete DICOM {dcm}: {e}")
-            else:
-                self.log_message(f"⚠️ Batch not fully sent, DICOMs kept.")
+                    self.root.after(0, lambda f=dcm: self.upsert_grid_record(
+                        f, patient_id, patient_name, accession_no, "⏳ Processing (Batch)"))
 
-        except Exception as e:
-            self.root.after(0, lambda: messagebox.showerror("Pipeline Error", f"Error: {str(e)}"))
-            self.log_message(f"❌ Batch pipeline error: {e}")
-            for dcm in dcm_paths:
-                self.root.after(0, lambda f=dcm: self.upsert_grid_record(
-                    f, patient_id, patient_name, accession_no, f"Error: {str(e)[:30]}"))
+                pdf_output_path = os.path.join(
+                    self.get_pdf_folder(),
+                    self.build_pdf_filename(patient_name, study_date)
+                )
+                self.generate_pdf_report_from_dicom(dcm_paths, pdf_output_path)
+
+                for dcm in dcm_paths:
+                    self.root.after(0, lambda f=dcm: self.upsert_grid_record(
+                        f, patient_id, patient_name, accession_no, "📤 Sending"))
+
+                tg_enabled = bool(self.TELEGRAM_BOT_TOKEN)
+                wa_enabled = bool(self.config.get("whatsapp_api_key") and self.config.get("whatsapp_phone_number_id"))
+
+                tg_ok = False
+                wa_ok = False
+
+                if tg_enabled:
+                    if self.decrement_telegram_credits():
+                        tg_ok = self.send_to_all_telegram(pdf_output_path, patient_id, patient_name, accession_no)
+                        if not tg_ok:
+                            self.add_telegram_credits(1)
+                            self.log_message("⚠️ Telegram send failed, credit refunded.")
+                    else:
+                        self.log_message("⚠️ Insufficient Telegram credits.")
+
+                if wa_enabled:
+                    if self.decrement_whatsapp_credits():
+                        wa_ok = self.dispatch_to_whatsapp_business(pdf_output_path, patient_id, patient_name, accession_no)
+                        if not wa_ok:
+                            self.add_whatsapp_credits(1)
+                            self.log_message("⚠️ WhatsApp send failed, credit refunded.")
+                    else:
+                        self.log_message("⚠️ Insufficient WhatsApp credits.")
+
+                status_parts = []
+                if tg_enabled:
+                    status_parts.append(f"Telegram {'✅' if tg_ok else '❌'}")
+                if wa_enabled:
+                    status_parts.append(f"WhatsApp {'✅' if wa_ok else '❌'}")
+                if not status_parts:
+                    status_parts.append("No platforms configured")
+                status_str = ", ".join(status_parts)
+
+                for dcm in dcm_paths:
+                    self.root.after(0, lambda f=dcm: self.upsert_grid_record(
+                        f, patient_id, patient_name, accession_no, status_str))
+
+                all_ok = (not tg_enabled or tg_ok) and (not wa_enabled or wa_ok)
+                if all_ok:
+                    # Save PDF index before deleting DICOMs
+                    self.save_pdf_index(patient_id, patient_name, accession_no, pdf_output_path)
+                    self.log_message(f"💾 PDF saved and indexed: {os.path.basename(pdf_output_path)}")
+                    for dcm in dcm_paths:
+                        try:
+                            if os.path.exists(dcm):
+                                os.remove(dcm)
+                                self.remove_from_index(dcm)
+                                self.log_message(f"🗑️ Deleted DICOM after batch send: {os.path.basename(dcm)}")
+                        except Exception as e:
+                            self.log_message(f"⚠️ Could not delete DICOM {dcm}: {e}")
+                else:
+                    self.log_message(f"⚠️ Batch not fully sent, DICOMs kept.")
+
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("Pipeline Error", f"Error: {str(e)}"))
+                self.log_message(f"❌ Batch pipeline error: {e}")
+                for dcm in dcm_paths:
+                    self.root.after(0, lambda f=dcm: self.upsert_grid_record(
+                        f, patient_id, patient_name, accession_no, f"Error: {str(e)[:30]}"))
 
     # ---------- Grid update ----------
     def upsert_grid_record(self, file_path, p_id, p_name, acc_no, status):
@@ -1945,7 +1973,7 @@ class RadXrReceiverApp:
         # Retry with exponential backoff
         max_attempts = 5
         base_delay = 1  # seconds
-        timeout = 300  # increased upload timeout
+        timeout = 60  # increased upload timeout
 
         for attempt in range(1, max_attempts + 1):
             try:
@@ -2294,7 +2322,7 @@ class RadXrReceiverApp:
                                     study_date = ""
                                     try:
                                         first_ds = pydicom.dcmread(file_paths[0], stop_before_pixels=True)
-                                        study_date = str(first_ds.get("StudyDate", "")).strip()
+                                        study_date = self._normalize_string(first_ds.get("StudyDate", ""))
                                     except Exception:
                                         pass
                                     bot_pdf_path = os.path.join(

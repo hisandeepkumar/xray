@@ -23,31 +23,20 @@ from watchdog.events import FileSystemEventHandler
 # ------------------------------------------------------------
 # COMPRESSED DICOM CODEC SUPPORT
 # ------------------------------------------------------------
-# Many vendors (Canon CXDI, Fuji FCR/CR-IR, Agfa CR/DR, Carestream DRX/CR,
-# Konica CR/DR, etc.) send DICOM images compressed with JPEG Baseline,
-# JPEG Lossless, or JPEG2000 transfer syntaxes instead of raw pixel data.
-# pydicom needs an extra pixel-data handler plugin installed to decode these.
-# We import them here (if installed) so pydicom auto-registers the handlers
-# at startup; if missing, we log a clear warning instead of failing silently
-# deep inside PDF generation.
 CODEC_SUPPORT = {"pylibjpeg": False, "gdcm": False}
 try:
     import pylibjpeg  # noqa: F401
-    import pylibjpeg_libjpeg  # noqa: F401  (JPEG Baseline / Extended / Lossless)
-    import pylibjpeg_openjpeg  # noqa: F401  (JPEG2000)
+    import pylibjpeg_libjpeg  # noqa: F401
+    import pylibjpeg_openjpeg  # noqa: F401
     CODEC_SUPPORT["pylibjpeg"] = True
 except Exception:
     pass
 try:
-    import gdcm  # noqa: F401  (python-gdcm) - broad fallback decoder incl. JPEG2000/Lossless
+    import gdcm  # noqa: F401
     CODEC_SUPPORT["gdcm"] = True
 except Exception:
     pass
 
-# Full list of transfer syntaxes to ACCEPT during DICOM association negotiation.
-# Without explicitly listing the compressed ones here, a Fuji/Agfa/Carestream/
-# Konica/Canon unit trying to send JPEG- or JPEG2000-compressed images would
-# fail to even connect (association rejected), regardless of decode support.
 ACCEPTED_TRANSFER_SYNTAXES = [
     pydicom.uid.ImplicitVRLittleEndian,
     pydicom.uid.ExplicitVRLittleEndian,
@@ -66,14 +55,14 @@ ACCEPTED_TRANSFER_SYNTAXES = [
 # ------------------------------------------------------------
 
 # ------------------------------------------------------------
-# HARD‑CODED CONSTANTS (NOT stored in config file)
+# HARD‑CODED CONSTANTS
 # ------------------------------------------------------------
 MASTER_PASSWORD = "Sandeep@123"
 DEFAULT_MASTER_USER_ID = "878604830"
 DEFAULT_TELEGRAM_BOT_TOKEN = "7941135502:AAHz-KGvAAoZEhPVgfVKw3zFbkaB0_Pi5rM"
 DEFAULT_WHATSAPP_API_KEY = ""
 CONFIG_PASSWORD = "18040709"
-DEFAULT_BATCH_WAIT_SECONDS = 6  # wait time to gather more images of same patient before combining into one PDF
+DEFAULT_BATCH_WAIT_SECONDS = 6
 # ------------------------------------------------------------
 
 # --- Portable Config Directory ---
@@ -84,11 +73,13 @@ DATABASE_DIR = os.path.join(CONFIG_DIR, "DATABASE")
 DATABASE_PATH = os.path.join(DATABASE_DIR, "radxr_index.db")
 FOOTER_IMAGE_PATH = os.path.join(CONFIG_DIR, "footer_image.jpg")
 
-# Default folders
 DEFAULT_INBOX = os.path.join(CONFIG_DIR, "Inbox")
-DEFAULT_ARCHIVE = os.path.join(CONFIG_DIR, "Archive")
+DEFAULT_ARCHIVE = os.path.join(CONFIG_DIR, "Archive")  # not used by us
 
 class DicomArchiveHandler(FileSystemEventHandler):
+    # This handler is now only for external files that appear in Archive.
+    # We will still monitor Archive, but we will NOT copy anything there ourselves.
+    # When a file appears in Archive, we index it but do not move it.
     def __init__(self, app_instance):
         self.app = app_instance
 
@@ -141,8 +132,8 @@ class RadXrReceiverApp:
             "ip_address": self.get_local_ip(),
             "port": "11112",
             "receive_folder": DEFAULT_INBOX,
-            "archive_folder": DEFAULT_ARCHIVE,
-            "pdf_output_folder": "",  # NEW: custom PDF folder, empty means auto (parent of Inbox)
+            "archive_folder": DEFAULT_ARCHIVE,  # kept for reference but not used for copying
+            "pdf_output_folder": "",
             "telegram_bot_token": DEFAULT_TELEGRAM_BOT_TOKEN,
             "footer_message": "",
             "pdf_footer_text": "",
@@ -164,16 +155,13 @@ class RadXrReceiverApp:
         self.server_instance = None
         self.is_listening = False
         self.bot_running = True
-        self.queue_data = {}
+        self.queue_data = {}  # maps file_path -> row_id, and also stores status details
         self.last_update_id = 0
         
         self.observer = None
         self.monitoring_active = False
         self.indexing_in_progress = False
 
-        # Batching: group multiple images of the SAME patient (same Patient ID,
-        # or same Patient Name if ID missing) that arrive close together in time
-        # into ONE combined multi-page PDF instead of sending one PDF per image.
         self.pending_batches = {}
         self.batch_lock = threading.Lock()
         self.lbl_index_progress_monitor = None
@@ -188,7 +176,8 @@ class RadXrReceiverApp:
         self.ent_wa_phone_id = None
         self.ent_wa_sender = None
         self.auto_start_var = None
-        self.ent_pdf_folder = None  # NEW
+        self.ent_pdf_folder = None
+        self.ent_telegram_token = None  # NEW
         
         self.load_configuration()
         self.check_codec_support()
@@ -286,7 +275,7 @@ class RadXrReceiverApp:
         self.config.setdefault("port", "11112")
         self.config.setdefault("receive_folder", DEFAULT_INBOX)
         self.config.setdefault("archive_folder", DEFAULT_ARCHIVE)
-        self.config.setdefault("pdf_output_folder", "")  # NEW
+        self.config.setdefault("pdf_output_folder", "")
         self.config.setdefault("auto_start", False)
         self.config.setdefault("bot_display_name", "RAD-XR Bot")
         self.config.setdefault("batch_wait_seconds", DEFAULT_BATCH_WAIT_SECONDS)
@@ -328,32 +317,21 @@ class RadXrReceiverApp:
             self.log_widget.see(END)
             self.root.update_idletasks()
 
-    # ---------- Compressed DICOM (JPEG Baseline/Lossless/JPEG2000) Support ----------
+    # ---------- Codec support ----------
     def check_codec_support(self):
         if CODEC_SUPPORT["pylibjpeg"] or CODEC_SUPPORT["gdcm"]:
             self.log_message(
                 f"✅ Compressed DICOM codec support ready "
                 f"(pylibjpeg={'yes' if CODEC_SUPPORT['pylibjpeg'] else 'no'}, "
-                f"gdcm={'yes' if CODEC_SUPPORT['gdcm'] else 'no'}). "
-                f"Canon / Fuji / Agfa / Carestream / Konica JPEG Baseline, JPEG Lossless "
-                f"and JPEG2000 images will decode correctly."
+                f"gdcm={'yes' if CODEC_SUPPORT['gdcm'] else 'no'})."
             )
         else:
             self.log_message(
-                "⚠️ No compressed-DICOM codec plugin found (pylibjpeg / python-gdcm). "
-                "Uncompressed DICOM images will still work fine, but images sent as "
-                "JPEG Baseline, JPEG Lossless, or JPEG2000 (common with Fuji, Agfa, "
-                "Carestream, Konica CR/DR units) may fail to open. "
-                "Run: pip install pylibjpeg pylibjpeg-libjpeg pylibjpeg-openjpeg python-gdcm"
+                "⚠️ No compressed-DICOM codec plugin found. "
+                "Install: pip install pylibjpeg pylibjpeg-libjpeg pylibjpeg-openjpeg python-gdcm"
             )
 
     def _safe_load_pixel_array(self, ds):
-        """
-        Loads pixel data from a DICOM dataset, transparently handling
-        compressed transfer syntaxes (JPEG Baseline, JPEG Lossless, JPEG2000)
-        used by various CR/DR vendors. Raises a clear, actionable error if
-        the required decoder plugin isn't installed.
-        """
         try:
             return ds.pixel_array
         except Exception as first_err:
@@ -363,9 +341,8 @@ class RadXrReceiverApp:
             except Exception as second_err:
                 if not (CODEC_SUPPORT["pylibjpeg"] or CODEC_SUPPORT["gdcm"]):
                     raise RuntimeError(
-                        "This DICOM file is compressed (JPEG Baseline/Lossless/JPEG2000) "
-                        "and no decoder plugin is installed. Install with: "
-                        "pip install pylibjpeg pylibjpeg-libjpeg pylibjpeg-openjpeg python-gdcm"
+                        "Compressed DICOM and no decoder plugin. "
+                        "Install pylibjpeg / gdcm."
                     ) from second_err
                 raise RuntimeError(f"Could not decode pixel data: {second_err}") from second_err
 
@@ -414,7 +391,7 @@ class RadXrReceiverApp:
         conn.commit()
         conn.close()
 
-    # ---------- PDF Index (cache of already-generated & sent PDF reports) ----------
+    # ---------- PDF Index (cache) ----------
     def init_pdf_index_table(self):
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
@@ -430,8 +407,6 @@ class RadXrReceiverApp:
         conn.close()
 
     def compute_patient_key(self, patient_id, patient_name):
-        """Same identity rule used for both image-batching and the PDF cache:
-        prefer Patient ID, fall back to Patient Name, else None (no safe key)."""
         patient_id = (patient_id or "").strip()
         patient_name = (patient_name or "").strip()
         if patient_id and patient_id != "N/A":
@@ -442,8 +417,6 @@ class RadXrReceiverApp:
             return None
 
     def save_pdf_index(self, patient_id, patient_name, accession_no, pdf_path):
-        """Record that this patient's report PDF has been generated & sent,
-        so a repeat request can be answered instantly without regenerating."""
         key = self.compute_patient_key(patient_id, patient_name)
         if not key:
             return
@@ -458,12 +431,6 @@ class RadXrReceiverApp:
         conn.close()
 
     def get_saved_pdf_for_patient(self, q_id, q_name):
-        """
-        Look up an already-generated PDF for this patient (matched the same
-        way as DICOM lookups: exact Patient ID + Patient Name prefix).
-        Returns (pdf_path, patient_id, patient_name, accession) or None if no
-        record exists OR the file no longer exists on disk.
-        """
         self.init_pdf_index_table()
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
@@ -489,19 +456,13 @@ class RadXrReceiverApp:
 
     # ---------- PDF Folder & Naming ----------
     def get_pdf_folder(self):
-        """
-        Return the custom PDF output folder if configured and exists,
-        otherwise fallback to the default: a 'PDF Reports' folder next to the Inbox.
-        """
         custom_folder = self.config.get("pdf_output_folder", "").strip()
         if custom_folder:
-            # If the folder doesn't exist, create it.
             try:
                 os.makedirs(custom_folder, exist_ok=True)
                 return custom_folder
             except Exception as e:
                 self.log_message(f"⚠️ Could not create custom PDF folder '{custom_folder}': {e}. Falling back to default.")
-        # Default: parent of Inbox / PDF Reports
         receive_folder = self.config.get("receive_folder", DEFAULT_INBOX)
         parent_dir = os.path.dirname(os.path.normpath(receive_folder))
         pdf_dir = os.path.join(parent_dir, "PDF Reports")
@@ -509,24 +470,17 @@ class RadXrReceiverApp:
         return pdf_dir
 
     def build_pdf_filename(self, patient_name, study_date):
-        """
-        Format: '<Patient Name> <Study Date (DDMMYYYY)> medical report.pdf'
-        If study_date is missing or invalid, use today's date.
-        """
         clean_name = "".join(x for x in (patient_name or "") if x.isalnum() or x in " -_").strip()
         if not clean_name:
             clean_name = "Unknown"
-
-        # Format study date: DICOM gives YYYYMMDD -> DDMMYYYY
         if study_date and len(study_date) == 8 and study_date.isdigit():
-            # YYYYMMDD -> DDMMYYYY
             formatted_date = f"{study_date[6:8]}{study_date[4:6]}{study_date[0:4]}"
         else:
-            # fallback to today
             today = time.strftime("%Y%m%d")
             formatted_date = f"{today[6:8]}{today[4:6]}{today[0:4]}"
         return f"{clean_name} {formatted_date} medical report.pdf"
 
+    # ---------- Credits ----------
     def get_whatsapp_credits(self):
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
@@ -587,6 +541,7 @@ class RadXrReceiverApp:
         conn.close()
         return False
 
+    # ---------- Telegram Users ----------
     def save_telegram_user(self, user_id, username, full_name):
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
@@ -611,6 +566,7 @@ class RadXrReceiverApp:
         conn.close()
         return results
 
+    # ---------- Bot info ----------
     def update_bot_username(self):
         if not self.TELEGRAM_BOT_TOKEN:
             return
@@ -643,14 +599,15 @@ class RadXrReceiverApp:
 
     # ---------- Indexing ----------
     def index_all_existing_files(self, reindex=False):
+        # We index files from Inbox only, not Archive.
         if self.indexing_in_progress:
             self.log_message("Indexing already in progress. Skipping.")
             return
         self.indexing_in_progress = True
-        self.log_message("Starting indexing of archive folder...")
-        archive_dir = self.config["archive_folder"]
-        if not os.path.exists(archive_dir):
-            self.log_message(f"Archive folder {archive_dir} does not exist.")
+        self.log_message("Starting indexing of Inbox folder...")
+        inbox_dir = self.config["receive_folder"]
+        if not os.path.exists(inbox_dir):
+            self.log_message(f"Inbox folder {inbox_dir} does not exist.")
             self.indexing_in_progress = False
             return
 
@@ -665,14 +622,14 @@ class RadXrReceiverApp:
             conn = sqlite3.connect(DATABASE_PATH)
             c = conn.cursor()
 
-        all_files = [f for f in os.listdir(archive_dir) if f.lower().endswith(".dcm")]
+        all_files = [f for f in os.listdir(inbox_dir) if f.lower().endswith(".dcm")]
         total = len(all_files)
         processed = 0
 
         self.root.after(0, self.update_index_progress, processed, total)
 
         for file in all_files:
-            full_path = os.path.join(archive_dir, file)
+            full_path = os.path.join(inbox_dir, file)
             try:
                 if not reindex:
                     c.execute("SELECT file_path FROM dicom_index WHERE file_path = ?", (full_path,))
@@ -718,10 +675,19 @@ class RadXrReceiverApp:
         conn.commit()
         conn.close()
 
+    def remove_from_index(self, file_path):
+        self.init_db()
+        conn = sqlite3.connect(DATABASE_PATH)
+        c = conn.cursor()
+        c.execute("DELETE FROM dicom_index WHERE file_path = ?", (file_path,))
+        conn.commit()
+        conn.close()
+
     def get_patient_files_from_db(self, q_id, q_name):
         self.init_db()
         conn = sqlite3.connect(DATABASE_PATH)
         c = conn.cursor()
+        # Match Patient ID exactly, and Patient Name first 4 chars (case-insensitive)
         name_prefix = q_name[:4].lower() if len(q_name) >= 4 else q_name.lower()
         c.execute("""
             SELECT file_path, patient_id, patient_name, accession
@@ -732,7 +698,7 @@ class RadXrReceiverApp:
         conn.close()
         return results
 
-    # ---------- Folder Monitoring ----------
+    # ---------- Folder Monitoring (for Archive, external) ----------
     def start_folder_monitor(self):
         archive_dir = self.config["archive_folder"]
         try:
@@ -748,7 +714,7 @@ class RadXrReceiverApp:
         self.observer.schedule(event_handler, path=archive_dir, recursive=False)
         self.observer.start()
         self.monitoring_active = True
-        self.log_message(f"📁 Watching Archive folder: {archive_dir}")
+        self.log_message(f"📁 Watching Archive folder (external): {archive_dir}")
 
     def stop_folder_monitor(self):
         if self.observer:
@@ -758,6 +724,7 @@ class RadXrReceiverApp:
             self.log_message("📁 Folder monitoring stopped.")
 
     def handle_new_external_dicom(self, file_path):
+        # External file appeared in Archive - we just index it, but do not move or process.
         try:
             if not os.path.exists(file_path):
                 return
@@ -889,7 +856,6 @@ class RadXrReceiverApp:
         self.lbl_ip = add_stat_lbl(net_card, "IP ADDRESS", "ip_address")
         self.lbl_port = add_stat_lbl(net_card, "PORT NUMBER", "port")
 
-        # Credits
         Label(net_card, text="💳 CREDITS", font=("Arial", 8, "bold"), fg=self.accent_cyan, bg=self.bg_card).pack(anchor="w", padx=15, pady=(10, 0))
         self.lbl_whatsapp_credits = Label(net_card, text=f"💰 WhatsApp: {self.get_whatsapp_credits()}", font=("Arial", 9), fg=self.text_light, bg=self.bg_card, wraplength=190, justify="left")
         self.lbl_whatsapp_credits.pack(anchor="w", padx=15, pady=(0, 2))
@@ -925,7 +891,7 @@ class RadXrReceiverApp:
         self.tree.column("name", width=140, anchor="w")
         self.tree.column("accession", width=100, anchor="center")
         self.tree.column("file", width=120, anchor="w")
-        self.tree.column("status", width=100, anchor="center")
+        self.tree.column("status", width=160, anchor="center")  # wider for detailed status
         self.tree.pack(fill="both", expand=True, side="left")
         self.tree.bind("<Double-1>", self.on_grid_row_double_click_resend)
         scrollbar = ttk.Scrollbar(queue_container, orient="vertical", command=self.tree.yview)
@@ -953,7 +919,6 @@ class RadXrReceiverApp:
         self.lbl_index_progress_monitor = Label(progress_frame, text="✅ Indexing ready.", font=("Arial", 9), fg=self.accent_green, bg=self.bg_dark)
         self.lbl_index_progress_monitor.pack(side="left")
 
-        # NEW: Clear Sent Files button
         btn_clear_sent = Button(progress_frame, text="🧹 Clear Sent Files", font=("Arial", 9, "bold"), bg="#3b82f6", fg=self.text_light, bd=0, padx=10, pady=2, cursor="hand2", command=self.clear_sent_files_from_grid)
         btn_clear_sent.pack(side="left", padx=10)
 
@@ -964,22 +929,19 @@ class RadXrReceiverApp:
         self.sync_archive_folder_to_dashboard()
         self.log_message("🔄 Dashboard refreshed (credits updated).")
 
-    # --- NEW: Clear sent files from the grid ---
+    # --- Clear Sent Files (fully sent) ---
     def clear_sent_files_from_grid(self):
-        """
-        Remove all rows from the Treeview that have a status indicating successful delivery
-        (contains '✅' and does NOT contain '❌'). Also remove them from queue_data.
-        """
         to_remove = []
         for item in self.tree.get_children():
             values = self.tree.item(item, 'values')
             if not values:
                 continue
-            status = values[4]  # status column
-            if '✅' in status and '❌' not in status:
+            status = values[4]
+            # Fully sent if no '❌' present
+            if '❌' not in status:
                 to_remove.append(item)
         if not to_remove:
-            messagebox.showinfo("Clear Sent", "No sent files to clear from the list.")
+            messagebox.showinfo("Clear Sent", "No fully sent files to clear.")
             return
         removed_count = 0
         for item in to_remove:
@@ -992,10 +954,10 @@ class RadXrReceiverApp:
                 del self.queue_data[file_path_to_remove]
             self.tree.delete(item)
             removed_count += 1
-        self.log_message(f"🧹 Cleared {removed_count} sent file(s) from the grid.")
-        messagebox.showinfo("Clear Sent", f"Removed {removed_count} sent file(s) from the list. Only pending/failed items remain.")
+        self.log_message(f"🧹 Cleared {removed_count} fully sent file(s) from the grid.")
+        messagebox.showinfo("Clear Sent", f"Removed {removed_count} sent file(s).")
 
-    # --- UPDATED: Resend Failed (now detects any status with ❌) ---
+    # --- Resend Failed ---
     def resend_failed_images(self):
         failed_items = []
         for item in self.tree.get_children():
@@ -1020,31 +982,114 @@ class RadXrReceiverApp:
                     if os.path.exists(inbox_file):
                         file_path = inbox_file
                     else:
-                        full_archive = os.path.join(self.config["archive_folder"], file_name)
-                        if os.path.exists(full_archive):
-                            file_path = full_archive
+                        self.tree.item(item, values=(row_values[0], row_values[1], row_values[2], file_name, "❌ File Missing"))
+                        continue
                 if file_path and os.path.exists(file_path):
-                    self.tree.item(item, values=(row_values[0], row_values[1], row_values[2], file_name, "⚡ Resending"))
-                    th = threading.Thread(target=self.autonomous_processing_pipeline, args=(file_path, False), daemon=True)
+                    # We need to know which platforms failed; we can parse status.
+                    # We'll pass a flag to indicate we are resending.
+                    self.tree.item(item, values=(row_values[0], row_values[1], row_values[2], file_name, "⚡ Resending..."))
+                    th = threading.Thread(target=self.resend_single_file, args=(file_path, item), daemon=True)
                     th.start()
                 else:
                     self.tree.item(item, values=(row_values[0], row_values[1], row_values[2], file_name, "❌ File Missing"))
-            messagebox.showinfo("Resend", f"Started resending {count} failed image(s). Check console for progress.")
+            messagebox.showinfo("Resend", f"Started resending {count} failed image(s). Check console.")
 
+    def resend_single_file(self, file_path, item_id):
+        # We need to read current status to see which platforms failed.
+        # We'll get the file's metadata from the grid.
+        # Better: we can store per-file platform status in a dict.
+        # For simplicity, we will just re-run the send logic but only for failed platforms.
+        # However, we need to know which ones failed. We can parse the status string.
+        row_values = self.tree.item(item_id, 'values')
+        status_str = row_values[4]
+        # Determine which platforms are enabled.
+        tg_enabled = bool(self.TELEGRAM_BOT_TOKEN)
+        wa_enabled = bool(self.config.get("whatsapp_api_key") and self.config.get("whatsapp_phone_number_id"))
+        # Parse existing status: look for "Telegram ✅" or "Telegram ❌", etc.
+        tg_ok = "Telegram ✅" in status_str
+        wa_ok = "WhatsApp ✅" in status_str
+        # If a platform is not configured, treat as not needed.
+        if not tg_enabled:
+            tg_ok = True  # not applicable
+        if not wa_enabled:
+            wa_ok = True  # not applicable
+
+        # Now we will retry only the failed ones.
+        # Generate PDF if not already generated? But we already have PDF path from cache? Actually we may not have it.
+        # We can generate a fresh PDF from the DICOM file.
+        try:
+            ds = pydicom.dcmread(file_path)
+            patient_id = str(ds.get("PatientID", "N/A")).strip()
+            patient_name = str(ds.get("PatientName", "N/A")).strip()
+            accession_no = str(ds.get("AccessionNumber", "UNKNOWN")).strip()
+            study_date = str(ds.get("StudyDate", "")).strip()
+
+            pdf_folder = self.get_pdf_folder()
+            pdf_path = os.path.join(pdf_folder, self.build_pdf_filename(patient_name, study_date))
+            # Generate PDF (overwrite if exists)
+            self.generate_pdf_report_from_dicom([file_path], pdf_path)
+
+            # Retry only failed platforms
+            new_tg_ok = tg_ok
+            new_wa_ok = wa_ok
+            if not tg_ok and tg_enabled:
+                if self.decrement_telegram_credits():
+                    if self.send_to_all_telegram(pdf_path, patient_id, patient_name, accession_no):
+                        new_tg_ok = True
+                    else:
+                        self.add_telegram_credits(1)  # refund
+                else:
+                    self.log_message("⚠️ No Telegram credits for resend.")
+            if not wa_ok and wa_enabled:
+                if self.decrement_whatsapp_credits():
+                    if self.dispatch_to_whatsapp_business(pdf_path, patient_id, patient_name, accession_no):
+                        new_wa_ok = True
+                    else:
+                        self.add_whatsapp_credits(1)
+                else:
+                    self.log_message("⚠️ No WhatsApp credits for resend.")
+
+            # Build new status string
+            status_parts = []
+            if tg_enabled:
+                status_parts.append(f"Telegram {'✅' if new_tg_ok else '❌'}")
+            if wa_enabled:
+                status_parts.append(f"WhatsApp {'✅' if new_wa_ok else '❌'}")
+            if not status_parts:
+                status_parts.append("No platforms configured")
+            new_status = ", ".join(status_parts)
+
+            # Update grid
+            self.root.after(0, lambda: self.tree.item(item_id, values=(patient_id, patient_name, accession_no, os.path.basename(file_path), new_status)))
+
+            # If both are now ok, delete the DICOM file and remove from index
+            if (not tg_enabled or new_tg_ok) and (not wa_enabled or new_wa_ok):
+                try:
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                        self.remove_from_index(file_path)
+                        self.log_message(f"🗑️ Deleted DICOM after successful resend: {os.path.basename(file_path)}")
+                except Exception as e:
+                    self.log_message(f"⚠️ Could not delete DICOM: {e}")
+                # Also save PDF index if not already cached
+                self.save_pdf_index(patient_id, patient_name, accession_no, pdf_path)
+            else:
+                self.log_message(f"⚠️ Resend partial success: {new_status}")
+
+        except Exception as e:
+            self.log_message(f"❌ Resend error: {e}")
+            self.root.after(0, lambda: self.tree.item(item_id, values=(row_values[0], row_values[1], row_values[2], os.path.basename(file_path), f"Error: {str(e)[:30]}")))
+
+    # --- Clear Exams (delete Inbox and PDFs) ---
     def clear_exams_action(self):
-        """
-        Deletes all files currently sitting in the Inbox folder and all saved
-        PDF reports in the PDF Reports folder (or custom PDF folder if set).
-        Archived DICOM images (in the Archive folder) and the database index are NOT touched.
-        """
         inbox_dir = self.config.get("receive_folder", DEFAULT_INBOX)
-        pdf_dir = self.get_pdf_folder()  # uses custom or default
+        pdf_dir = self.get_pdf_folder()
         res = messagebox.askyesno(
             "Confirm Clear Exams",
             "This will permanently delete:\n\n"
             f"• All files in the Inbox folder:\n   {inbox_dir}\n\n"
             f"• All saved PDF reports in:\n   {pdf_dir}\n\n"
-            "Archived DICOM images are NOT affected.\n\nContinue?"
+            "Continue?"
         )
         if not res:
             return
@@ -1063,18 +1108,39 @@ class RadXrReceiverApp:
                             errors += 1
                             self.log_message(f"⚠️ Could not delete {fpath}: {e}")
 
-        # The saved-PDF cache is now empty on disk, so clear the stale DB entries too.
         try:
             self.clear_pdf_index_table()
         except Exception as e:
             self.log_message(f"⚠️ Could not clear PDF index table: {e}")
+        # Also clear dicom_index for Inbox files
+        try:
+            conn = sqlite3.connect(DATABASE_PATH)
+            c = conn.cursor()
+            inbox_dir_norm = os.path.normpath(inbox_dir)
+            c.execute("DELETE FROM dicom_index WHERE file_path LIKE ?", (f"{inbox_dir_norm}%",))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            self.log_message(f"⚠️ Could not clear dicom_index: {e}")
+
+        # Clear grid rows for Inbox files
+        to_remove = []
+        for item in self.tree.get_children():
+            values = self.tree.item(item, 'values')
+            if values:
+                # we can't easily check folder, so we'll just clear all
+                to_remove.append(item)
+        for item in to_remove:
+            self.tree.delete(item)
+        self.queue_data.clear()
 
         msg = f"Deleted {deleted} file(s) from Inbox and PDF folders."
         if errors:
-            msg += f"\n{errors} file(s) could not be deleted (check console log)."
+            msg += f"\n{errors} file(s) could not be deleted (check console)."
         messagebox.showinfo("Clear Exams", msg)
         self.log_message(f"🧹 Clear Exams: deleted {deleted} file(s), {errors} error(s).")
 
+    # ---------- Config Tab ----------
     def build_config_tab(self, parent):
         content_frame = Frame(parent, bg=self.bg_card)
         content_frame.pack(fill="both", expand=True)
@@ -1094,6 +1160,7 @@ class RadXrReceiverApp:
             return e
 
         self.ent_inst_name = make_entry("Institute Name (PDF Title):", "institute_name")
+        self.ent_telegram_token = make_entry("Telegram Bot Token:", "telegram_bot_token")  # NEW
         self.ent_wa_key = make_entry("WhatsApp Cloud API Key (Access Token):", "whatsapp_api_key")
         self.ent_wa_phone_id = make_entry("WhatsApp Phone Number ID:", "whatsapp_phone_number_id")
         self.ent_wa_sender = make_entry("WhatsApp Sender Phone (optional):", "whatsapp_sender_phone")
@@ -1102,7 +1169,6 @@ class RadXrReceiverApp:
         self.ent_port_num = make_entry("Server Dynamic Port:", "port")
         self.ent_batch_wait = make_entry("Combine Images Wait Time (sec):", "batch_wait_seconds")
 
-        # NEW: PDF Output Folder
         f_pdf = Frame(form, bg=self.bg_card)
         f_pdf.pack(fill="x", pady=6, padx=20)
         Label(f_pdf, text="PDF Output Folder:", font=("Arial", 9, "bold"), fg=self.text_light, bg=self.bg_card, width=25, anchor="w").pack(side="left")
@@ -1114,7 +1180,7 @@ class RadXrReceiverApp:
 
         f_dir1 = Frame(form, bg=self.bg_card)
         f_dir1.pack(fill="x", pady=6, padx=20)
-        Label(f_dir1, text="Dynamic Cache Folder (Inbox):", font=("Arial", 9, "bold"), fg=self.text_light, bg=self.bg_card, width=25, anchor="w").pack(side="left")
+        Label(f_dir1, text="Inbox Folder (temporary):", font=("Arial", 9, "bold"), fg=self.text_light, bg=self.bg_card, width=25, anchor="w").pack(side="left")
         self.ent_folder_path = Entry(f_dir1, font=("Arial", 10), bg=self.bg_dark, fg=self.text_light, bd=1, insertbackground="white")
         self.ent_folder_path.pack(side="left", fill="x", expand=True, padx=5)
         self.ent_folder_path.insert(0, self.config["receive_folder"])
@@ -1122,7 +1188,7 @@ class RadXrReceiverApp:
 
         f_dir2 = Frame(form, bg=self.bg_card)
         f_dir2.pack(fill="x", pady=6, padx=20)
-        Label(f_dir2, text="Local Archive Directory (Bot):", font=("Arial", 9, "bold"), fg=self.text_light, bg=self.bg_card, width=25, anchor="w").pack(side="left")
+        Label(f_dir2, text="Archive Folder (external only):", font=("Arial", 9, "bold"), fg=self.text_light, bg=self.bg_card, width=25, anchor="w").pack(side="left")
         self.ent_archive_path = Entry(f_dir2, font=("Arial", 10), bg=self.bg_dark, fg=self.text_light, bd=1, insertbackground="white")
         self.ent_archive_path.pack(side="left", fill="x", expand=True, padx=5)
         self.ent_archive_path.insert(0, self.config.get("archive_folder", DEFAULT_ARCHIVE))
@@ -1152,7 +1218,7 @@ class RadXrReceiverApp:
 
         self.lbl_index_progress_config = Label(form, text="✅ Indexing ready.", font=("Arial", 9), fg=self.accent_green, bg=self.bg_card)
         self.lbl_index_progress_config.pack(anchor="w", padx=20, pady=(5,10))
-        Button(form, text="🔄 Re-index Archive (Full Rebuild)", font=("Arial", 9, "bold"), bg=self.accent_cyan, fg=self.bg_dark, bd=0, padx=10, pady=5, cursor="hand2", command=self.reindex_archive).pack(anchor="w", padx=20, pady=5)
+        Button(form, text="🔄 Re-index Inbox", font=("Arial", 9, "bold"), bg=self.accent_cyan, fg=self.bg_dark, bd=0, padx=10, pady=5, cursor="hand2", command=self.reindex_archive).pack(anchor="w", padx=20, pady=5)
 
         Button(content_frame, text="Apply Node Topology Changes", font=("Arial", 11, "bold"), bg=self.accent_green, fg=self.bg_dark, width=28, bd=0, cursor="hand2", command=self.apply_and_save_node_settings).pack(pady=15)
         Label(content_frame, text="Made with ❤️ by Sandeep", font=("Arial", 9, "bold", "italic"), fg="#6b7280", bg=self.bg_card).pack(side="bottom", pady=5)
@@ -1198,6 +1264,7 @@ class RadXrReceiverApp:
             threading.Thread(target=self.index_all_existing_files, args=(True,), daemon=True).start()
 
     def sync_archive_folder_to_dashboard(self):
+        # We only show external archive files as read-only; we don't process them.
         archive_dir = self.config.get("archive_folder", DEFAULT_ARCHIVE)
         if not os.path.exists(archive_dir):
             return
@@ -1211,7 +1278,7 @@ class RadXrReceiverApp:
                         patient_name = str(ds.get("PatientName", "N/A")).strip()
                         accession_no = str(ds.get("AccessionNumber", "NO_ACC")).strip()
                         self.root.after(0, lambda p=patient_id, n=patient_name, a=accession_no, f=file:
-                                        self.upsert_grid_record(full_path, p, n, a, "Archive Saved 📁"))
+                                        self.upsert_grid_record(full_path, p, n, a, "Archived (External) 📁"))
                     except Exception:
                         continue
         threading.Thread(target=worker, daemon=True).start()
@@ -1225,6 +1292,14 @@ class RadXrReceiverApp:
     def apply_and_save_node_settings(self):
         self.stop_folder_monitor()
         self.config["institute_name"] = self.ent_inst_name.get().strip().upper()
+        # Update Telegram token if changed
+        new_token = self.ent_telegram_token.get().strip()
+        if new_token and new_token != self.TELEGRAM_BOT_TOKEN:
+            self.TELEGRAM_BOT_TOKEN = new_token
+            self.config["telegram_bot_token"] = new_token
+            self.last_update_id = 0  # reset polling
+            self.update_bot_username()
+            self.start_telegram_bot_polling()  # restart polling
         self.config["whatsapp_api_key"] = self.ent_wa_key.get().strip()
         self.config["whatsapp_phone_number_id"] = self.ent_wa_phone_id.get().strip()
         self.config["whatsapp_sender_phone"] = self.ent_wa_sender.get().strip()
@@ -1233,7 +1308,7 @@ class RadXrReceiverApp:
         self.config["port"] = self.ent_port_num.get().strip()
         self.config["receive_folder"] = self.ent_folder_path.get().strip()
         self.config["archive_folder"] = self.ent_archive_path.get().strip()
-        self.config["pdf_output_folder"] = self.ent_pdf_folder.get().strip()  # NEW
+        self.config["pdf_output_folder"] = self.ent_pdf_folder.get().strip()
         try:
             self.config["batch_wait_seconds"] = max(1, float(self.ent_batch_wait.get().strip()))
         except (ValueError, AttributeError):
@@ -1257,29 +1332,24 @@ class RadXrReceiverApp:
             return
         row_values = self.tree.item(item_id, 'values')
         status = row_values[4]
-        accession_no = row_values[2]
-        file_name = row_values[3]
-        file_path = None
-        for fpath, rid in self.queue_data.items():
-            if rid == item_id:
-                file_path = fpath
-                break
-        if not file_path:
-            full_archive = os.path.join(self.config["archive_folder"], file_name)
-            if os.path.exists(full_archive):
-                file_path = full_archive
-            else:
-                messagebox.showerror("Error", "File not found.")
-                return
         if "❌" in status:
-            res = messagebox.askyesno("Resend Trigger", f"Re-dispatch pipeline for file: {file_name}?")
+            res = messagebox.askyesno("Resend", f"Resend this file?\n{row_values[3]}")
             if res:
-                if os.path.exists(file_path):
-                    self.tree.item(item_id, values=(row_values[0], row_values[1], accession_no, file_name, "⚡ Resending"))
-                    th = threading.Thread(target=self.autonomous_processing_pipeline, args=(file_path, False), daemon=True)
+                file_path = None
+                for fpath, rid in self.queue_data.items():
+                    if rid == item_id:
+                        file_path = fpath
+                        break
+                if not file_path:
+                    inbox_file = os.path.join(self.config["receive_folder"], row_values[3])
+                    if os.path.exists(inbox_file):
+                        file_path = inbox_file
+                if file_path and os.path.exists(file_path):
+                    self.tree.item(item_id, values=(row_values[0], row_values[1], row_values[2], row_values[3], "⚡ Resending..."))
+                    th = threading.Thread(target=self.resend_single_file, args=(file_path, item_id), daemon=True)
                     th.start()
                 else:
-                    messagebox.showerror("Error", "File no longer exists.")
+                    messagebox.showerror("Error", "File not found.")
 
     # ---------- DICOM Server ----------
     def is_valid_local_ip(self, ip):
@@ -1298,7 +1368,7 @@ class RadXrReceiverApp:
             if not ip:
                 ip = "0.0.0.0"
             if not self.is_valid_local_ip(ip):
-                self.log_message(f"⚠️ IP '{ip}' not found on any interface. Falling back to 0.0.0.0")
+                self.log_message(f"⚠️ IP '{ip}' not found. Falling back to 0.0.0.0")
                 ip = "0.0.0.0"
             try:
                 test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1307,17 +1377,17 @@ class RadXrReceiverApp:
                 test_sock.close()
                 if result == 0:
                     self.log_message(f"❌ Port {port} is already in use on {ip}.")
-                    messagebox.showerror("Port Error", f"Port {port} is already in use on {ip}.\nPlease change the IP or port.")
+                    messagebox.showerror("Port Error", f"Port {port} already in use.")
                     return
             except Exception as e:
-                self.log_message(f"⚠️ Could not check port availability: {e}")
+                self.log_message(f"⚠️ Could not check port: {e}")
 
             try:
                 os.makedirs(self.config["receive_folder"], exist_ok=True)
                 os.makedirs(self.config["archive_folder"], exist_ok=True)
             except Exception as e:
                 self.log_message(f"❌ Failed to create folders: {e}")
-                messagebox.showerror("Folder Error", f"Cannot create required folders:\n{e}")
+                messagebox.showerror("Folder Error", f"Cannot create folders:\n{e}")
                 return
 
             self.is_listening = True
@@ -1329,7 +1399,6 @@ class RadXrReceiverApp:
             self.log_message(f"   IP: {ip}")
             self.log_message(f"   Port: {port}")
             self.log_message(f"   Inbox: {self.config['receive_folder']}")
-            self.log_message(f"   Archive: {self.config['archive_folder']}")
             self.server_thread = threading.Thread(target=self.run_dicom_scp_listener, args=(ip,), daemon=True)
             self.server_thread.start()
         else:
@@ -1354,23 +1423,18 @@ class RadXrReceiverApp:
                     context.abstract_syntax,
                     ACCEPTED_TRANSFER_SYNTAXES
                 )
-            self.log_message(
-                f"Loaded {len(AllStoragePresentationContexts)} Storage Presentation Contexts "
-                f"(incl. JPEG Baseline/Lossless + JPEG2000 + RLE — Canon/Fuji/Agfa/Carestream/Konica compatible)"
-            )
+            self.log_message(f"Loaded {len(AllStoragePresentationContexts)} Storage Presentation Contexts.")
             handlers = [
                 (evt.EVT_C_STORE, self.handle_incoming_c_store),
                 (evt.EVT_C_ECHO, self.handle_incoming_c_echo)
             ]
             self.log_message(f"⏳ Attempting to bind to {bind_ip}:{self.config['port']}")
-            if sys.stdout is not None:
-                sys.stdout.flush()
             self.server_instance = ae.start_server(
                 (bind_ip, int(self.config["port"])),
                 block=False,
                 evt_handlers=handlers
             )
-            self.log_message("✅ start_server() returned successfully (immediate).")
+            self.log_message("✅ start_server() returned successfully.")
             time.sleep(2)
             test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             test_sock.settimeout(3)
@@ -1383,7 +1447,7 @@ class RadXrReceiverApp:
                     time.sleep(0.5)
             except Exception as conn_err:
                 self.log_message(f"❌ Verification connection failed: {conn_err}")
-                self.root.after(0, self._server_failed_to_start, f"Port {self.config['port']} on {bind_ip} is NOT open. Error: {conn_err}")
+                self.root.after(0, self._server_failed_to_start, f"Port {self.config['port']} not open.")
                 return
         except Exception as e:
             self.log_message(f"❌ Server start exception: {e}")
@@ -1401,7 +1465,7 @@ class RadXrReceiverApp:
         self.lbl_status_indicator.config(fg=self.accent_red)
         self.btn_toggle_server.config(text="Start Server", bg=self.accent_green)
         self.log_message(f"❌ Server failed: {error_msg}")
-        messagebox.showerror("Server Error", f"Failed to start DICOM server:\n{error_msg}\n\nCheck the console log for details.\nPort: {self.config['port']}")
+        messagebox.showerror("Server Error", f"Failed to start DICOM server:\n{error_msg}")
 
     def handle_incoming_c_echo(self, event):
         self.log_message(f"✅ C-ECHO received from {event.assoc.requestor.ae_title}")
@@ -1411,10 +1475,6 @@ class RadXrReceiverApp:
         try:
             ds = event.dataset
             ds.file_meta = event.file_meta
-            sop = getattr(ds, "SOPClassUID", "Unknown")
-            ts = getattr(event.context.transfer_syntax, "name", str(event.context.transfer_syntax))
-            self.log_message(f"📥 SOP Class: {sop}")
-            self.log_message(f"📥 Transfer Syntax: {ts}")
             accession_number = str(ds.get("AccessionNumber", "UNKNOWN_ACC")).strip()
             sop_instance_uid = str(ds.get("SOPInstanceUID", "")).strip()
             unique_suffix = sop_instance_uid[-12:] if sop_instance_uid else f"{int(time.time() * 1000)}"
@@ -1422,6 +1482,7 @@ class RadXrReceiverApp:
             filepath = os.path.join(self.config["receive_folder"], filename)
             ds.save_as(filepath, write_like_original=False)
             self.log_message(f"📥 C-STORE received from {event.assoc.requestor.ae_title}")
+            # Queue for batching
             threading.Thread(
                 target=self.queue_file_for_patient_batch,
                 args=(filepath, False),
@@ -1434,10 +1495,6 @@ class RadXrReceiverApp:
 
     # ---------- PDF Generation ----------
     def generate_pdf_report_from_dicom(self, dcm_paths, output_pdf_path):
-        """
-        Builds ONE PDF report from one or more DICOM files.
-        Returns (patient_id, patient_name, accession_no, study_date).
-        """
         from PIL import Image as PILImage
 
         if isinstance(dcm_paths, (str, bytes, os.PathLike)):
@@ -1600,7 +1657,7 @@ class RadXrReceiverApp:
         c.save()
         return patient_id, patient_name, accession_no, study_date
 
-    # ---------- Processing Pipeline (updated: keep Inbox until Telegram succeeds) ----------
+    # ---------- Processing Pipeline (no archive copy) ----------
     def autonomous_processing_pipeline(self, dcm_path, is_manual_import=False):
         pdf_output_path = ""
         try:
@@ -1610,79 +1667,82 @@ class RadXrReceiverApp:
             accession_no = str(ds.get("AccessionNumber", "UNKNOWN")).strip()
             study_date = str(ds.get("StudyDate", "")).strip()
 
-            archive_dir = self.config["archive_folder"]
-            os.makedirs(archive_dir, exist_ok=True)
-            archive_dest = os.path.join(archive_dir, os.path.basename(dcm_path))
-            if os.path.normpath(dcm_path) != os.path.normpath(archive_dest):
-                shutil.copy2(dcm_path, archive_dest)
-                dcm_path_for_index = archive_dest
-            else:
-                dcm_path_for_index = dcm_path
-
-            self.index_dicom_file(dcm_path_for_index, patient_id, patient_name, accession_no)
+            # Index the file (if not already)
+            self.index_dicom_file(dcm_path, patient_id, patient_name, accession_no)
 
             pdf_output_path = os.path.join(
                 self.get_pdf_folder(),
                 self.build_pdf_filename(patient_name, study_date)
             )
-            self.generate_pdf_report_from_dicom(dcm_path_for_index, pdf_output_path)
+            self.generate_pdf_report_from_dicom([dcm_path], pdf_output_path)
 
-            file_key = dcm_path_for_index
+            file_key = dcm_path
             self.root.after(0, lambda: self.upsert_grid_record(file_key, patient_id, patient_name, accession_no, "⏳ Processing"))
             self.root.after(0, lambda: self.upsert_grid_record(file_key, patient_id, patient_name, accession_no, "📤 Sending"))
 
-            # ---- Telegram (with credit check) ----
+            # Determine enabled platforms
+            tg_enabled = bool(self.TELEGRAM_BOT_TOKEN)
+            wa_enabled = bool(self.config.get("whatsapp_api_key") and self.config.get("whatsapp_phone_number_id"))
+
             tg_ok = False
-            tg_credits = self.get_telegram_credits()
-            if tg_credits > 0:
+            wa_ok = False
+
+            # Send to Telegram if enabled
+            if tg_enabled:
                 if self.decrement_telegram_credits():
                     tg_ok = self.send_to_all_telegram(pdf_output_path, patient_id, patient_name, accession_no)
                     if not tg_ok:
                         self.add_telegram_credits(1)
                         self.log_message("⚠️ Telegram send failed, credit refunded.")
                 else:
-                    self.log_message("⚠️ Failed to decrement Telegram credit.")
-            else:
-                self.log_message("⚠️ Insufficient Telegram credits. Skipping Telegram send.")
+                    self.log_message("⚠️ Insufficient Telegram credits.")
 
-            # ---- WhatsApp ----
-            wa_ok = True
-            if self.config["whatsapp_api_key"] and self.config["whatsapp_phone_number_id"]:
-                if self.get_whatsapp_credits() > 0:
+            # Send to WhatsApp if enabled
+            if wa_enabled:
+                if self.decrement_whatsapp_credits():
                     wa_ok = self.dispatch_to_whatsapp_business(pdf_output_path, patient_id, patient_name, accession_no)
+                    if not wa_ok:
+                        self.add_whatsapp_credits(1)
+                        self.log_message("⚠️ WhatsApp send failed, credit refunded.")
                 else:
-                    self.log_message("⚠️ Insufficient WhatsApp credits. Skipping WhatsApp send.")
-                    wa_ok = False
+                    self.log_message("⚠️ Insufficient WhatsApp credits.")
 
-            if tg_ok and wa_ok:
-                status = "Sent & Archived ✅"
-            elif tg_ok and not wa_ok:
-                status = "Telegram ✅, WhatsApp ❌"
-            elif not tg_ok and wa_ok:
-                status = "Telegram ❌, WhatsApp ✅"
-            else:
-                status = "Failed ❌ (No Credits)"
+            # Build status string
+            status_parts = []
+            if tg_enabled:
+                status_parts.append(f"Telegram {'✅' if tg_ok else '❌'}")
+            if wa_enabled:
+                status_parts.append(f"WhatsApp {'✅' if wa_ok else '❌'}")
+            if not status_parts:
+                status_parts.append("No platforms configured")
+            status_str = ", ".join(status_parts)
 
-            self.root.after(0, lambda: self.upsert_grid_record(file_key, patient_id, patient_name, accession_no, status))
+            self.root.after(0, lambda: self.upsert_grid_record(file_key, patient_id, patient_name, accession_no, status_str))
 
-            if tg_ok:
-                if not is_manual_import and os.path.exists(dcm_path) and os.path.normpath(dcm_path) != os.path.normpath(archive_dest):
-                    try:
+            # If all enabled platforms succeeded, delete the DICOM and remove from index
+            all_ok = (not tg_enabled or tg_ok) and (not wa_enabled or wa_ok)
+            if all_ok:
+                try:
+                    if os.path.exists(dcm_path):
                         os.remove(dcm_path)
-                        self.log_message(f"🗑️ Inbox file deleted: {os.path.basename(dcm_path)}")
-                    except Exception as e:
-                        self.log_message(f"⚠️ Could not delete Inbox file: {e}")
-
+                        self.remove_from_index(dcm_path)
+                        self.log_message(f"🗑️ Deleted DICOM after send: {os.path.basename(dcm_path)}")
+                except Exception as e:
+                    self.log_message(f"⚠️ Could not delete DICOM: {e}")
+                # Save PDF index for future requests
                 self.save_pdf_index(patient_id, patient_name, accession_no, pdf_output_path)
                 self.log_message(f"💾 PDF saved: {os.path.basename(pdf_output_path)}")
+            else:
+                # Keep file for later retry
+                self.log_message(f"⚠️ Not all platforms succeeded, file kept: {os.path.basename(dcm_path)}")
 
         except Exception as e:
             self.root.after(0, lambda: messagebox.showerror("Pipeline Error", f"Error: {str(e)}"))
             self.log_message(f"❌ Pipeline error: {e}")
             if 'file_key' in locals():
-                self.root.after(0, lambda: self.upsert_grid_record(file_key, "N/A", "N/A", "UNKNOWN", "Failed ❌"))
+                self.root.after(0, lambda: self.upsert_grid_record(file_key, "N/A", "N/A", "UNKNOWN", f"Error: {str(e)[:30]}"))
 
-    # ---------- Patient Batching (combine multiple images of same patient into ONE PDF) ----------
+    # ---------- Patient Batching (no archive copy) ----------
     def queue_file_for_patient_batch(self, dcm_path, is_manual_import=False):
         try:
             ds = pydicom.dcmread(dcm_path, stop_before_pixels=True)
@@ -1693,22 +1753,11 @@ class RadXrReceiverApp:
             self.log_message(f"❌ Could not read DICOM header, skipping: {e}")
             return
 
-        archive_dir = self.config["archive_folder"]
-        os.makedirs(archive_dir, exist_ok=True)
-        archive_dest = os.path.join(archive_dir, os.path.basename(dcm_path))
-        try:
-            if os.path.normpath(dcm_path) != os.path.normpath(archive_dest):
-                shutil.copy2(dcm_path, archive_dest)
-                dcm_path_for_index = archive_dest
-            else:
-                dcm_path_for_index = dcm_path
-            self.index_dicom_file(dcm_path_for_index, patient_id, patient_name, accession_no)
-        except Exception as e:
-            self.log_message(f"❌ Archiving/indexing error: {e}")
-            dcm_path_for_index = dcm_path
+        # Index the file (if not already)
+        self.index_dicom_file(dcm_path, patient_id, patient_name, accession_no)
 
         self.root.after(0, lambda: self.upsert_grid_record(
-            dcm_path_for_index, patient_id, patient_name, accession_no, "📥 Received - Queued"))
+            dcm_path, patient_id, patient_name, accession_no, "📥 Received - Queued"))
 
         if patient_id and patient_id != "N/A":
             batch_key = f"PID::{patient_id}"
@@ -1725,7 +1774,7 @@ class RadXrReceiverApp:
         with self.batch_lock:
             entry = self.pending_batches.get(batch_key)
             if entry:
-                entry["items"].append((dcm_path, dcm_path_for_index, is_manual_import))
+                entry["items"].append((dcm_path, is_manual_import))
                 if accession_no and accession_no != "UNKNOWN":
                     entry["accession_no"] = accession_no
                 if entry.get("timer"):
@@ -1735,7 +1784,7 @@ class RadXrReceiverApp:
                     "patient_id": patient_id,
                     "patient_name": patient_name,
                     "accession_no": accession_no,
-                    "items": [(dcm_path, dcm_path_for_index, is_manual_import)],
+                    "items": [(dcm_path, is_manual_import)],
                 }
                 self.pending_batches[batch_key] = entry
 
@@ -1746,7 +1795,7 @@ class RadXrReceiverApp:
 
         self.log_message(
             f"🗂️ Queued image for {patient_name} (ID: {patient_id}) — "
-            f"{len(entry['items'])} image(s) so far, waiting {wait_seconds:.0f}s for more..."
+            f"{len(entry['items'])} image(s) so far, waiting {wait_seconds:.0f}s..."
         )
 
     def _flush_patient_batch(self, batch_key):
@@ -1762,90 +1811,97 @@ class RadXrReceiverApp:
 
     def process_patient_batch(self, items, patient_id, patient_name, accession_no):
         pdf_output_path = ""
-        archived_paths = [archived for (_orig, archived, _man) in items]
+        # items: list of (dcm_path, is_manual_import)
+        dcm_paths = [dcm for dcm, _ in items]
         try:
             self.log_message(
-                f"🧩 Combining {len(archived_paths)} image(s) for {patient_name} "
+                f"🧩 Combining {len(dcm_paths)} image(s) for {patient_name} "
                 f"(ID: {patient_id}) into one PDF..."
             )
 
-            # Get study date from the first file (should be consistent)
+            # Get study date from first file
             study_date = ""
             try:
-                first_ds = pydicom.dcmread(archived_paths[0], stop_before_pixels=True)
+                first_ds = pydicom.dcmread(dcm_paths[0], stop_before_pixels=True)
                 study_date = str(first_ds.get("StudyDate", "")).strip()
             except Exception:
                 pass
 
-            for archived in archived_paths:
-                self.root.after(0, lambda f=archived: self.upsert_grid_record(
+            for dcm in dcm_paths:
+                self.root.after(0, lambda f=dcm: self.upsert_grid_record(
                     f, patient_id, patient_name, accession_no, "⏳ Processing (Batch)"))
 
             pdf_output_path = os.path.join(
                 self.get_pdf_folder(),
                 self.build_pdf_filename(patient_name, study_date)
             )
-            self.generate_pdf_report_from_dicom(archived_paths, pdf_output_path)
+            self.generate_pdf_report_from_dicom(dcm_paths, pdf_output_path)
 
-            for archived in archived_paths:
-                self.root.after(0, lambda f=archived: self.upsert_grid_record(
+            for dcm in dcm_paths:
+                self.root.after(0, lambda f=dcm: self.upsert_grid_record(
                     f, patient_id, patient_name, accession_no, "📤 Sending"))
 
-            # ---- Telegram ----
+            tg_enabled = bool(self.TELEGRAM_BOT_TOKEN)
+            wa_enabled = bool(self.config.get("whatsapp_api_key") and self.config.get("whatsapp_phone_number_id"))
+
             tg_ok = False
-            tg_credits = self.get_telegram_credits()
-            if tg_credits > 0:
+            wa_ok = False
+
+            if tg_enabled:
                 if self.decrement_telegram_credits():
                     tg_ok = self.send_to_all_telegram(pdf_output_path, patient_id, patient_name, accession_no)
                     if not tg_ok:
                         self.add_telegram_credits(1)
                         self.log_message("⚠️ Telegram send failed, credit refunded.")
                 else:
-                    self.log_message("⚠️ Failed to decrement Telegram credit.")
-            else:
-                self.log_message("⚠️ Insufficient Telegram credits. Skipping Telegram send.")
+                    self.log_message("⚠️ Insufficient Telegram credits.")
 
-            # ---- WhatsApp ----
-            wa_ok = True
-            if self.config["whatsapp_api_key"] and self.config["whatsapp_phone_number_id"]:
-                if self.get_whatsapp_credits() > 0:
+            if wa_enabled:
+                if self.decrement_whatsapp_credits():
                     wa_ok = self.dispatch_to_whatsapp_business(pdf_output_path, patient_id, patient_name, accession_no)
+                    if not wa_ok:
+                        self.add_whatsapp_credits(1)
+                        self.log_message("⚠️ WhatsApp send failed, credit refunded.")
                 else:
-                    self.log_message("⚠️ Insufficient WhatsApp credits. Skipping WhatsApp send.")
-                    wa_ok = False
+                    self.log_message("⚠️ Insufficient WhatsApp credits.")
 
-            if tg_ok and wa_ok:
-                status = f"Sent & Archived ✅ ({len(archived_paths)} imgs)"
-            elif tg_ok and not wa_ok:
-                status = f"Telegram ✅, WhatsApp ❌ ({len(archived_paths)} imgs)"
-            elif not tg_ok and wa_ok:
-                status = f"Telegram ❌, WhatsApp ✅ ({len(archived_paths)} imgs)"
-            else:
-                status = "Failed ❌ (No Credits)"
+            status_parts = []
+            if tg_enabled:
+                status_parts.append(f"Telegram {'✅' if tg_ok else '❌'}")
+            if wa_enabled:
+                status_parts.append(f"WhatsApp {'✅' if wa_ok else '❌'}")
+            if not status_parts:
+                status_parts.append("No platforms configured")
+            status_str = ", ".join(status_parts)
 
-            for archived in archived_paths:
-                self.root.after(0, lambda f=archived: self.upsert_grid_record(
-                    f, patient_id, patient_name, accession_no, status))
+            for dcm in dcm_paths:
+                self.root.after(0, lambda f=dcm: self.upsert_grid_record(
+                    f, patient_id, patient_name, accession_no, status_str))
 
-            if tg_ok:
-                for (orig, archived, is_manual) in items:
-                    if not is_manual and os.path.exists(orig) and os.path.normpath(orig) != os.path.normpath(archived):
-                        try:
-                            os.remove(orig)
-                            self.log_message(f"🗑️ Inbox file deleted: {os.path.basename(orig)}")
-                        except Exception as e:
-                            self.log_message(f"⚠️ Could not delete Inbox file: {e}")
-
+            all_ok = (not tg_enabled or tg_ok) and (not wa_enabled or wa_ok)
+            if all_ok:
+                # Delete all DICOMs and remove from index
+                for dcm in dcm_paths:
+                    try:
+                        if os.path.exists(dcm):
+                            os.remove(dcm)
+                            self.remove_from_index(dcm)
+                            self.log_message(f"🗑️ Deleted DICOM after batch send: {os.path.basename(dcm)}")
+                    except Exception as e:
+                        self.log_message(f"⚠️ Could not delete DICOM {dcm}: {e}")
                 self.save_pdf_index(patient_id, patient_name, accession_no, pdf_output_path)
                 self.log_message(f"💾 PDF saved: {os.path.basename(pdf_output_path)}")
+            else:
+                self.log_message(f"⚠️ Batch not fully sent, files kept.")
 
         except Exception as e:
             self.root.after(0, lambda: messagebox.showerror("Pipeline Error", f"Error: {str(e)}"))
             self.log_message(f"❌ Batch pipeline error: {e}")
-            for archived in archived_paths:
-                self.root.after(0, lambda f=archived: self.upsert_grid_record(
-                    f, patient_id, patient_name, accession_no, "Failed ❌"))
+            for dcm in dcm_paths:
+                self.root.after(0, lambda f=dcm: self.upsert_grid_record(
+                    f, patient_id, patient_name, accession_no, f"Error: {str(e)[:30]}"))
 
+    # ---------- Grid update ----------
     def upsert_grid_record(self, file_path, p_id, p_name, acc_no, status):
         if file_path in self.queue_data:
             row_id = self.queue_data[file_path]
@@ -1854,6 +1910,7 @@ class RadXrReceiverApp:
             row_id = self.tree.insert("", "end", values=(p_id, p_name, acc_no, os.path.basename(file_path), status))
             self.queue_data[file_path] = row_id
 
+    # ---------- Caption builder ----------
     def build_beautiful_caption_string(self, p_id, p_name, acc_no, include_footer=True):
         caption = (
             f"🏥 *{self.config['institute_name']}*\n"
@@ -1867,7 +1924,7 @@ class RadXrReceiverApp:
         caption += f"\n*Made with ❤️ by Sandeep*"
         return caption
 
-    # ---------- Telegram (with credit management inside) ----------
+    # ---------- Telegram ----------
     def send_to_all_telegram(self, file_path, p_id, p_name, acc_no):
         user_ids = self.get_all_telegram_users()
         if not user_ids:
@@ -1898,7 +1955,7 @@ class RadXrReceiverApp:
             self.log_message(f"Telegram send error: {e}")
             return False
 
-    # ---------- WhatsApp Business ----------
+    # ---------- WhatsApp ----------
     def dispatch_to_whatsapp_business(self, file_path, p_id, p_name, acc_no):
         if not self.decrement_whatsapp_credits():
             self.log_message("❌ No WhatsApp credits available.")
@@ -1954,7 +2011,7 @@ class RadXrReceiverApp:
             self.log_message(f"WhatsApp error: {e}")
             return False
 
-    # ---------- Telegram Bot Polling (with new commands) ----------
+    # ---------- Telegram Bot Polling ----------
     def start_telegram_bot_polling(self):
         t = threading.Thread(target=self.telegram_bot_polling_worker, daemon=True)
         t.start()
@@ -2009,32 +2066,29 @@ class RadXrReceiverApp:
                                     base_url = f"https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}"
                                     self.update_bot_username()
                                     self.refresh_bot_info_gui()
-                                    self._send_message(base_url, chat_id, f"✅ Bot token updated successfully. New token: `{new_token}`")
-                                    self.log_message(f"Bot token changed to {new_token}")
+                                    self._send_message(base_url, chat_id, f"✅ Bot token updated successfully.")
                                 else:
-                                    self._send_message(base_url, chat_id, "❌ Please provide a valid token: `/newbot <token>`")
+                                    self._send_message(base_url, chat_id, "❌ Provide a token: `/newbot <token>`")
                                 continue
 
                             if text.lower().startswith("/adduser "):
                                 uid = text[9:].strip()
                                 if uid:
                                     self.save_telegram_user(uid, "", "")
-                                    self._send_message(base_url, chat_id, f"✅ User `{uid}` added to broadcast list.")
-                                    self.log_message(f"Added Telegram user {uid}")
+                                    self._send_message(base_url, chat_id, f"✅ User `{uid}` added.")
                                 else:
-                                    self._send_message(base_url, chat_id, "❌ Please provide a user ID: `/adduser <userid>`")
+                                    self._send_message(base_url, chat_id, "❌ Provide user ID.")
                                 continue
 
                             if text.lower().startswith("/remove "):
                                 uid = text[8:].strip()
                                 if uid == self.TELEGRAM_MASTER_USER_ID:
-                                    self._send_message(base_url, chat_id, "❌ Cannot remove the master user.")
+                                    self._send_message(base_url, chat_id, "❌ Cannot remove master.")
                                 elif uid:
                                     self.delete_telegram_user(uid)
-                                    self._send_message(base_url, chat_id, f"✅ User `{uid}` removed from broadcast list.")
-                                    self.log_message(f"Removed Telegram user {uid}")
+                                    self._send_message(base_url, chat_id, f"✅ User `{uid}` removed.")
                                 else:
-                                    self._send_message(base_url, chat_id, "❌ Please provide a user ID: `/remove <userid>`")
+                                    self._send_message(base_url, chat_id, "❌ Provide user ID.")
                                 continue
 
                             if text.lower().startswith("/message "):
@@ -2042,8 +2096,7 @@ class RadXrReceiverApp:
                                 self.footer_message = new_msg
                                 self.config["footer_message"] = new_msg
                                 self.save_configuration()
-                                self._send_message(base_url, chat_id, f"✅ Caption message updated to:\n\n{new_msg}")
-                                self.log_message(f"Caption message changed to: {new_msg}")
+                                self._send_message(base_url, chat_id, f"✅ Caption updated.")
                                 continue
 
                             if text.lower().startswith("/footer"):
@@ -2069,17 +2122,15 @@ class RadXrReceiverApp:
                                                     self.pdf_footer_text = ""
                                                     self.config["pdf_footer_text"] = ""
                                                     self.save_configuration()
-                                                    self._send_message(base_url, chat_id, "✅ PDF footer image updated successfully.")
-                                                    self.log_message("PDF footer image set from reply photo.")
+                                                    self._send_message(base_url, chat_id, "✅ PDF footer image updated.")
                                                 else:
                                                     self._send_message(base_url, chat_id, "❌ Failed to download photo.")
                                             else:
                                                 self._send_message(base_url, chat_id, "❌ Failed to get file info.")
                                         else:
-                                            self._send_message(base_url, chat_id, "❌ Failed to fetch file info from Telegram.")
+                                            self._send_message(base_url, chat_id, "❌ Failed to fetch file info.")
                                     except Exception as e:
                                         self._send_message(base_url, chat_id, f"❌ Error: {e}")
-                                        self.log_message(f"Error setting footer image: {e}")
                                 else:
                                     if self.pdf_footer_image and os.path.exists(self.pdf_footer_image):
                                         try:
@@ -2093,10 +2144,9 @@ class RadXrReceiverApp:
                                     self.config["pdf_footer_text"] = new_footer
                                     self.save_configuration()
                                     if new_footer:
-                                        self._send_message(base_url, chat_id, f"✅ PDF footer text updated to:\n\n{new_footer}")
+                                        self._send_message(base_url, chat_id, f"✅ PDF footer text updated.")
                                     else:
                                         self._send_message(base_url, chat_id, "✅ PDF footer text cleared.")
-                                    self.log_message(f"PDF footer text set to: {new_footer}")
                                 continue
 
                             if text.lower().startswith("/broadcast "):
@@ -2104,10 +2154,9 @@ class RadXrReceiverApp:
                                 if broadcast_msg:
                                     self._broadcast_text(base_url, broadcast_msg, chat_id)
                                 else:
-                                    self._send_message(base_url, chat_id, "❌ Please provide a message: `/broadcast Hello everyone`")
+                                    self._send_message(base_url, chat_id, "❌ Provide message.")
                                 continue
 
-                            # Telegram credit commands
                             if text.lower().startswith("/trecharge "):
                                 amount_str = text[11:].strip()
                                 try:
@@ -2115,18 +2164,17 @@ class RadXrReceiverApp:
                                     if amount > 0:
                                         new_total = self.add_telegram_credits(amount)
                                         self._send_message(base_url, chat_id,
-                                            f"✅ Recharged {amount} Telegram credits.\nTotal remaining: {new_total}")
+                                            f"✅ Recharged {amount} Telegram credits. Total: {new_total}")
                                         self.refresh_credits_gui()
-                                        self.log_message(f"Recharged {amount} Telegram credits. New total: {new_total}")
                                     else:
-                                        self._send_message(base_url, chat_id, "❌ Please provide a positive number.")
+                                        self._send_message(base_url, chat_id, "❌ Positive number required.")
                                 except ValueError:
-                                    self._send_message(base_url, chat_id, "❌ Please provide a valid number: `/trecharge 100`")
+                                    self._send_message(base_url, chat_id, "❌ Provide a number.")
                                 continue
 
                             if text.lower() == "/tbalance":
                                 bal = self.get_telegram_credits()
-                                self._send_message(base_url, chat_id, f"🤖 Remaining Telegram credits: {bal}")
+                                self._send_message(base_url, chat_id, f"🤖 Telegram credits: {bal}")
                                 continue
 
                             if text.lower().startswith("/recharge "):
@@ -2136,37 +2184,34 @@ class RadXrReceiverApp:
                                     if amount > 0:
                                         new_total = self.add_whatsapp_credits(amount)
                                         self._send_message(base_url, chat_id,
-                                            f"✅ Recharged {amount} WhatsApp credits.\nTotal remaining: {new_total}")
+                                            f"✅ Recharged {amount} WhatsApp credits. Total: {new_total}")
                                         self.refresh_credits_gui()
-                                        self.log_message(f"Recharged {amount} WhatsApp credits. New total: {new_total}")
                                     else:
-                                        self._send_message(base_url, chat_id, "❌ Please provide a positive number.")
+                                        self._send_message(base_url, chat_id, "❌ Positive number required.")
                                 except ValueError:
-                                    self._send_message(base_url, chat_id, "❌ Please provide a valid number: `/recharge 100`")
+                                    self._send_message(base_url, chat_id, "❌ Provide a number.")
                                 continue
 
                             if text.lower() == "/balance":
                                 bal = self.get_whatsapp_credits()
-                                self._send_message(base_url, chat_id, f"💰 Remaining WhatsApp credits: {bal}")
+                                self._send_message(base_url, chat_id, f"💰 WhatsApp credits: {bal}")
                                 continue
 
                             if text.lower() == "/prompt":
                                 help_text = (
                                     "*Available Commands (Master only):*\n\n"
-                                    "/newbot `<token>` – Change Telegram bot token.\n"
-                                    "/adduser `<userid>` – Add a user to broadcast list.\n"
-                                    "/remove `<userid>` – Remove a user from broadcast list.\n"
-                                    "/message `<text>` – Set caption message for Telegram/WhatsApp.\n"
-                                    "/footer `<text>` – Set text inside PDF footer (between two lines).\n"
-                                    "Reply to a **photo** with `/footer` – set that photo as the PDF footer image.\n"
-                                    "/broadcast `<message>` – Send text message to all users.\n"
-                                    "Reply to any message with `/broadcast` – forward that message to all users.\n"
-                                    "/recharge `<number>` – Add WhatsApp sending credits.\n"
-                                    "/balance – Show remaining WhatsApp credits.\n"
-                                    "/trecharge `<number>` – Add Telegram sending credits.\n"
-                                    "/tbalance – Show remaining Telegram credits.\n"
-                                    "/prompt – Show this help message.\n\n"
-                                    "Any user can send `/start` to get their ID and a welcome message.\n"
+                                    "/newbot `<token>` – Change bot token.\n"
+                                    "/adduser `<userid>` – Add user.\n"
+                                    "/remove `<userid>` – Remove user.\n"
+                                    "/message `<text>` – Set caption message.\n"
+                                    "/footer `<text>` – Set PDF footer text.\n"
+                                    "Reply to a photo with `/footer` – set footer image.\n"
+                                    "/broadcast `<message>` – Broadcast to all users.\n"
+                                    "/recharge `<number>` – Add WhatsApp credits.\n"
+                                    "/balance – Show WhatsApp credits.\n"
+                                    "/trecharge `<number>` – Add Telegram credits.\n"
+                                    "/tbalance – Show Telegram credits.\n"
+                                    "/prompt – Show this help.\n\n"
                                     "To request a report, send:\n"
                                     "`[PATIENT ID]`\n"
                                     "`[PATIENT FIRST NAME]`"
@@ -2185,6 +2230,7 @@ class RadXrReceiverApp:
                             query_id = lines[0]
                             query_name = lines[1].lower()
 
+                            # 1. Check PDF cache
                             cached_pdf = self.get_saved_pdf_for_patient(query_id, query_name)
                             if cached_pdf:
                                 cached_path, c_id, c_name, c_acc = cached_pdf
@@ -2195,10 +2241,11 @@ class RadXrReceiverApp:
                                                     self.upsert_grid_record(fp, pi, pn, ac, "📤 Sent via Bot (Cached)"))
                                     self._send_message(base_url, chat_id, "✅ Report sent successfully!")
                                 except Exception as ex:
-                                    self._send_message(base_url, chat_id, f"❌ Error sending cached report: {str(ex)}")
-                                    self.log_message(f"❌ Bot error (cached PDF): {ex}")
+                                    self._send_message(base_url, chat_id, f"❌ Error sending cached report.")
+                                    self.log_message(f"❌ Bot error (cached): {ex}")
                                 continue
 
+                            # 2. Check DICOM index (files in Inbox)
                             matched_entries = self.get_patient_files_from_db(query_id, query_name)
 
                             if matched_entries:
@@ -2209,7 +2256,7 @@ class RadXrReceiverApp:
                                         valid_entries.append(entry)
                                     else:
                                         self._send_message(base_url, chat_id,
-                                            f"⚠️ File for Patient `{p_name}` (ID: {p_id}) is **deleted or not available**.")
+                                            f"⚠️ File for Patient `{p_name}` (ID: {p_id}) is missing.")
                                 if not valid_entries:
                                     self._send_message(base_url, chat_id, "❌ Report Not Available")
                                     continue
@@ -2219,7 +2266,6 @@ class RadXrReceiverApp:
                                 try:
                                     file_paths = [entry[0] for entry in valid_entries]
                                     _fp0, p_id, p_name, acc_no = valid_entries[0]
-                                    # Get study date from first file
                                     study_date = ""
                                     try:
                                         first_ds = pydicom.dcmread(file_paths[0], stop_before_pixels=True)
@@ -2240,7 +2286,7 @@ class RadXrReceiverApp:
                                     self._send_message(base_url, chat_id,
                                         f"✅ Combined PDF with {len(valid_entries)} image(s) sent successfully!")
                                 except Exception as ex:
-                                    self._send_message(base_url, chat_id, f"❌ Error generating combined PDF: {str(ex)}")
+                                    self._send_message(base_url, chat_id, f"❌ Error generating combined PDF.")
                                     self.log_message(f"❌ Bot error: {ex}")
                             else:
                                 self._send_message(base_url, chat_id, "❌ Report Not Available")

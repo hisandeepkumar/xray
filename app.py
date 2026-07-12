@@ -85,6 +85,7 @@ class DicomArchiveHandler(FileSystemEventHandler):
     def on_created(self, event):
         if not event.is_directory and event.src_path.lower().endswith('.dcm'):
             time.sleep(0.5)
+            # Process the new DICOM: index and queue for batching (which will send PDF)
             threading.Thread(target=self.app.handle_new_external_dicom, args=(event.src_path,), daemon=True).start()
 
     def on_moved(self, event):
@@ -491,7 +492,6 @@ class RadXrReceiverApp:
         else:
             today = time.strftime("%Y%m%d")
             formatted_date = f"{today[6:8]}{today[4:6]}{today[0:4]}"
-        # Clean filename: replace spaces with underscores for safety, but we'll keep spaces as allowed
         safe_name = "".join(c for c in patient_name if c.isalnum() or c in " -_")
         return f"{safe_name} {formatted_date} medical report.pdf"
 
@@ -612,16 +612,16 @@ class RadXrReceiverApp:
         if self.lbl_telegram_credits:
             self.lbl_telegram_credits.config(text=f"🤖 Telegram: {self.get_telegram_credits()}")
 
-    # ---------- Indexing ----------
+    # ---------- Indexing (now indexes Archive folder) ----------
     def index_all_existing_files(self, reindex=False):
         if self.indexing_in_progress:
             self.log_message("Indexing already in progress. Skipping.")
             return
         self.indexing_in_progress = True
-        self.log_message("Starting indexing of Inbox folder...")
-        inbox_dir = self.config["receive_folder"]
-        if not os.path.exists(inbox_dir):
-            self.log_message(f"Inbox folder {inbox_dir} does not exist.")
+        self.log_message("Starting indexing of Archive folder...")
+        archive_dir = self.config["archive_folder"]
+        if not os.path.exists(archive_dir):
+            self.log_message(f"Archive folder {archive_dir} does not exist.")
             self.indexing_in_progress = False
             return
 
@@ -636,14 +636,14 @@ class RadXrReceiverApp:
             conn = sqlite3.connect(DATABASE_PATH)
             c = conn.cursor()
 
-        all_files = [f for f in os.listdir(inbox_dir) if f.lower().endswith(".dcm")]
+        all_files = [f for f in os.listdir(archive_dir) if f.lower().endswith(".dcm")]
         total = len(all_files)
         processed = 0
 
         self.root.after(0, self.update_index_progress, processed, total)
 
         for file in all_files:
-            full_path = os.path.join(inbox_dir, file)
+            full_path = os.path.join(archive_dir, file)
             try:
                 if not reindex:
                     c.execute("SELECT file_path FROM dicom_index WHERE file_path = ?", (full_path,))
@@ -742,18 +742,15 @@ class RadXrReceiverApp:
             self.log_message("📁 Folder monitoring stopped.")
 
     def handle_new_external_dicom(self, file_path):
+        # This is called when a new DICOM appears in the Archive folder.
+        # We will index it and queue it for batching (which generates PDF and sends).
         try:
             if not os.path.exists(file_path):
                 return
-            ds = pydicom.dcmread(file_path, stop_before_pixels=True)
-            patient_id = self._normalize_string(ds.get("PatientID", "N/A"))
-            patient_name = self._normalize_string(ds.get("PatientName", "N/A"))
-            accession_no = self._normalize_string(ds.get("AccessionNumber", "UNKNOWN"))
-            self.index_dicom_file(file_path, patient_id, patient_name, accession_no)
-            self.root.after(0, lambda: self.upsert_grid_record(file_path, patient_id, patient_name, accession_no, "Archived (External) 📁"))
-            self.log_message(f"✅ External DICOM indexed: {os.path.basename(file_path)}")
+            # Queue for processing (will also index)
+            self.queue_file_for_patient_batch(file_path, is_manual_import=False)
         except Exception as e:
-            self.log_message(f"❌ Error indexing external DICOM {file_path}: {e}")
+            self.log_message(f"❌ Error processing external DICOM {file_path}: {e}")
 
     # ---------- GUI ----------
     def show_password_screen(self):
@@ -1002,7 +999,6 @@ class RadXrReceiverApp:
                         continue
                 if file_path and os.path.exists(file_path):
                     self.tree.item(item, values=(row_values[0], row_values[1], row_values[2], file_name, "⚡ Resending..."))
-                    # Acquire processing lock to ensure sequential resend
                     th = threading.Thread(target=self.resend_single_file, args=(file_path, item), daemon=True)
                     th.start()
                 else:
@@ -1010,17 +1006,19 @@ class RadXrReceiverApp:
             messagebox.showinfo("Resend", f"Started resending {count} failed image(s). Check console.")
 
     def resend_single_file(self, file_path, item_id):
-        with self.processing_lock:  # Ensure sequential processing
+        with self.processing_lock:
             row_values = self.tree.item(item_id, 'values')
             status_str = row_values[4]
             tg_enabled = bool(self.TELEGRAM_BOT_TOKEN)
             wa_enabled = bool(self.config.get("whatsapp_api_key") and self.config.get("whatsapp_phone_number_id"))
             tg_ok = "Telegram ✅" in status_str
             wa_ok = "WhatsApp ✅" in status_str
+            wa_skip = "WhatsApp ⏭️" in status_str
             if not tg_enabled:
                 tg_ok = True
             if not wa_enabled:
                 wa_ok = True
+                wa_skip = True
 
             try:
                 ds = pydicom.dcmread(file_path)
@@ -1035,6 +1033,7 @@ class RadXrReceiverApp:
 
                 new_tg_ok = tg_ok
                 new_wa_ok = wa_ok
+                new_wa_skip = wa_skip
                 if not tg_ok and tg_enabled:
                     if self.decrement_telegram_credits():
                         if self.send_to_all_telegram(pdf_path, patient_id, patient_name, accession_no):
@@ -1043,7 +1042,12 @@ class RadXrReceiverApp:
                             self.add_telegram_credits(1)
                     else:
                         self.log_message("⚠️ No Telegram credits for resend.")
-                if not wa_ok and wa_enabled:
+                # WhatsApp: skip if accession missing
+                accession_missing = not accession_no or accession_no in ("N/A", "UNKNOWN")
+                if accession_missing:
+                    new_wa_skip = True
+                    self.log_message(f"ℹ️ WhatsApp skipped: Accession Number missing for {patient_name} ({patient_id})")
+                elif not wa_ok and wa_enabled and not new_wa_skip:
                     if self.decrement_whatsapp_credits():
                         if self.dispatch_to_whatsapp_business(pdf_path, patient_id, patient_name, accession_no):
                             new_wa_ok = True
@@ -1056,14 +1060,18 @@ class RadXrReceiverApp:
                 if tg_enabled:
                     status_parts.append(f"Telegram {'✅' if new_tg_ok else '❌'}")
                 if wa_enabled:
-                    status_parts.append(f"WhatsApp {'✅' if new_wa_ok else '❌'}")
+                    if new_wa_skip:
+                        status_parts.append("WhatsApp ⏭️")
+                    else:
+                        status_parts.append(f"WhatsApp {'✅' if new_wa_ok else '❌'}")
                 if not status_parts:
                     status_parts.append("No platforms configured")
                 new_status = ", ".join(status_parts)
 
                 self.root.after(0, lambda: self.tree.item(item_id, values=(patient_id, patient_name, accession_no, os.path.basename(file_path), new_status)))
 
-                if (not tg_enabled or new_tg_ok) and (not wa_enabled or new_wa_ok):
+                all_ok = (not tg_enabled or new_tg_ok) and (not wa_enabled or new_wa_ok or new_wa_skip)
+                if all_ok:
                     try:
                         if os.path.exists(file_path):
                             os.remove(file_path)
@@ -1212,7 +1220,16 @@ class RadXrReceiverApp:
 
         self.lbl_index_progress_config = Label(form, text="✅ Indexing ready.", font=("Arial", 9), fg=self.accent_green, bg=self.bg_card)
         self.lbl_index_progress_config.pack(anchor="w", padx=20, pady=(5,10))
-        Button(form, text="🔄 Re-index Inbox", font=("Arial", 9, "bold"), bg=self.accent_cyan, fg=self.bg_dark, bd=0, padx=10, pady=5, cursor="hand2", command=self.reindex_archive).pack(anchor="w", padx=20, pady=5)
+
+        # Button frame for index operations
+        index_btn_frame = Frame(form, bg=self.bg_card)
+        index_btn_frame.pack(anchor="w", padx=20, pady=5)
+
+        Button(index_btn_frame, text="🔄 Re-index Archive", font=("Arial", 9, "bold"), bg=self.accent_cyan, fg=self.bg_dark, bd=0, padx=10, pady=5, cursor="hand2", command=self.reindex_archive).pack(side="left", padx=5)
+
+        Button(index_btn_frame, text="🗑️ Clear dicom_index", font=("Arial", 9, "bold"), bg="#ef4444", fg=self.text_light, bd=0, padx=10, pady=5, cursor="hand2", command=self.clear_dicom_index).pack(side="left", padx=5)
+
+        Button(index_btn_frame, text="🗑️ Clear pdf_index", font=("Arial", 9, "bold"), bg="#ef4444", fg=self.text_light, bd=0, padx=10, pady=5, cursor="hand2", command=self.clear_pdf_index).pack(side="left", padx=5)
 
         Button(content_frame, text="Apply Node Topology Changes", font=("Arial", 11, "bold"), bg=self.accent_green, fg=self.bg_dark, width=28, bd=0, cursor="hand2", command=self.apply_and_save_node_settings).pack(pady=15)
         Label(content_frame, text="Made with ❤️ by Sandeep", font=("Arial", 9, "bold", "italic"), fg="#6b7280", bg=self.bg_card).pack(side="bottom", pady=5)
@@ -1253,9 +1270,45 @@ class RadXrReceiverApp:
         if self.indexing_in_progress:
             messagebox.showinfo("Info", "Indexing already in progress. Please wait.")
             return
-        res = messagebox.askyesno("Confirm Re-index", "This will rebuild the entire index database. Continue?")
+        res = messagebox.askyesno("Confirm Re-index", "This will rebuild the entire dicom_index from the Archive folder. Continue?")
         if res:
             threading.Thread(target=self.index_all_existing_files, args=(True,), daemon=True).start()
+
+    def clear_dicom_index(self):
+        res = messagebox.askyesno("Confirm Clear", "This will delete ALL records from dicom_index table and VACUUM the database. Continue?")
+        if not res:
+            return
+        try:
+            conn = sqlite3.connect(DATABASE_PATH)
+            c = conn.cursor()
+            c.execute("DELETE FROM dicom_index")
+            conn.commit()
+            c.execute("VACUUM")
+            conn.commit()
+            conn.close()
+            self.log_message("✅ dicom_index cleared and database vacuumed.")
+            messagebox.showinfo("Success", "dicom_index table cleared and VACUUM completed.")
+        except Exception as e:
+            self.log_message(f"❌ Failed to clear dicom_index: {e}")
+            messagebox.showerror("Error", f"Failed to clear dicom_index: {e}")
+
+    def clear_pdf_index(self):
+        res = messagebox.askyesno("Confirm Clear", "This will delete ALL records from pdf_index table and VACUUM the database. Continue?")
+        if not res:
+            return
+        try:
+            conn = sqlite3.connect(DATABASE_PATH)
+            c = conn.cursor()
+            c.execute("DELETE FROM pdf_index")
+            conn.commit()
+            c.execute("VACUUM")
+            conn.commit()
+            conn.close()
+            self.log_message("✅ pdf_index cleared and database vacuumed.")
+            messagebox.showinfo("Success", "pdf_index table cleared and VACUUM completed.")
+        except Exception as e:
+            self.log_message(f"❌ Failed to clear pdf_index: {e}")
+            messagebox.showerror("Error", f"Failed to clear pdf_index: {e}")
 
     def sync_archive_folder_to_dashboard(self):
         archive_dir = self.config.get("archive_folder", DEFAULT_ARCHIVE)
@@ -1694,7 +1747,7 @@ class RadXrReceiverApp:
 
     # ---------- Processing Pipeline (with sequential lock) ----------
     def autonomous_processing_pipeline(self, dcm_path, is_manual_import=False):
-        with self.processing_lock:  # Ensure sequential processing
+        with self.processing_lock:
             pdf_output_path = ""
             try:
                 ds = pydicom.dcmread(dcm_path)
@@ -1720,6 +1773,10 @@ class RadXrReceiverApp:
 
                 tg_ok = False
                 wa_ok = False
+                wa_skip = False
+
+                # Check if accession is missing (empty, N/A, UNKNOWN)
+                accession_missing = not accession_no or accession_no in ("N/A", "UNKNOWN")
 
                 if tg_enabled:
                     if self.decrement_telegram_credits():
@@ -1731,31 +1788,36 @@ class RadXrReceiverApp:
                         self.log_message("⚠️ Insufficient Telegram credits.")
 
                 if wa_enabled:
-                    if self.decrement_whatsapp_credits():
-                        wa_ok = self.dispatch_to_whatsapp_business(pdf_output_path, patient_id, patient_name, accession_no)
-                        if not wa_ok:
-                            self.add_whatsapp_credits(1)
-                            self.log_message("⚠️ WhatsApp send failed, credit refunded.")
+                    if accession_missing:
+                        wa_skip = True
+                        self.log_message(f"ℹ️ WhatsApp skipped: Accession Number missing for {patient_name} ({patient_id})")
                     else:
-                        self.log_message("⚠️ Insufficient WhatsApp credits.")
+                        if self.decrement_whatsapp_credits():
+                            wa_ok = self.dispatch_to_whatsapp_business(pdf_output_path, patient_id, patient_name, accession_no)
+                            if not wa_ok:
+                                self.add_whatsapp_credits(1)
+                                self.log_message("⚠️ WhatsApp send failed, credit refunded.")
+                        else:
+                            self.log_message("⚠️ Insufficient WhatsApp credits.")
 
                 status_parts = []
                 if tg_enabled:
                     status_parts.append(f"Telegram {'✅' if tg_ok else '❌'}")
                 if wa_enabled:
-                    status_parts.append(f"WhatsApp {'✅' if wa_ok else '❌'}")
+                    if wa_skip:
+                        status_parts.append("WhatsApp ⏭️")
+                    else:
+                        status_parts.append(f"WhatsApp {'✅' if wa_ok else '❌'}")
                 if not status_parts:
                     status_parts.append("No platforms configured")
                 status_str = ", ".join(status_parts)
 
                 self.root.after(0, lambda: self.upsert_grid_record(file_key, patient_id, patient_name, accession_no, status_str))
 
-                all_ok = (not tg_enabled or tg_ok) and (not wa_enabled or wa_ok)
+                all_ok = (not tg_enabled or tg_ok) and (not wa_enabled or wa_ok or wa_skip)
                 if all_ok:
-                    # Save PDF index before deleting DICOM
                     self.save_pdf_index(patient_id, patient_name, accession_no, pdf_output_path)
                     self.log_message(f"💾 PDF saved and indexed: {os.path.basename(pdf_output_path)}")
-                    # Now safe to delete DICOM
                     try:
                         if os.path.exists(dcm_path):
                             os.remove(dcm_path)
@@ -1839,7 +1901,7 @@ class RadXrReceiverApp:
         ).start()
 
     def process_patient_batch(self, items, patient_id, patient_name, accession_no):
-        with self.processing_lock:  # Ensure sequential processing
+        with self.processing_lock:
             pdf_output_path = ""
             dcm_paths = [dcm for dcm, _ in items]
             try:
@@ -1874,6 +1936,9 @@ class RadXrReceiverApp:
 
                 tg_ok = False
                 wa_ok = False
+                wa_skip = False
+
+                accession_missing = not accession_no or accession_no in ("N/A", "UNKNOWN")
 
                 if tg_enabled:
                     if self.decrement_telegram_credits():
@@ -1885,19 +1950,26 @@ class RadXrReceiverApp:
                         self.log_message("⚠️ Insufficient Telegram credits.")
 
                 if wa_enabled:
-                    if self.decrement_whatsapp_credits():
-                        wa_ok = self.dispatch_to_whatsapp_business(pdf_output_path, patient_id, patient_name, accession_no)
-                        if not wa_ok:
-                            self.add_whatsapp_credits(1)
-                            self.log_message("⚠️ WhatsApp send failed, credit refunded.")
+                    if accession_missing:
+                        wa_skip = True
+                        self.log_message(f"ℹ️ WhatsApp skipped: Accession Number missing for {patient_name} ({patient_id})")
                     else:
-                        self.log_message("⚠️ Insufficient WhatsApp credits.")
+                        if self.decrement_whatsapp_credits():
+                            wa_ok = self.dispatch_to_whatsapp_business(pdf_output_path, patient_id, patient_name, accession_no)
+                            if not wa_ok:
+                                self.add_whatsapp_credits(1)
+                                self.log_message("⚠️ WhatsApp send failed, credit refunded.")
+                        else:
+                            self.log_message("⚠️ Insufficient WhatsApp credits.")
 
                 status_parts = []
                 if tg_enabled:
                     status_parts.append(f"Telegram {'✅' if tg_ok else '❌'}")
                 if wa_enabled:
-                    status_parts.append(f"WhatsApp {'✅' if wa_ok else '❌'}")
+                    if wa_skip:
+                        status_parts.append("WhatsApp ⏭️")
+                    else:
+                        status_parts.append(f"WhatsApp {'✅' if wa_ok else '❌'}")
                 if not status_parts:
                     status_parts.append("No platforms configured")
                 status_str = ", ".join(status_parts)
@@ -1906,9 +1978,8 @@ class RadXrReceiverApp:
                     self.root.after(0, lambda f=dcm: self.upsert_grid_record(
                         f, patient_id, patient_name, accession_no, status_str))
 
-                all_ok = (not tg_enabled or tg_ok) and (not wa_enabled or wa_ok)
+                all_ok = (not tg_enabled or tg_ok) and (not wa_enabled or wa_ok or wa_skip)
                 if all_ok:
-                    # Save PDF index before deleting DICOMs
                     self.save_pdf_index(patient_id, patient_name, accession_no, pdf_output_path)
                     self.log_message(f"💾 PDF saved and indexed: {os.path.basename(pdf_output_path)}")
                     for dcm in dcm_paths:
@@ -1970,10 +2041,10 @@ class RadXrReceiverApp:
         url = f"https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}/sendDocument"
         caption_text = self.build_beautiful_caption_string(p_id, p_name, acc_no, include_footer=True)
 
-        # Retry with exponential backoff
+        # Retry with exponential backoff, timeout 180 seconds
         max_attempts = 5
-        base_delay = 1  # seconds
-        timeout = 60  # increased upload timeout
+        base_delay = 1
+        timeout = 180
 
         for attempt in range(1, max_attempts + 1):
             try:
@@ -1994,7 +2065,7 @@ class RadXrReceiverApp:
                 self.log_message(f"⚠️ Telegram attempt {attempt} error: {e}")
 
             if attempt < max_attempts:
-                wait = base_delay * (2 ** (attempt - 1))  # exponential: 1, 2, 4, 8, 16
+                wait = base_delay * (2 ** (attempt - 1))
                 self.log_message(f"⏳ Retrying Telegram in {wait} seconds...")
                 time.sleep(wait)
 

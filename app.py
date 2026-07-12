@@ -14,6 +14,7 @@ from PIL import Image
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 import requests
+import gc
 
 from pynetdicom import AE, evt, sop_class
 from pynetdicom.presentation import AllStoragePresentationContexts
@@ -74,7 +75,7 @@ DATABASE_PATH = os.path.join(DATABASE_DIR, "radxr_index.db")
 FOOTER_IMAGE_PATH = os.path.join(CONFIG_DIR, "footer_image.jpg")
 
 DEFAULT_INBOX = os.path.join(CONFIG_DIR, "Inbox")
-DEFAULT_ARCHIVE = os.path.join(CONFIG_DIR, "Archive")  # not used by us
+DEFAULT_ARCHIVE = os.path.join(CONFIG_DIR, "Archive")
 
 class DicomArchiveHandler(FileSystemEventHandler):
     def __init__(self, app_instance):
@@ -1459,7 +1460,7 @@ class RadXrReceiverApp:
             self.log_message(f"❌ C-STORE error: {e}")
             return 0xC000
 
-    # ---------- PDF Generation (FIXED for multiple images) ----------
+    # ---------- PDF Generation (FIXED for multiple images & temp file lock) ----------
     def generate_pdf_report_from_dicom(self, dcm_paths, output_pdf_path):
         """
         Builds ONE PDF report from one or more DICOM files.
@@ -1512,6 +1513,7 @@ class RadXrReceiverApp:
                     draw_w = (f_img_w / f_img_h) * draw_h
                 footer_img_w = draw_w
                 footer_img_h = draw_h
+                footer_img.close()
             except Exception as e:
                 self.log_message(f"Footer image error: {e}")
                 footer_img_w = 0
@@ -1530,6 +1532,7 @@ class RadXrReceiverApp:
             total_pages = len(dcm_paths)
 
         page_counter = 0
+        temp_files = []  # track temp files for cleanup
 
         # Loop through each DICOM file
         for dcm_path in dcm_paths:
@@ -1561,13 +1564,18 @@ class RadXrReceiverApp:
                         frame_array = frame_array.astype(np.uint8)
 
                 # Convert to PIL Image
-                image = Image.fromarray(frame_array)
+                image = PILImage.fromarray(frame_array)
                 if image.mode != "RGB":
                     image = image.convert("RGB")
 
                 # Save temporary image (high quality JPEG)
                 temp_img_path = f"workflow_temp_frame_{page_counter}_{int(time.time())}.jpg"
                 image.save(temp_img_path, quality=95)
+                temp_files.append(temp_img_path)
+                # Close PIL image to free file handles
+                image.close()
+                del image
+                gc.collect()
 
                 # ---- Draw Header ----
                 header_y = height - top_margin
@@ -1612,7 +1620,7 @@ class RadXrReceiverApp:
                 # ---- Draw Image ----
                 avail_height = main_image_top - main_image_bottom
                 avail_width = width - 2 * margin_lr
-                img_w, img_h = image.size
+                img_w, img_h = image.size  # image already closed, but we have saved the file
                 scale = 1.0
                 if img_w > avail_width or img_h > avail_height:
                     scale = min(avail_width / img_w, avail_height / img_h)
@@ -1622,10 +1630,6 @@ class RadXrReceiverApp:
                 y_main = main_image_bottom + (avail_height - draw_main_h) / 2
                 c.drawImage(temp_img_path, x_main, y_main, width=draw_main_w, height=draw_main_h,
                             preserveAspectRatio=True, anchor='c')
-
-                # Remove temporary image
-                if os.path.exists(temp_img_path):
-                    os.remove(temp_img_path)
 
                 # ---- Draw Footer Image (if any) ----
                 if footer_img_w > 0 and footer_img_h > 0:
@@ -1638,7 +1642,29 @@ class RadXrReceiverApp:
 
         # Save PDF (no extra showPage)
         c.save()
+
+        # ---- Delete temporary files with retry ----
+        for temp_path in temp_files:
+            if os.path.exists(temp_path):
+                self._delete_file_with_retry(temp_path, max_retries=5, delay=0.2)
+
+        # Also force garbage collection
+        gc.collect()
+
         return patient_id, patient_name, accession_no, study_date
+
+    def _delete_file_with_retry(self, file_path, max_retries=5, delay=0.2):
+        """Delete a file with retry to handle Windows file locking."""
+        for attempt in range(max_retries):
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                return
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(delay * (attempt + 1))
+                else:
+                    self.log_message(f"⚠️ Could not delete {file_path} after {max_retries} attempts: {e}")
 
     # ---------- Processing Pipeline (no archive copy) ----------
     def autonomous_processing_pipeline(self, dcm_path, is_manual_import=False):
@@ -1699,17 +1725,19 @@ class RadXrReceiverApp:
 
             all_ok = (not tg_enabled or tg_ok) and (not wa_enabled or wa_ok)
             if all_ok:
+                # Save PDF index before deleting DICOM
+                self.save_pdf_index(patient_id, patient_name, accession_no, pdf_output_path)
+                self.log_message(f"💾 PDF saved and indexed: {os.path.basename(pdf_output_path)}")
+                # Now safe to delete DICOM
                 try:
                     if os.path.exists(dcm_path):
                         os.remove(dcm_path)
                         self.remove_from_index(dcm_path)
-                        self.log_message(f"🗑️ Deleted DICOM after send: {os.path.basename(dcm_path)}")
+                        self.log_message(f"🗑️ Deleted DICOM after successful send: {os.path.basename(dcm_path)}")
                 except Exception as e:
                     self.log_message(f"⚠️ Could not delete DICOM: {e}")
-                self.save_pdf_index(patient_id, patient_name, accession_no, pdf_output_path)
-                self.log_message(f"💾 PDF saved: {os.path.basename(pdf_output_path)}")
             else:
-                self.log_message(f"⚠️ Not all platforms succeeded, file kept: {os.path.basename(dcm_path)}")
+                self.log_message(f"⚠️ Not all platforms succeeded, DICOM kept: {os.path.basename(dcm_path)}")
 
         except Exception as e:
             self.root.after(0, lambda: messagebox.showerror("Pipeline Error", f"Error: {str(e)}"))
@@ -1852,6 +1880,9 @@ class RadXrReceiverApp:
 
             all_ok = (not tg_enabled or tg_ok) and (not wa_enabled or wa_ok)
             if all_ok:
+                # Save PDF index before deleting DICOMs
+                self.save_pdf_index(patient_id, patient_name, accession_no, pdf_output_path)
+                self.log_message(f"💾 PDF saved and indexed: {os.path.basename(pdf_output_path)}")
                 for dcm in dcm_paths:
                     try:
                         if os.path.exists(dcm):
@@ -1860,10 +1891,8 @@ class RadXrReceiverApp:
                             self.log_message(f"🗑️ Deleted DICOM after batch send: {os.path.basename(dcm)}")
                     except Exception as e:
                         self.log_message(f"⚠️ Could not delete DICOM {dcm}: {e}")
-                self.save_pdf_index(patient_id, patient_name, accession_no, pdf_output_path)
-                self.log_message(f"💾 PDF saved: {os.path.basename(pdf_output_path)}")
             else:
-                self.log_message(f"⚠️ Batch not fully sent, files kept.")
+                self.log_message(f"⚠️ Batch not fully sent, DICOMs kept.")
 
         except Exception as e:
             self.root.after(0, lambda: messagebox.showerror("Pipeline Error", f"Error: {str(e)}"))
@@ -1895,7 +1924,7 @@ class RadXrReceiverApp:
         caption += f"\n*Made with ❤️ by Sandeep*"
         return caption
 
-    # ---------- Telegram ----------
+    # ---------- Telegram (with retry) ----------
     def send_to_all_telegram(self, file_path, p_id, p_name, acc_no):
         user_ids = self.get_all_telegram_users()
         if not user_ids:
@@ -1911,20 +1940,38 @@ class RadXrReceiverApp:
 
     def dispatch_to_telegram(self, file_path, p_id, p_name, acc_no, target_chat_id):
         url = f"https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}/sendDocument"
-        try:
-            caption_text = self.build_beautiful_caption_string(p_id, p_name, acc_no, include_footer=True)
-            with open(file_path, "rb") as document:
-                payload = {
-                    "chat_id": target_chat_id,
-                    "caption": caption_text,
-                    "parse_mode": "Markdown"
-                }
-                files = {"document": (os.path.basename(file_path), document, "application/pdf")}
-                res = requests.post(url, data=payload, files=files, timeout=25)
-                return res.status_code == 200
-        except Exception as e:
-            self.log_message(f"Telegram send error: {e}")
-            return False
+        caption_text = self.build_beautiful_caption_string(p_id, p_name, acc_no, include_footer=True)
+
+        # Retry with exponential backoff
+        max_attempts = 5
+        base_delay = 1  # seconds
+        timeout = 60  # increased upload timeout
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                with open(file_path, "rb") as document:
+                    payload = {
+                        "chat_id": target_chat_id,
+                        "caption": caption_text,
+                        "parse_mode": "Markdown"
+                    }
+                    files = {"document": (os.path.basename(file_path), document, "application/pdf")}
+                    res = requests.post(url, data=payload, files=files, timeout=timeout)
+                    if res.status_code == 200:
+                        self.log_message(f"✅ Telegram sent to {target_chat_id} (attempt {attempt})")
+                        return True
+                    else:
+                        self.log_message(f"⚠️ Telegram attempt {attempt} failed with status {res.status_code}: {res.text}")
+            except Exception as e:
+                self.log_message(f"⚠️ Telegram attempt {attempt} error: {e}")
+
+            if attempt < max_attempts:
+                wait = base_delay * (2 ** (attempt - 1))  # exponential: 1, 2, 4, 8, 16
+                self.log_message(f"⏳ Retrying Telegram in {wait} seconds...")
+                time.sleep(wait)
+
+        self.log_message(f"❌ Telegram send failed after {max_attempts} attempts.")
+        return False
 
     # ---------- WhatsApp ----------
     def dispatch_to_whatsapp_business(self, file_path, p_id, p_name, acc_no):
@@ -1953,7 +2000,7 @@ class RadXrReceiverApp:
                     "file": (os.path.basename(file_path), f, "application/pdf"),
                     "messaging_product": (None, "whatsapp")
                 }
-                upload_res = requests.post(upload_url, headers=headers, files=files, timeout=25)
+                upload_res = requests.post(upload_url, headers=headers, files=files, timeout=60)
                 if upload_res.status_code != 200:
                     self.log_message(f"WhatsApp upload failed: {upload_res.text}")
                     return False
@@ -1972,7 +2019,7 @@ class RadXrReceiverApp:
                         "caption": clean_caption
                     }
                 }
-                msg_res = requests.post(msg_url, headers=headers, json=payload, timeout=25)
+                msg_res = requests.post(msg_url, headers=headers, json=payload, timeout=60)
                 if msg_res.status_code == 200:
                     return True
                 else:
@@ -1982,7 +2029,7 @@ class RadXrReceiverApp:
             self.log_message(f"WhatsApp error: {e}")
             return False
 
-    # ---------- Telegram Bot Polling ----------
+    # ---------- Telegram Bot Polling (with fixed PDF cache lookup) ----------
     def start_telegram_bot_polling(self):
         t = threading.Thread(target=self.telegram_bot_polling_worker, daemon=True)
         t.start()
@@ -2194,16 +2241,18 @@ class RadXrReceiverApp:
                                 self._broadcast_reply(base_url, reply_to, chat_id)
                                 continue
 
-                        # Patient Query
+                        # ---------- Patient Query (any user) ----------
                         lines = [line.strip() for line in text.split("\n") if line.strip()]
                         if len(lines) >= 2:
                             query_id = lines[0]
                             query_name = lines[1].lower()
 
-                            # 1. Check PDF cache
+                            # STEP 1: Check PDF cache (pdf_index)
+                            self.log_message(f"🔍 Searching pdf_index for patient ID: {query_id}, name prefix: {query_name[:4]}")
                             cached_pdf = self.get_saved_pdf_for_patient(query_id, query_name)
                             if cached_pdf:
                                 cached_path, c_id, c_name, c_acc = cached_pdf
+                                self.log_message(f"📄 PDF Found in cache: {os.path.basename(cached_path)}")
                                 try:
                                     self._send_message(base_url, chat_id, "📄 Found existing report. Sending...")
                                     ok = self.dispatch_to_telegram(cached_path, c_id, c_name, c_acc, chat_id)
@@ -2211,6 +2260,7 @@ class RadXrReceiverApp:
                                         self.root.after(0, lambda pi=c_id, pn=c_name, ac=c_acc, fp=cached_path:
                                                         self.upsert_grid_record(fp, pi, pn, ac, "📤 Sent via Bot (Cached)"))
                                         self._send_message(base_url, chat_id, "✅ Report sent successfully!")
+                                        self.log_message(f"✅ Cached PDF sent to {chat_id}")
                                     else:
                                         self._send_message(base_url, chat_id, "❌ Failed to send PDF. Please try again later.")
                                         self.log_message(f"⚠️ Failed to send cached PDF for {c_id} - {c_name}")
@@ -2219,7 +2269,8 @@ class RadXrReceiverApp:
                                     self.log_message(f"❌ Bot error (cached): {ex}")
                                 continue
 
-                            # 2. Check DICOM index
+                            # STEP 2: Cache miss – check DICOM index (dicom_index)
+                            self.log_message(f"🔍 Cache miss. Searching dicom_index for patient ID: {query_id}, name prefix: {query_name[:4]}")
                             matched_entries = self.get_patient_files_from_db(query_id, query_name)
 
                             if matched_entries:
@@ -2250,6 +2301,7 @@ class RadXrReceiverApp:
                                         self.get_pdf_folder(),
                                         self.build_pdf_filename(p_name, study_date)
                                     )
+                                    self.log_message(f"📄 Generating PDF from {len(file_paths)} DICOM files...")
                                     self.generate_pdf_report_from_dicom(file_paths, bot_pdf_path)
                                     ok = self.dispatch_to_telegram(bot_pdf_path, p_id, p_name, acc_no, chat_id)
                                     if ok:
@@ -2260,12 +2312,14 @@ class RadXrReceiverApp:
                                         self.save_pdf_index(p_id, p_name, acc_no, bot_pdf_path)
                                         self._send_message(base_url, chat_id,
                                             f"✅ Combined PDF with {len(valid_entries)} image(s) sent successfully!")
+                                        self.log_message(f"✅ New PDF generated and sent to {chat_id}")
                                     else:
                                         self._send_message(base_url, chat_id, "❌ Failed to send PDF.")
                                 except Exception as ex:
                                     self._send_message(base_url, chat_id, f"❌ Error generating combined PDF.")
                                     self.log_message(f"❌ Bot error: {ex}")
                             else:
+                                self.log_message(f"❌ No record found for patient ID: {query_id}, name: {query_name}")
                                 self._send_message(base_url, chat_id, "❌ Report Not Available")
             except Exception as e:
                 self.log_message(f"Bot polling error: {e}")

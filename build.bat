@@ -8,7 +8,8 @@ echo [1/4] Flushing existing build data files...
 rmdir /s /q build dist
 del /q RAD-XR.spec 2>nul
 echo Done.
-echo [2/4] Syncing core dependencies...
+echo.
+echo [2/4] Syncing core dependencies (including openpyxl for Excel export)...
 pip install -r requirements.txt --force-reinstall
 if %errorlevel% neq 0 (
     echo ERROR: Dependency mapping process collapsed.
@@ -24,11 +25,15 @@ pyinstaller --noconsole --onefile --name="RAD-XR" --icon=icon.png --add-data "ic
     --collect-all pylibjpeg_libjpeg ^
     --collect-all pylibjpeg_openjpeg ^
     --collect-all gdcm ^
+    --collect-all watchdog ^
+    --collect-all reportlab ^
+    --collect-all openpyxl ^
     --collect-data pydicom ^
     --copy-metadata pydicom ^
     --copy-metadata pylibjpeg ^
     --copy-metadata pylibjpeg-libjpeg ^
     --copy-metadata pylibjpeg-openjpeg ^
+    --copy-metadata openpyxl ^
     --hidden-import=numpy ^
     --hidden-import=pynetdicom ^
     --hidden-import=pydicom.encoders.gdcm ^
@@ -39,6 +44,14 @@ pyinstaller --noconsole --onefile --name="RAD-XR" --icon=icon.png --add-data "ic
     --hidden-import=pylibjpeg_openjpeg ^
     --hidden-import=gdcm ^
     --hidden-import=pylibjpeg.data ^
+    --hidden-import=watchdog ^
+    --hidden-import=watchdog.events ^
+    --hidden-import=watchdog.observers ^
+    --hidden-import=reportlab ^
+    --hidden-import=openpyxl ^
+    --hidden-import=openpyxl.cell ^
+    --hidden-import=openpyxl.reader.excel ^
+    --hidden-import=openpyxl.workbook ^
     app.py
 if %errorlevel% neq 0 (
     echo.

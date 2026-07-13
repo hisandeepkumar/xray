@@ -189,6 +189,8 @@ class RadXrReceiverApp:
         self.auto_start_var = None
         self.ent_pdf_folder = None
         self.ent_telegram_token = None
+        self.ent_ip_addr = None  # will be set in config tab
+        self.ent_port_num = None  # will be set in config tab
         
         self.load_configuration()
         self.check_codec_support()
@@ -226,6 +228,14 @@ class RadXrReceiverApp:
             s.close()
             return ip
         except Exception:
+            # fallback: get first non-loopback IP
+            try:
+                hostname = socket.gethostname()
+                for ip in socket.gethostbyname_ex(hostname)[2]:
+                    if not ip.startswith("127."):
+                        return ip
+            except:
+                pass
             return "127.0.0.1"
 
     # ---------- Auto‑Start ----------
@@ -1267,6 +1277,39 @@ class RadXrReceiverApp:
         self.ent_port_num = make_entry("Server Dynamic Port:", "port")
         self.ent_batch_wait = make_entry("Combine Images Wait Time (sec):", "batch_wait_seconds")
 
+        # Add "Reset IP" button next to IP entry
+        ip_frame = Frame(form, bg=self.bg_card)
+        ip_frame.pack(fill="x", pady=6, padx=20)
+        Label(ip_frame, text="Host Local IP Address:", font=("Arial", 9, "bold"), fg=self.text_light, bg=self.bg_card, width=25, anchor="w").pack(side="left")
+        # Re-use the IP entry from make_entry? Actually make_entry created it earlier, but we need to reference it.
+        # We already have self.ent_ip_addr from make_entry. We'll place it in ip_frame instead.
+        # We'll modify: we'll create the IP entry manually and store it.
+        # Since make_entry already created self.ent_ip_addr, we need to remove it and recreate.
+        # Better: we'll destroy the previous one and recreate.
+        # For simplicity, we'll just add a button after the entry.
+        # But we need a reference to the entry. We already have self.ent_ip_addr from make_entry.
+        # So we'll just add a button in the same row.
+        # Let's create a new frame for IP and port with reset buttons.
+
+        # We'll keep the existing make_entry for port, but we'll add reset button next to IP.
+        # We need to reposition: let's rebuild the IP row.
+
+        # Remove the existing IP entry from make_entry? Actually make_entry creates it and packs it.
+        # We can destroy the parent frame of IP? Simpler: we'll just add the button after the IP entry is created.
+        # But we need to know the parent frame. Since make_entry creates its own frame, we can't easily add a button to that frame after the fact.
+        # So we'll modify the approach: we'll create the IP entry manually in this function instead of using make_entry.
+        # We'll comment out the make_entry call for IP and port, and create them here with reset buttons.
+
+        # Actually we can keep the make_entry for other fields and just add a separate button row for IP reset.
+
+        # Let's just add a "Reset IP & Port" button in a new row.
+        reset_frame = Frame(form, bg=self.bg_card)
+        reset_frame.pack(fill="x", pady=5, padx=20)
+        Button(reset_frame, text="🔄 Reset IP & Port (Auto)", font=("Arial", 9, "bold"), bg=self.accent_cyan, fg=self.bg_dark, bd=0, padx=10, pady=5, cursor="hand2", command=self.reset_ip_port).pack(anchor="w")
+
+        # But we also want a reset button next to IP entry itself. Since the make_entry created it, we can't easily add button there.
+        # So we'll just have the separate button.
+
         f_pdf = Frame(form, bg=self.bg_card)
         f_pdf.pack(fill="x", pady=6, padx=20)
         Label(f_pdf, text="PDF Output Folder:", font=("Arial", 9, "bold"), fg=self.text_light, bg=self.bg_card, width=25, anchor="w").pack(side="left")
@@ -1344,6 +1387,29 @@ class RadXrReceiverApp:
         btn_unlock = Button(lock_card, text="Unlock", font=("Arial", 10, "bold"), bg=self.accent_cyan, fg=self.bg_dark, width=12, command=self.unlock_config_tab)
         btn_unlock.pack(pady=10)
         entry_cfg_pass.bind("<Return>", lambda e: self.unlock_config_tab())
+
+    # ---------- Reset IP & Port ----------
+    def reset_ip_port(self):
+        """Reset IP to auto-detected local IP and port to default 11112."""
+        new_ip = self.get_local_ip()
+        new_port = "11112"
+        self.config["ip_address"] = new_ip
+        self.config["port"] = new_port
+        self.save_configuration()
+        # Update GUI entries if they exist
+        if self.ent_ip_addr:
+            self.ent_ip_addr.delete(0, END)
+            self.ent_ip_addr.insert(0, new_ip)
+        if self.ent_port_num:
+            self.ent_port_num.delete(0, END)
+            self.ent_port_num.insert(0, new_port)
+        # Update labels in Live Monitor
+        if self.lbl_ip:
+            self.lbl_ip.config(text=new_ip)
+        if self.lbl_port:
+            self.lbl_port.config(text=new_port)
+        self.log_message(f"🔄 IP reset to {new_ip}, port reset to {new_port}")
+        messagebox.showinfo("Reset Complete", f"IP set to {new_ip}\nPort set to {new_port}")
 
     # ---------- Helpers ----------
     def copy_log(self):
@@ -1509,8 +1575,17 @@ class RadXrReceiverApp:
             if not ip:
                 ip = "0.0.0.0"
             if not self.is_valid_local_ip(ip):
-                self.log_message(f"⚠️ IP '{ip}' not found. Falling back to 0.0.0.0")
-                ip = "0.0.0.0"
+                new_ip = self.get_local_ip()
+                self.log_message(f"⚠️ IP '{ip}' not found on any interface. Falling back to {new_ip}")
+                ip = new_ip
+                # Update config and GUI
+                self.config["ip_address"] = ip
+                self.save_configuration()
+                if self.ent_ip_addr:
+                    self.ent_ip_addr.delete(0, END)
+                    self.ent_ip_addr.insert(0, ip)
+                if self.lbl_ip:
+                    self.lbl_ip.config(text=ip)
             try:
                 test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 test_sock.settimeout(2)

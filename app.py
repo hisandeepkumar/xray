@@ -189,8 +189,8 @@ class RadXrReceiverApp:
         self.auto_start_var = None
         self.ent_pdf_folder = None
         self.ent_telegram_token = None
-        self.ent_ip_addr = None  # will be set in config tab
-        self.ent_port_num = None  # will be set in config tab
+        self.ent_ip_addr = None
+        self.ent_port_num = None
         
         self.load_configuration()
         self.check_codec_support()
@@ -228,7 +228,6 @@ class RadXrReceiverApp:
             s.close()
             return ip
         except Exception:
-            # fallback: get first non-loopback IP
             try:
                 hostname = socket.gethostname()
                 for ip in socket.gethostbyname_ex(hostname)[2]:
@@ -1076,55 +1075,241 @@ class RadXrReceiverApp:
         self.log_message(f"🧹 Cleared {removed_count} fully sent file(s) from the grid.")
         messagebox.showinfo("Clear Sent", f"Removed {removed_count} sent file(s).")
 
-    # --- Resend Failed ---
+    # ---------- Status parsing helper ----------
+    def _parse_status(self, status_str):
+        """
+        Parse status string like "Telegram ✅, WhatsApp ❌" or "Telegram ✅"
+        Returns dict: {'telegram': True/False/None, 'whatsapp': True/False/None}
+        True = success, False = failure, None = not applicable
+        """
+        result = {'telegram': None, 'whatsapp': None}
+        if not status_str:
+            return result
+        # Split by comma
+        parts = [p.strip() for p in status_str.split(',')]
+        for part in parts:
+            if 'Telegram' in part:
+                if '✅' in part:
+                    result['telegram'] = True
+                elif '❌' in part:
+                    result['telegram'] = False
+                else:
+                    result['telegram'] = None
+            elif 'WhatsApp' in part:
+                if '✅' in part:
+                    result['whatsapp'] = True
+                elif '❌' in part:
+                    result['whatsapp'] = False
+                elif '⏭️' in part:
+                    result['whatsapp'] = True  # treat skip as success
+                else:
+                    result['whatsapp'] = None
+        return result
+
+    def _build_status_string(self, tg_ok, wa_ok, wa_skip=False):
+        """Build status string from platform booleans."""
+        parts = []
+        if self.TELEGRAM_BOT_TOKEN:
+            parts.append(f"Telegram {'✅' if tg_ok else '❌'}")
+        if self.config.get("whatsapp_api_key") and self.config.get("whatsapp_phone_number_id"):
+            if wa_skip:
+                parts.append("WhatsApp ⏭️")
+            else:
+                parts.append(f"WhatsApp {'✅' if wa_ok else '❌'}")
+        if not parts:
+            parts.append("No platforms configured")
+        return ", ".join(parts)
+
+    # ---------- Resend Failed (with batching) ----------
     def resend_failed_images(self):
+        """Gather failed items, group by patient, and resend each group as a batch."""
         failed_items = []
         for item in self.tree.get_children():
             values = self.tree.item(item, 'values')
             if values and "❌" in values[4]:
                 failed_items.append(item)
+
         if not failed_items:
             messagebox.showinfo("Resend", "No failed images to resend.")
             return
-        count = len(failed_items)
-        if messagebox.askyesno("Resend Failed", f"Found {count} failed image(s). Resend all?"):
-            for item in failed_items:
-                row_values = self.tree.item(item, 'values')
-                file_name = row_values[3]
-                file_path = None
-                for fpath, rid in self.queue_data.items():
-                    if rid == item:
-                        file_path = fpath
-                        break
-                if not file_path:
-                    inbox_file = os.path.join(self.config["receive_folder"], file_name)
-                    if os.path.exists(inbox_file):
-                        file_path = inbox_file
-                    else:
-                        self.tree.item(item, values=(row_values[0], row_values[1], row_values[2], file_name, "❌ File Missing"))
-                        continue
-                if file_path and os.path.exists(file_path):
-                    self.tree.item(item, values=(row_values[0], row_values[1], row_values[2], file_name, "⚡ Resending..."))
-                    th = threading.Thread(target=self.resend_single_file, args=(file_path, item), daemon=True)
-                    th.start()
-                else:
-                    self.tree.item(item, values=(row_values[0], row_values[1], row_values[2], file_name, "❌ File Missing"))
-            messagebox.showinfo("Resend", f"Started resending {count} failed image(s). Check console.")
 
+        count = len(failed_items)
+        if not messagebox.askyesno("Resend Failed", f"Found {count} failed image(s). Resend all?"):
+            return
+
+        # Group by patient key
+        groups = {}  # key -> list of (item_id, file_path, patient_id, patient_name, accession, study_date)
+        for item in failed_items:
+            row_values = self.tree.item(item, 'values')
+            if not row_values or len(row_values) < 5:
+                continue
+            p_id = row_values[0]
+            p_name = row_values[1]
+            accession = row_values[2]
+            file_name = row_values[3]
+            # Find file path
+            file_path = None
+            for fpath, rid in self.queue_data.items():
+                if rid == item:
+                    file_path = fpath
+                    break
+            if not file_path:
+                # Try inbox or archive
+                inbox_file = os.path.join(self.config["receive_folder"], file_name)
+                if os.path.exists(inbox_file):
+                    file_path = inbox_file
+                else:
+                    archive_file = os.path.join(self.config["archive_folder"], file_name)
+                    if os.path.exists(archive_file):
+                        file_path = archive_file
+            if not file_path or not os.path.exists(file_path):
+                self.log_message(f"❌ File not found: {file_name}")
+                continue
+            # Read study date from DICOM
+            study_date = ""
+            try:
+                ds = pydicom.dcmread(file_path, stop_before_pixels=True)
+                study_date = self._normalize_string(ds.get("StudyDate", ""))
+            except:
+                pass
+            key = self.compute_patient_key(p_id, p_name)
+            if not key:
+                key = f"UNKNOWN::{time.time_ns()}"
+            if key not in groups:
+                groups[key] = []
+            groups[key].append({
+                'item_id': item,
+                'file_path': file_path,
+                'patient_id': p_id,
+                'patient_name': p_name,
+                'accession': accession,
+                'study_date': study_date,
+                'file_name': file_name
+            })
+
+        # Process each group
+        for key, group_items in groups.items():
+            threading.Thread(target=self.resend_batch_for_patient, args=(group_items,), daemon=True).start()
+
+        messagebox.showinfo("Resend", f"Started resending {len(groups)} patient group(s). Check console.")
+
+    def resend_batch_for_patient(self, group_items):
+        """
+        Resend a group of failed files for the same patient as one combined PDF.
+        group_items: list of dicts with item_id, file_path, patient_id, patient_name, accession, study_date
+        """
+        with self.processing_lock:
+            try:
+                # Prepare data
+                file_paths = [item['file_path'] for item in group_items]
+                patient_id = group_items[0]['patient_id']
+                patient_name = group_items[0]['patient_name']
+                accession_no = group_items[0]['accession']
+                study_date = group_items[0]['study_date']
+
+                # Determine which platforms are enabled
+                tg_enabled = bool(self.TELEGRAM_BOT_TOKEN)
+                wa_enabled = bool(self.config.get("whatsapp_api_key") and self.config.get("whatsapp_phone_number_id"))
+
+                # Parse current status for each file to know which platforms failed
+                # We'll aggregate: for each platform, if any file has a failure, we need to retry.
+                tg_need_retry = False
+                wa_need_retry = False
+                for item in group_items:
+                    status_str = self.tree.item(item['item_id'], 'values')[4]
+                    parsed = self._parse_status(status_str)
+                    if parsed.get('telegram') is False:
+                        tg_need_retry = True
+                    if parsed.get('whatsapp') is False:
+                        wa_need_retry = True
+
+                # Generate combined PDF
+                pdf_folder = self.get_pdf_folder()
+                pdf_path = os.path.join(pdf_folder, self.build_pdf_filename(patient_name, study_date))
+                self.generate_pdf_report_from_dicom(file_paths, pdf_path)
+
+                # Update status to "Retrying..."
+                for item in group_items:
+                    self.root.after(0, lambda i=item['item_id'], p=patient_id, n=patient_name, a=accession_no:
+                                    self.tree.item(i, values=(p, n, a, item['file_name'], "⚡ Resending...")))
+
+                # Retry Telegram if needed
+                tg_ok = True
+                if tg_enabled and tg_need_retry:
+                    if self.decrement_telegram_credits():
+                        tg_ok = self.send_to_all_telegram(pdf_path, patient_id, patient_name, accession_no)
+                        if not tg_ok:
+                            self.add_telegram_credits(1)
+                            self.log_message("⚠️ Telegram resend failed, credit refunded.")
+                    else:
+                        tg_ok = False
+                        self.log_message("⚠️ No Telegram credits for resend.")
+                elif not tg_enabled:
+                    tg_ok = True  # not applicable
+
+                # Retry WhatsApp if needed (and if accession not missing)
+                wa_ok = True
+                wa_skip = False
+                accession_missing = not accession_no or accession_no in ("N/A", "UNKNOWN")
+                if wa_enabled and wa_need_retry and not accession_missing:
+                    if self.decrement_whatsapp_credits():
+                        wa_ok = self.dispatch_to_whatsapp_business(pdf_path, patient_id, patient_name, accession_no)
+                        if not wa_ok:
+                            self.add_whatsapp_credits(1)
+                            self.log_message("⚠️ WhatsApp resend failed, credit refunded.")
+                    else:
+                        wa_ok = False
+                        self.log_message("⚠️ No WhatsApp credits for resend.")
+                elif wa_enabled and accession_missing:
+                    wa_skip = True
+                    self.log_message(f"ℹ️ WhatsApp skipped: Accession Number missing for {patient_name} ({patient_id})")
+                elif not wa_enabled:
+                    wa_ok = True  # not applicable
+
+                # Build final status string
+                status_str = self._build_status_string(tg_ok, wa_ok, wa_skip)
+
+                # Update all items in group with the new status
+                for item in group_items:
+                    self.root.after(0, lambda i=item['item_id'], p=patient_id, n=patient_name, a=accession_no, s=status_str:
+                                    self.tree.item(i, values=(p, n, a, item['file_name'], s)))
+
+                # Check if all ok (or skipped)
+                all_ok = (not tg_enabled or tg_ok) and (not wa_enabled or wa_ok or wa_skip)
+                if all_ok:
+                    # Save PDF index
+                    self.save_pdf_index(patient_id, patient_name, accession_no, pdf_path)
+                    self.log_message(f"💾 PDF saved and indexed for resend: {os.path.basename(pdf_path)}")
+                    # Delete all DICOM files in the group
+                    for item in group_items:
+                        try:
+                            if os.path.exists(item['file_path']):
+                                os.remove(item['file_path'])
+                                self.remove_from_index(item['file_path'])
+                                self.log_message(f"🗑️ Deleted DICOM after resend: {os.path.basename(item['file_path'])}")
+                        except Exception as e:
+                            self.log_message(f"⚠️ Could not delete {item['file_path']}: {e}")
+                else:
+                    self.log_message(f"⚠️ Resend partial success for {patient_name} ({patient_id}): {status_str}")
+
+            except Exception as e:
+                self.log_message(f"❌ Resend batch error: {e}")
+                # Update items to show error
+                for item in group_items:
+                    self.root.after(0, lambda i=item['item_id'], p=patient_id, n=patient_name, a=accession_no:
+                                    self.tree.item(i, values=(p, n, a, item['file_name'], f"Error: {str(e)[:30]}")))
+
+    # ---------- Resend single file (kept for double‑click) ----------
     def resend_single_file(self, file_path, item_id):
         with self.processing_lock:
             row_values = self.tree.item(item_id, 'values')
             status_str = row_values[4]
             tg_enabled = bool(self.TELEGRAM_BOT_TOKEN)
             wa_enabled = bool(self.config.get("whatsapp_api_key") and self.config.get("whatsapp_phone_number_id"))
-            tg_ok = "Telegram ✅" in status_str
-            wa_ok = "WhatsApp ✅" in status_str
-            wa_skip = "WhatsApp ⏭️" in status_str
-            if not tg_enabled:
-                tg_ok = True
-            if not wa_enabled:
-                wa_ok = True
-                wa_skip = True
+            parsed = self._parse_status(status_str)
+            tg_ok = parsed.get('telegram') if parsed.get('telegram') is not None else True
+            wa_ok = parsed.get('whatsapp') if parsed.get('whatsapp') is not None else True
+            wa_skip = False  # will be set if accession missing
 
             try:
                 ds = pydicom.dcmread(file_path)
@@ -1139,7 +1324,8 @@ class RadXrReceiverApp:
 
                 new_tg_ok = tg_ok
                 new_wa_ok = wa_ok
-                new_wa_skip = wa_skip
+                new_wa_skip = False
+
                 if not tg_ok and tg_enabled:
                     if self.decrement_telegram_credits():
                         if self.send_to_all_telegram(pdf_path, patient_id, patient_name, accession_no):
@@ -1148,12 +1334,12 @@ class RadXrReceiverApp:
                             self.add_telegram_credits(1)
                     else:
                         self.log_message("⚠️ No Telegram credits for resend.")
-                # WhatsApp: skip if accession missing
+
                 accession_missing = not accession_no or accession_no in ("N/A", "UNKNOWN")
                 if accession_missing:
                     new_wa_skip = True
                     self.log_message(f"ℹ️ WhatsApp skipped: Accession Number missing for {patient_name} ({patient_id})")
-                elif not wa_ok and wa_enabled and not new_wa_skip:
+                elif not wa_ok and wa_enabled:
                     if self.decrement_whatsapp_credits():
                         if self.dispatch_to_whatsapp_business(pdf_path, patient_id, patient_name, accession_no):
                             new_wa_ok = True
@@ -1162,19 +1348,9 @@ class RadXrReceiverApp:
                     else:
                         self.log_message("⚠️ No WhatsApp credits for resend.")
 
-                status_parts = []
-                if tg_enabled:
-                    status_parts.append(f"Telegram {'✅' if new_tg_ok else '❌'}")
-                if wa_enabled:
-                    if new_wa_skip:
-                        status_parts.append("WhatsApp ⏭️")
-                    else:
-                        status_parts.append(f"WhatsApp {'✅' if new_wa_ok else '❌'}")
-                if not status_parts:
-                    status_parts.append("No platforms configured")
-                new_status = ", ".join(status_parts)
+                status_str = self._build_status_string(new_tg_ok, new_wa_ok, new_wa_skip)
 
-                self.root.after(0, lambda: self.tree.item(item_id, values=(patient_id, patient_name, accession_no, os.path.basename(file_path), new_status)))
+                self.root.after(0, lambda: self.tree.item(item_id, values=(patient_id, patient_name, accession_no, os.path.basename(file_path), status_str)))
 
                 all_ok = (not tg_enabled or new_tg_ok) and (not wa_enabled or new_wa_ok or new_wa_skip)
                 if all_ok:
@@ -1187,7 +1363,7 @@ class RadXrReceiverApp:
                         self.log_message(f"⚠️ Could not delete DICOM: {e}")
                     self.save_pdf_index(patient_id, patient_name, accession_no, pdf_path)
                 else:
-                    self.log_message(f"⚠️ Resend partial success: {new_status}")
+                    self.log_message(f"⚠️ Resend partial success: {status_str}")
 
             except Exception as e:
                 self.log_message(f"❌ Resend error: {e}")
@@ -1277,38 +1453,10 @@ class RadXrReceiverApp:
         self.ent_port_num = make_entry("Server Dynamic Port:", "port")
         self.ent_batch_wait = make_entry("Combine Images Wait Time (sec):", "batch_wait_seconds")
 
-        # Add "Reset IP" button next to IP entry
-        ip_frame = Frame(form, bg=self.bg_card)
-        ip_frame.pack(fill="x", pady=6, padx=20)
-        Label(ip_frame, text="Host Local IP Address:", font=("Arial", 9, "bold"), fg=self.text_light, bg=self.bg_card, width=25, anchor="w").pack(side="left")
-        # Re-use the IP entry from make_entry? Actually make_entry created it earlier, but we need to reference it.
-        # We already have self.ent_ip_addr from make_entry. We'll place it in ip_frame instead.
-        # We'll modify: we'll create the IP entry manually and store it.
-        # Since make_entry already created self.ent_ip_addr, we need to remove it and recreate.
-        # Better: we'll destroy the previous one and recreate.
-        # For simplicity, we'll just add a button after the entry.
-        # But we need a reference to the entry. We already have self.ent_ip_addr from make_entry.
-        # So we'll just add a button in the same row.
-        # Let's create a new frame for IP and port with reset buttons.
-
-        # We'll keep the existing make_entry for port, but we'll add reset button next to IP.
-        # We need to reposition: let's rebuild the IP row.
-
-        # Remove the existing IP entry from make_entry? Actually make_entry creates it and packs it.
-        # We can destroy the parent frame of IP? Simpler: we'll just add the button after the IP entry is created.
-        # But we need to know the parent frame. Since make_entry creates its own frame, we can't easily add a button to that frame after the fact.
-        # So we'll modify the approach: we'll create the IP entry manually in this function instead of using make_entry.
-        # We'll comment out the make_entry call for IP and port, and create them here with reset buttons.
-
-        # Actually we can keep the make_entry for other fields and just add a separate button row for IP reset.
-
-        # Let's just add a "Reset IP & Port" button in a new row.
+        # Reset IP & Port button
         reset_frame = Frame(form, bg=self.bg_card)
         reset_frame.pack(fill="x", pady=5, padx=20)
         Button(reset_frame, text="🔄 Reset IP & Port (Auto)", font=("Arial", 9, "bold"), bg=self.accent_cyan, fg=self.bg_dark, bd=0, padx=10, pady=5, cursor="hand2", command=self.reset_ip_port).pack(anchor="w")
-
-        # But we also want a reset button next to IP entry itself. Since the make_entry created it, we can't easily add button there.
-        # So we'll just have the separate button.
 
         f_pdf = Frame(form, bg=self.bg_card)
         f_pdf.pack(fill="x", pady=6, padx=20)
@@ -1396,14 +1544,12 @@ class RadXrReceiverApp:
         self.config["ip_address"] = new_ip
         self.config["port"] = new_port
         self.save_configuration()
-        # Update GUI entries if they exist
         if self.ent_ip_addr:
             self.ent_ip_addr.delete(0, END)
             self.ent_ip_addr.insert(0, new_ip)
         if self.ent_port_num:
             self.ent_port_num.delete(0, END)
             self.ent_port_num.insert(0, new_port)
-        # Update labels in Live Monitor
         if self.lbl_ip:
             self.lbl_ip.config(text=new_ip)
         if self.lbl_port:
@@ -1578,7 +1724,6 @@ class RadXrReceiverApp:
                 new_ip = self.get_local_ip()
                 self.log_message(f"⚠️ IP '{ip}' not found on any interface. Falling back to {new_ip}")
                 ip = new_ip
-                # Update config and GUI
                 self.config["ip_address"] = ip
                 self.save_configuration()
                 if self.ent_ip_addr:

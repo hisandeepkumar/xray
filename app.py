@@ -555,6 +555,26 @@ class RadXrReceiverApp:
         conn.close()
         return [row[0] for row in rows]
 
+    def get_all_groups_with_info(self):
+    """Return list of (group_id, added_by, added_at) for all groups."""
+    conn = sqlite3.connect(DATABASE_PATH)
+    c = conn.cursor()
+    c.execute("SELECT group_id, added_by, added_at FROM groups")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def _format_group_list(self):
+    """Format group list for display."""
+    groups = self.get_all_groups_with_info()
+    if not groups:
+        return "No groups added yet."
+    lines = ["📋 *Added Groups:*", ""]
+    for gid, added_by, added_at in groups:
+        added_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(added_at)) if added_at else "Unknown"
+        lines.append(f"• `{gid}`  (added by `{added_by}` on {added_time})")
+    return "\n".join(lines)
+
     # ---------- PDF Folder & Naming ----------
     def get_pdf_folder(self):
         custom_folder = self.config.get("pdf_output_folder", "").strip()
@@ -2226,295 +2246,179 @@ class RadXrReceiverApp:
         t.start()
 
     def telegram_bot_polling_worker(self):
-        base_url = f"https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}"
-        # state for config update
-        expecting_config = False
-        config_update_message_id = None
+    base_url = f"https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}"
+    expecting_config = False
+    config_update_message_id = None
 
-        while self.bot_running:
-            try:
-                url = f"{base_url}/getUpdates?offset={self.last_update_id + 1}&timeout=10"
-                response = requests.get(url, timeout=15)
-                if response.status_code == 200:
-                    data = response.json()
-                    for update in data.get("result", []):
-                        self.last_update_id = update["update_id"]
-                        if "message" not in update:
-                            continue
-                        msg = update["message"]
-                        chat_id = str(msg["chat"]["id"])
-                        text = msg.get("text", "").strip()
-                        user = msg.get("from", {})
-                        user_id = str(user.get("id", ""))
-                        username = user.get("username", "")
-                        full_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
-                        if user_id:
-                            self.save_telegram_user(user_id, username, full_name)
+    while self.bot_running:
+        try:
+            url = f"{base_url}/getUpdates?offset={self.last_update_id + 1}&timeout=10"
+            response = requests.get(url, timeout=15)
+            if response.status_code == 200:
+                data = response.json()
+                for update in data.get("result", []):
+                    self.last_update_id = update["update_id"]
+                    if "message" not in update:
+                        continue
+                    msg = update["message"]
+                    chat_id = str(msg["chat"]["id"])
+                    text = msg.get("text", "").strip()
+                    user = msg.get("from", {})
+                    user_id = str(user.get("id", ""))
+                    username = user.get("username", "")
+                    full_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
+                    is_group = msg["chat"]["type"] in ("group", "supergroup")
 
-                        # Handle /start
-                        if text.lower().startswith("/start"):
-                            welcome = (
-                                f"🏥 *Welcome to RAD-XR Portal Search Node*\n\n"
-                                f"Your User ID: `{chat_id}`\n\n"
-                                "To retrieve your patient's report(s), send the following format:\n"
-                                "`[PATIENT ID]`\n"
-                                "`[PATIENT FIRST NAME]`\n\n"
-                                "*Example:*\n"
-                                "`1898`\n"
-                                "`sandeep`"
-                            )
-                            if self.footer_message.strip():
-                                welcome += f"\n\n📝 *Message from Admin:* {self.footer_message.strip()}"
-                            self._send_message(base_url, chat_id, welcome)
-                            continue
+                    if user_id:
+                        self.save_telegram_user(user_id, username, full_name)
 
-                        # Master user commands
-                        if chat_id == self.TELEGRAM_MASTER_USER_ID:
-                            # ---- /newbot ----
-                            if text.lower().startswith("/newbot "):
-                                new_token = text[8:].strip()
-                                if new_token:
-                                    self.TELEGRAM_BOT_TOKEN = new_token
-                                    self.last_update_id = 0
-                                    self.config["telegram_bot_token"] = new_token
-                                    self.save_configuration()
-                                    base_url = f"https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}"
-                                    self.update_bot_username()
-                                    self.refresh_bot_info_gui()
-                                    self._send_message(base_url, chat_id, "✅ Bot token updated successfully.")
-                                else:
-                                    self._send_message(base_url, chat_id, "❌ Provide a token: `/newbot <token>`")
-                                continue
+                    # ---- /start ----
+                    if text.lower().startswith("/start"):
+                        welcome = (
+                            f"🏥 *Welcome to RAD-XR Portal Search Node*\n\n"
+                            f"Your User ID: `{chat_id}`\n\n"
+                            "To retrieve your patient's report(s), send the following format:\n"
+                            "`[PATIENT ID]`\n"
+                            "`[PATIENT FIRST NAME]`\n\n"
+                            "*Example:*\n"
+                            "`1898`\n"
+                            "`sandeep`"
+                        )
+                        if self.footer_message.strip():
+                            welcome += f"\n\n📝 *Message from Admin:* {self.footer_message.strip()}"
+                        self._send_message(base_url, chat_id, welcome)
+                        continue
 
-                            # ---- /adduser - adds to admin_users ----
-                            if text.lower().startswith("/adduser "):
-                                uid = text[9:].strip()
-                                if uid:
-                                    self.add_admin_user(uid, chat_id)
-                                    self.save_telegram_user(uid, "", "")
-                                    self._send_message(base_url, chat_id, f"✅ User `{uid}` added to admin list.")
-                                else:
-                                    self._send_message(base_url, chat_id, "❌ Provide user ID.")
-                                continue
-
-                            # ---- /remove - remove from admin_users ----
-                            if text.lower().startswith("/remove "):
-                                uid = text[8:].strip()
-                                if uid == self.TELEGRAM_MASTER_USER_ID:
-                                    self._send_message(base_url, chat_id, "❌ Cannot remove master.")
-                                elif uid:
-                                    self.remove_admin_user(uid)
-                                    self._send_message(base_url, chat_id, f"✅ User `{uid}` removed from admin list.")
-                                else:
-                                    self._send_message(base_url, chat_id, "❌ Provide user ID.")
-                                continue
-
-                            # ---- /users - export Excel ----
-                            if text.lower() == "/users":
-                                self._send_message(base_url, chat_id, "📊 Generating user list...")
-                                self._export_users_excel(base_url, chat_id)
-                                continue
-
-                            # ---- /addgroup ----
-                            if text.lower().startswith("/addgroup "):
-                                gid = text[10:].strip()
-                                if gid:
-                                    self.add_group(gid, chat_id)
-                                    self._send_message(base_url, chat_id, f"✅ Group `{gid}` added.")
-                                else:
-                                    self._send_message(base_url, chat_id, "❌ Provide group ID.")
-                                continue
-
-                            # ---- /removegroup ----
-                            if text.lower().startswith("/removegroup "):
-                                gid = text[13:].strip()
-                                if gid:
-                                    self.remove_group(gid)
-                                    self._send_message(base_url, chat_id, f"✅ Group `{gid}` removed.")
-                                else:
-                                    self._send_message(base_url, chat_id, "❌ Provide group ID.")
-                                continue
-
-                            # ---- /getconfig ----
-                            if text.lower() == "/getconfig":
-                                if os.path.exists(CONFIG_FILE):
-                                    self._send_message(base_url, chat_id, "📄 Sending current config file...")
-                                    ok = self._send_document(base_url, chat_id, CONFIG_FILE, "Current config file")
-                                    if not ok:
-                                        self._send_message(base_url, chat_id, "❌ Failed to send config file.")
-                                else:
-                                    self._send_message(base_url, chat_id, "❌ Config file not found.")
-                                continue
-
-                            # ---- /getdb ----
-                            if text.lower() == "/getdb":
-                                if os.path.exists(DATABASE_PATH):
-                                    self._send_message(base_url, chat_id, "📄 Sending database file...")
-                                    ok = self._send_document(base_url, chat_id, DATABASE_PATH, "Database file (radxr_index.db)")
-                                    if not ok:
-                                        self._send_message(base_url, chat_id, "❌ Failed to send database file.")
-                                else:
-                                    self._send_message(base_url, chat_id, "❌ Database file not found.")
-                                continue
-
-                            # ---- /updateconfig ----
-                            if text.lower() == "/updateconfig":
-                                self._send_message(base_url, chat_id, "Please send the new config file as a document (JSON).")
-                                expecting_config = True
-                                config_update_message_id = msg["message_id"]
-                                continue
-
-                            # ---- /message ----
-                            if text.lower().startswith("/message "):
-                                new_msg = text[9:].strip()
-                                self.footer_message = new_msg
-                                self.config["footer_message"] = new_msg
+                    # ---- Master commands (check user_id, not chat_id) ----
+                    if user_id == self.TELEGRAM_MASTER_USER_ID:
+                        # ---- /newbot ----
+                        if text.lower().startswith("/newbot "):
+                            new_token = text[8:].strip()
+                            if new_token:
+                                self.TELEGRAM_BOT_TOKEN = new_token
+                                self.last_update_id = 0
+                                self.config["telegram_bot_token"] = new_token
                                 self.save_configuration()
-                                self._send_message(base_url, chat_id, "✅ Caption updated.")
-                                continue
+                                base_url = f"https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}"
+                                self.update_bot_username()
+                                self.refresh_bot_info_gui()
+                                self._send_message(base_url, chat_id, "✅ Bot token updated successfully.")
+                            else:
+                                self._send_message(base_url, chat_id, "❌ Provide a token: `/newbot <token>`")
+                            continue
 
-                            # ---- /footer ----
-                            if text.lower().startswith("/footer"):
-                                reply_to = msg.get("reply_to_message")
-                                if reply_to and "photo" in reply_to:
-                                    try:
-                                        photos = reply_to["photo"]
-                                        largest = photos[-1]
-                                        file_id = largest["file_id"]
-                                        get_file_url = f"{base_url}/getFile?file_id={file_id}"
-                                        file_resp = requests.get(get_file_url, timeout=10)
-                                        if file_resp.status_code == 200:
-                                            file_data = file_resp.json()
-                                            if file_data.get("ok"):
-                                                file_path = file_data["result"]["file_path"]
-                                                download_url = f"https://api.telegram.org/file/bot{self.TELEGRAM_BOT_TOKEN}/{file_path}"
-                                                img_resp = requests.get(download_url, timeout=30)
-                                                if img_resp.status_code == 200:
-                                                    with open(FOOTER_IMAGE_PATH, "wb") as f:
-                                                        f.write(img_resp.content)
-                                                    self.pdf_footer_image = FOOTER_IMAGE_PATH
-                                                    self.config["pdf_footer_image"] = FOOTER_IMAGE_PATH
-                                                    self.pdf_footer_text = ""
-                                                    self.config["pdf_footer_text"] = ""
-                                                    self.save_configuration()
-                                                    self._send_message(base_url, chat_id, "✅ PDF footer image updated.")
-                                                else:
-                                                    self._send_message(base_url, chat_id, "❌ Failed to download photo.")
-                                            else:
-                                                self._send_message(base_url, chat_id, "❌ Failed to get file info.")
-                                        else:
-                                            self._send_message(base_url, chat_id, "❌ Failed to fetch file info.")
-                                    except Exception as e:
-                                        self._send_message(base_url, chat_id, f"❌ Error: {e}")
-                                else:
-                                    if self.pdf_footer_image and os.path.exists(self.pdf_footer_image):
-                                        try:
-                                            os.remove(self.pdf_footer_image)
-                                        except:
-                                            pass
-                                        self.pdf_footer_image = ""
-                                        self.config["pdf_footer_image"] = ""
-                                    new_footer = text[7:].strip() if len(text) > 7 else ""
-                                    self.pdf_footer_text = new_footer
-                                    self.config["pdf_footer_text"] = new_footer
-                                    self.save_configuration()
-                                    if new_footer:
-                                        self._send_message(base_url, chat_id, "✅ PDF footer text updated.")
-                                    else:
-                                        self._send_message(base_url, chat_id, "✅ PDF footer text cleared.")
-                                continue
+                        # ---- /adduser ----
+                        if text.lower().startswith("/adduser "):
+                            uid = text[9:].strip()
+                            if uid:
+                                self.add_admin_user(uid, user_id)
+                                self.save_telegram_user(uid, "", "")
+                                self._send_message(base_url, chat_id, f"✅ User `{uid}` added to admin list.")
+                            else:
+                                self._send_message(base_url, chat_id, "❌ Provide user ID.")
+                            continue
 
-                            # ---- /broadcast ----
-                            if text.lower().startswith("/broadcast "):
-                                broadcast_msg = text[11:].strip()
-                                if broadcast_msg:
-                                    self._broadcast_text(base_url, broadcast_msg, chat_id)
-                                else:
-                                    self._send_message(base_url, chat_id, "❌ Provide message.")
-                                continue
+                        # ---- /remove ----
+                        if text.lower().startswith("/remove "):
+                            uid = text[8:].strip()
+                            if uid == self.TELEGRAM_MASTER_USER_ID:
+                                self._send_message(base_url, chat_id, "❌ Cannot remove master.")
+                            elif uid:
+                                self.remove_admin_user(uid)
+                                self._send_message(base_url, chat_id, f"✅ User `{uid}` removed from admin list.")
+                            else:
+                                self._send_message(base_url, chat_id, "❌ Provide user ID.")
+                            continue
 
-                            # ---- Credits ----
-                            if text.lower().startswith("/trecharge "):
-                                amount_str = text[11:].strip()
+                        # ---- /users ----
+                        if text.lower() == "/users":
+                            self._send_message(base_url, chat_id, "📊 Generating user list...")
+                            self._export_users_excel(base_url, chat_id)
+                            continue
+
+                        # ---- /addgroup ----
+                        if text.lower().startswith("/addgroup "):
+                            gid = text[10:].strip()
+                            if gid:
+                                self.add_group(gid, user_id)
+                                self._send_message(base_url, chat_id, f"✅ Group `{gid}` added.")
+                            else:
+                                self._send_message(base_url, chat_id, "❌ Provide group ID.")
+                            continue
+
+                        if text.lower() == "/addgroup":
+                            # No argument: if in a group, auto-add this group
+                            if is_group:
+                                gid = chat_id
+                                self.add_group(gid, user_id)
+                                self._send_message(base_url, chat_id, f"✅ This group `{gid}` added.")
+                            else:
+                                self._send_message(base_url, chat_id, "❌ This is a private chat. Please provide group ID: `/addgroup <group_id>`")
+                            continue
+
+                        # ---- /removegroup ----
+                      
+if text.lower().startswith("/removegroup "):
+    gid = text[13:].strip()
+    if gid:
+        self.remove_group(gid)
+        self._send_message(base_url, chat_id, f"✅ Group `{gid}` removed.")
+    else:
+        self._send_message(base_url, chat_id, "❌ Provide group ID. Use `/removegroup` without argument to list all groups.")
+    continue
+
+if text.lower() == "/removegroup":
+    # No argument: list all groups
+    group_list = self._format_group_list()
+    self._send_message(base_url, chat_id, group_list)
+    continue
+
+                        # ---- /getconfig ----
+                        if text.lower() == "/getconfig":
+                            if os.path.exists(CONFIG_FILE):
+                                self._send_message(base_url, chat_id, "📄 Sending current config file...")
+                                ok = self._send_document(base_url, chat_id, CONFIG_FILE, "Current config file")
+                                if not ok:
+                                    self._send_message(base_url, chat_id, "❌ Failed to send config file.")
+                            else:
+                                self._send_message(base_url, chat_id, "❌ Config file not found.")
+                            continue
+
+                        # ---- /getdb ----
+                        if text.lower() == "/getdb":
+                            if os.path.exists(DATABASE_PATH):
+                                self._send_message(base_url, chat_id, "📄 Sending database file...")
+                                ok = self._send_document(base_url, chat_id, DATABASE_PATH, "Database file (radxr_index.db)")
+                                if not ok:
+                                    self._send_message(base_url, chat_id, "❌ Failed to send database file.")
+                            else:
+                                self._send_message(base_url, chat_id, "❌ Database file not found.")
+                            continue
+
+                        # ---- /updateconfig ----
+                        if text.lower() == "/updateconfig":
+                            self._send_message(base_url, chat_id, "Please send the new config file as a document (JSON).")
+                            expecting_config = True
+                            config_update_message_id = msg["message_id"]
+                            continue
+
+                        # ---- /message ----
+                        if text.lower().startswith("/message "):
+                            new_msg = text[9:].strip()
+                            self.footer_message = new_msg
+                            self.config["footer_message"] = new_msg
+                            self.save_configuration()
+                            self._send_message(base_url, chat_id, "✅ Caption updated.")
+                            continue
+
+                        # ---- /footer ----
+                        if text.lower().startswith("/footer"):
+                            reply_to = msg.get("reply_to_message")
+                            if reply_to and "photo" in reply_to:
                                 try:
-                                    amount = int(amount_str)
-                                    if amount > 0:
-                                        new_total = self.add_telegram_credits(amount)
-                                        self._send_message(base_url, chat_id,
-                                            f"✅ Recharged {amount} Telegram credits. Total: {new_total}")
-                                        self.refresh_credits_gui()
-                                    else:
-                                        self._send_message(base_url, chat_id, "❌ Positive number required.")
-                                except ValueError:
-                                    self._send_message(base_url, chat_id, "❌ Provide a number.")
-                                continue
-
-                            if text.lower() == "/tbalance":
-                                bal = self.get_telegram_credits()
-                                self._send_message(base_url, chat_id, f"🤖 Telegram credits: {bal}")
-                                continue
-
-                            if text.lower().startswith("/recharge "):
-                                amount_str = text[10:].strip()
-                                try:
-                                    amount = int(amount_str)
-                                    if amount > 0:
-                                        new_total = self.add_whatsapp_credits(amount)
-                                        self._send_message(base_url, chat_id,
-                                            f"✅ Recharged {amount} WhatsApp credits. Total: {new_total}")
-                                        self.refresh_credits_gui()
-                                    else:
-                                        self._send_message(base_url, chat_id, "❌ Positive number required.")
-                                except ValueError:
-                                    self._send_message(base_url, chat_id, "❌ Provide a number.")
-                                continue
-
-                            if text.lower() == "/balance":
-                                bal = self.get_whatsapp_credits()
-                                self._send_message(base_url, chat_id, f"💰 WhatsApp credits: {bal}")
-                                continue
-
-                            # ---- /prompt ----
-                            if text.lower() == "/prompt":
-                                help_text = (
-                                    "*Available Commands (Master only):*\n\n"
-                                    "🔹 `/newbot <token>` – Change Telegram bot token.\n"
-                                    "🔹 `/adduser <userid>` – Add admin user (auto‑send).\n"
-                                    "🔹 `/remove <userid>` – Remove admin user.\n"
-                                    "🔹 `/users` – Export Excel with admin_users and telegram_users.\n"
-                                    "🔹 `/addgroup <group_id>` – Add a group for auto‑send.\n"
-                                    "🔹 `/removegroup <group_id>` – Remove a group.\n"
-                                    "🔹 `/getconfig` – Send current config file.\n"
-                                    "🔹 `/getdb` – Send database file.\n"
-                                    "🔹 `/updateconfig` – Reply with a JSON file to replace config.\n"
-                                    "🔹 `/message <text>` – Set caption message.\n"
-                                    "🔹 `/footer <text>` – Set PDF footer text (or reply to photo).\n"
-                                    "🔹 `/broadcast <message>` – Broadcast to ALL users.\n"
-                                    "🔹 `/recharge <number>` – Add WhatsApp credits.\n"
-                                    "🔹 `/balance` – Show WhatsApp credits.\n"
-                                    "🔹 `/trecharge <number>` – Add Telegram credits.\n"
-                                    "🔹 `/tbalance` – Show Telegram credits.\n"
-                                    "🔹 `/prompt` – Show this help.\n\n"
-                                    "📌 *For all users:*\n"
-                                    "• `/start` – Get your ID and welcome message.\n"
-                                    "• To request a report, send:\n"
-                                    "  `[PATIENT ID]`\n"
-                                    "  `[PATIENT FIRST NAME]`"
-                                )
-                                self._send_message(base_url, chat_id, help_text)
-                                continue
-
-                            # ---- Handle reply to /broadcast ----
-                            if msg.get("reply_to_message") and text.lower() == "/broadcast":
-                                reply_to = msg["reply_to_message"]
-                                self._broadcast_reply(base_url, reply_to, chat_id)
-                                continue
-
-                            # ---- Handle file upload for /updateconfig ----
-                            if expecting_config and msg.get("reply_to_message") and msg["reply_to_message"]["message_id"] == config_update_message_id:
-                                document = msg.get("document")
-                                if document and document.get("mime_type") == "application/json":
-                                    file_id = document["file_id"]
+                                    photos = reply_to["photo"]
+                                    largest = photos[-1]
+                                    file_id = largest["file_id"]
                                     get_file_url = f"{base_url}/getFile?file_id={file_id}"
                                     file_resp = requests.get(get_file_url, timeout=10)
                                     if file_resp.status_code == 200:
@@ -2522,127 +2426,260 @@ class RadXrReceiverApp:
                                         if file_data.get("ok"):
                                             file_path = file_data["result"]["file_path"]
                                             download_url = f"https://api.telegram.org/file/bot{self.TELEGRAM_BOT_TOKEN}/{file_path}"
-                                            content_resp = requests.get(download_url, timeout=30)
-                                            if content_resp.status_code == 200:
-                                                try:
-                                                    new_config = content_resp.json()
-                                                    # Validate required keys (basic check)
-                                                    required_keys = ["telegram_bot_token", "whatsapp_api_key", "institute_name"]
-                                                    missing = [k for k in required_keys if k not in new_config]
-                                                    if missing:
-                                                        self._send_message(base_url, chat_id, f"❌ Invalid config: missing keys {missing}")
-                                                    else:
-                                                        # Backup existing config
-                                                        backup_path = CONFIG_FILE + ".bak"
-                                                        if os.path.exists(CONFIG_FILE):
-                                                            shutil.copy2(CONFIG_FILE, backup_path)
-                                                            self.log_message(f"📁 Config backed up to {backup_path}")
-                                                        # Write new config
-                                                        with open(CONFIG_FILE, "w") as f:
-                                                            json.dump(new_config, f, indent=4)
-                                                        # Reload config
-                                                        self.load_configuration()
-                                                        self.TELEGRAM_BOT_TOKEN = self.config["telegram_bot_token"]
-                                                        self.update_bot_username()
-                                                        self.refresh_bot_info_gui()
-                                                        self.save_configuration()
-                                                        self._send_message(base_url, chat_id, "✅ Config updated and reloaded successfully.")
-                                                        self.log_message("✅ Config updated via Telegram.")
-                                                except json.JSONDecodeError:
-                                                    self._send_message(base_url, chat_id, "❌ Invalid JSON file.")
+                                            img_resp = requests.get(download_url, timeout=30)
+                                            if img_resp.status_code == 200:
+                                                with open(FOOTER_IMAGE_PATH, "wb") as f:
+                                                    f.write(img_resp.content)
+                                                self.pdf_footer_image = FOOTER_IMAGE_PATH
+                                                self.config["pdf_footer_image"] = FOOTER_IMAGE_PATH
+                                                self.pdf_footer_text = ""
+                                                self.config["pdf_footer_text"] = ""
+                                                self.save_configuration()
+                                                self._send_message(base_url, chat_id, "✅ PDF footer image updated.")
                                             else:
-                                                self._send_message(base_url, chat_id, "❌ Failed to download file content.")
+                                                self._send_message(base_url, chat_id, "❌ Failed to download photo.")
                                         else:
                                             self._send_message(base_url, chat_id, "❌ Failed to get file info.")
                                     else:
-                                        self._send_message(base_url, chat_id, "❌ Failed to fetch file.")
-                                else:
-                                    self._send_message(base_url, chat_id, "❌ Please reply with a JSON file.")
-                                expecting_config = False
-                                continue
-
-                        # ---------- Patient Query (any user, including groups) ----------
-                        lines = [line.strip() for line in text.split("\n") if line.strip()]
-                        if len(lines) >= 2:
-                            query_id = lines[0]
-                            query_name = lines[1].lower()
-
-                            self.log_message(f"🔍 Searching pdf_index for patient ID: {query_id}, name prefix: {query_name[:4]}")
-                            cached_pdf = self.get_saved_pdf_for_patient(query_id, query_name)
-                            if cached_pdf:
-                                cached_path, c_id, c_name, c_acc = cached_pdf
-                                self.log_message(f"📄 PDF Found in cache: {os.path.basename(cached_path)}")
-                                try:
-                                    self._send_message(base_url, chat_id, "📄 Found existing report. Sending...")
-                                    ok = self.dispatch_to_telegram(cached_path, c_id, c_name, c_acc, chat_id)
-                                    if ok:
-                                        self.root.after(0, lambda pi=c_id, pn=c_name, ac=c_acc, fp=cached_path:
-                                                        self.upsert_grid_record(fp, pi, pn, ac, "📤 Sent via Bot (Cached)"))
-                                        self._send_message(base_url, chat_id, "✅ Report sent successfully!")
-                                        self.log_message(f"✅ Cached PDF sent to {chat_id}")
-                                    else:
-                                        self._send_message(base_url, chat_id, "❌ Failed to send PDF. Please try again later.")
-                                        self.log_message(f"⚠️ Failed to send cached PDF for {c_id} - {c_name}")
-                                except Exception as ex:
-                                    self._send_message(base_url, chat_id, f"❌ Error sending cached report.")
-                                    self.log_message(f"❌ Bot error (cached): {ex}")
-                                continue
-
-                            self.log_message(f"🔍 Cache miss. Searching dicom_index for patient ID: {query_id}, name prefix: {query_name[:4]}")
-                            matched_entries = self.get_patient_files_from_db(query_id, query_name)
-
-                            if matched_entries:
-                                valid_entries = []
-                                for entry in matched_entries:
-                                    file_path, p_id, p_name, acc_no = entry
-                                    if os.path.exists(file_path):
-                                        valid_entries.append(entry)
-                                    else:
-                                        self._send_message(base_url, chat_id,
-                                            f"⚠️ File for Patient `{p_name}` (ID: {p_id}) is missing.")
-                                if not valid_entries:
-                                    self._send_message(base_url, chat_id, "❌ Report Not Available")
-                                    continue
-
-                                self._send_message(base_url, chat_id,
-                                    f"🔍 Found **{len(valid_entries)}** available DICOM file(s). Generating combined PDF...")
-                                try:
-                                    file_paths = [entry[0] for entry in valid_entries]
-                                    _fp0, p_id, p_name, acc_no = valid_entries[0]
-                                    study_date = ""
-                                    try:
-                                        first_ds = pydicom.dcmread(file_paths[0], stop_before_pixels=True)
-                                        study_date = self._normalize_string(first_ds.get("StudyDate", ""))
-                                    except Exception:
-                                        pass
-                                    bot_pdf_path = os.path.join(
-                                        self.get_pdf_folder(),
-                                        self.build_pdf_filename(p_name, study_date)
-                                    )
-                                    self.log_message(f"📄 Generating PDF from {len(file_paths)} DICOM files...")
-                                    self.generate_pdf_report_from_dicom(file_paths, bot_pdf_path)
-                                    ok = self.dispatch_to_telegram(bot_pdf_path, p_id, p_name, acc_no, chat_id)
-                                    if ok:
-                                        for entry in valid_entries:
-                                            file_path, e_id, e_name, e_acc = entry
-                                            self.root.after(0, lambda pi=e_id, pn=e_name, ac=e_acc, fp=file_path:
-                                                            self.upsert_grid_record(fp, pi, pn, ac, "📤 Sent via Bot (Combined)"))
-                                        self.save_pdf_index(p_id, p_name, acc_no, bot_pdf_path)
-                                        self._send_message(base_url, chat_id,
-                                            f"✅ Combined PDF with {len(valid_entries)} image(s) sent successfully!")
-                                        self.log_message(f"✅ New PDF generated and sent to {chat_id}")
-                                    else:
-                                        self._send_message(base_url, chat_id, "❌ Failed to send PDF.")
-                                except Exception as ex:
-                                    self._send_message(base_url, chat_id, f"❌ Error generating combined PDF.")
-                                    self.log_message(f"❌ Bot error: {ex}")
+                                        self._send_message(base_url, chat_id, "❌ Failed to fetch file info.")
+                                except Exception as e:
+                                    self._send_message(base_url, chat_id, f"❌ Error: {e}")
                             else:
-                                self.log_message(f"❌ No record found for patient ID: {query_id}, name: {query_name}")
-                                self._send_message(base_url, chat_id, "❌ Report Not Available")
-            except Exception as e:
-                self.log_message(f"Bot polling error: {e}")
-            time.sleep(1)
+                                if self.pdf_footer_image and os.path.exists(self.pdf_footer_image):
+                                    try:
+                                        os.remove(self.pdf_footer_image)
+                                    except:
+                                        pass
+                                    self.pdf_footer_image = ""
+                                    self.config["pdf_footer_image"] = ""
+                                new_footer = text[7:].strip() if len(text) > 7 else ""
+                                self.pdf_footer_text = new_footer
+                                self.config["pdf_footer_text"] = new_footer
+                                self.save_configuration()
+                                if new_footer:
+                                    self._send_message(base_url, chat_id, "✅ PDF footer text updated.")
+                                else:
+                                    self._send_message(base_url, chat_id, "✅ PDF footer text cleared.")
+                            continue
 
+                        # ---- /broadcast ----
+                        if text.lower().startswith("/broadcast "):
+                            broadcast_msg = text[11:].strip()
+                            if broadcast_msg:
+                                self._broadcast_text(base_url, broadcast_msg, chat_id)
+                            else:
+                                self._send_message(base_url, chat_id, "❌ Provide message.")
+                            continue
+
+                        # ---- Credits ----
+                        if text.lower().startswith("/trecharge "):
+                            amount_str = text[11:].strip()
+                            try:
+                                amount = int(amount_str)
+                                if amount > 0:
+                                    new_total = self.add_telegram_credits(amount)
+                                    self._send_message(base_url, chat_id,
+                                        f"✅ Recharged {amount} Telegram credits. Total: {new_total}")
+                                    self.refresh_credits_gui()
+                                else:
+                                    self._send_message(base_url, chat_id, "❌ Positive number required.")
+                            except ValueError:
+                                self._send_message(base_url, chat_id, "❌ Provide a number.")
+                            continue
+
+                        if text.lower() == "/tbalance":
+                            bal = self.get_telegram_credits()
+                            self._send_message(base_url, chat_id, f"🤖 Telegram credits: {bal}")
+                            continue
+
+                        if text.lower().startswith("/recharge "):
+                            amount_str = text[10:].strip()
+                            try:
+                                amount = int(amount_str)
+                                if amount > 0:
+                                    new_total = self.add_whatsapp_credits(amount)
+                                    self._send_message(base_url, chat_id,
+                                        f"✅ Recharged {amount} WhatsApp credits. Total: {new_total}")
+                                    self.refresh_credits_gui()
+                                else:
+                                    self._send_message(base_url, chat_id, "❌ Positive number required.")
+                            except ValueError:
+                                self._send_message(base_url, chat_id, "❌ Provide a number.")
+                            continue
+
+                        if text.lower() == "/balance":
+                            bal = self.get_whatsapp_credits()
+                            self._send_message(base_url, chat_id, f"💰 WhatsApp credits: {bal}")
+                            continue
+
+                        # ---- /prompt ----
+                        if text.lower() == "/prompt":
+    help_text = (
+        "*Available Commands (Master only):*\n\n"
+        "🔹 `/newbot <token>` – Change Telegram bot token.\n"
+        "🔹 `/adduser <userid>` – Add admin user (auto‑send).\n"
+        "🔹 `/remove <userid>` – Remove admin user.\n"
+        "🔹 `/users` – Export Excel with admin_users and telegram_users.\n"
+        "🔹 `/addgroup <group_id>` – Add a group for auto‑send.\n"
+        "    *In a group, use `/addgroup` without argument to add this group.*\n"
+        "🔹 `/removegroup <group_id>` – Remove a group.\n"
+        "    *Use `/removegroup` without argument to list all added groups.*\n"
+        "🔹 `/getconfig` – Send current config file.\n"
+        "🔹 `/getdb` – Send database file.\n"
+        "🔹 `/updateconfig` – Reply with a JSON file to replace config.\n"
+        "🔹 `/message <text>` – Set caption message.\n"
+        "🔹 `/footer <text>` – Set PDF footer text (or reply to photo).\n"
+        "🔹 `/broadcast <message>` – Broadcast to ALL users.\n"
+        "🔹 `/recharge <number>` – Add WhatsApp credits.\n"
+        "🔹 `/balance` – Show WhatsApp credits.\n"
+        "🔹 `/trecharge <number>` – Add Telegram credits.\n"
+        "🔹 `/tbalance` – Show Telegram credits.\n"
+        "🔹 `/prompt` – Show this help.\n\n"
+        "📌 *For all users:*\n"
+        "• `/start` – Get your ID and welcome message.\n"
+        "• To request a report, send:\n"
+        "  `[PATIENT ID]`\n"
+        "  `[PATIENT FIRST NAME]`"
+    )
+    self._send_message(base_url, chat_id, help_text)
+    continue
+
+                        # ---- Handle reply to /broadcast ----
+                        if msg.get("reply_to_message") and text.lower() == "/broadcast":
+                            reply_to = msg["reply_to_message"]
+                            self._broadcast_reply(base_url, reply_to, chat_id)
+                            continue
+
+                        # ---- Handle file upload for /updateconfig ----
+                        if expecting_config and msg.get("reply_to_message") and msg["reply_to_message"]["message_id"] == config_update_message_id:
+                            document = msg.get("document")
+                            if document and document.get("mime_type") == "application/json":
+                                file_id = document["file_id"]
+                                get_file_url = f"{base_url}/getFile?file_id={file_id}"
+                                file_resp = requests.get(get_file_url, timeout=10)
+                                if file_resp.status_code == 200:
+                                    file_data = file_resp.json()
+                                    if file_data.get("ok"):
+                                        file_path = file_data["result"]["file_path"]
+                                        download_url = f"https://api.telegram.org/file/bot{self.TELEGRAM_BOT_TOKEN}/{file_path}"
+                                        content_resp = requests.get(download_url, timeout=30)
+                                        if content_resp.status_code == 200:
+                                            try:
+                                                new_config = content_resp.json()
+                                                required_keys = ["telegram_bot_token", "whatsapp_api_key", "institute_name"]
+                                                missing = [k for k in required_keys if k not in new_config]
+                                                if missing:
+                                                    self._send_message(base_url, chat_id, f"❌ Invalid config: missing keys {missing}")
+                                                else:
+                                                    backup_path = CONFIG_FILE + ".bak"
+                                                    if os.path.exists(CONFIG_FILE):
+                                                        shutil.copy2(CONFIG_FILE, backup_path)
+                                                        self.log_message(f"📁 Config backed up to {backup_path}")
+                                                    with open(CONFIG_FILE, "w") as f:
+                                                        json.dump(new_config, f, indent=4)
+                                                    self.load_configuration()
+                                                    self.TELEGRAM_BOT_TOKEN = self.config["telegram_bot_token"]
+                                                    self.update_bot_username()
+                                                    self.refresh_bot_info_gui()
+                                                    self.save_configuration()
+                                                    self._send_message(base_url, chat_id, "✅ Config updated and reloaded successfully.")
+                                                    self.log_message("✅ Config updated via Telegram.")
+                                            except json.JSONDecodeError:
+                                                self._send_message(base_url, chat_id, "❌ Invalid JSON file.")
+                                        else:
+                                            self._send_message(base_url, chat_id, "❌ Failed to download file content.")
+                                    else:
+                                        self._send_message(base_url, chat_id, "❌ Failed to get file info.")
+                                else:
+                                    self._send_message(base_url, chat_id, "❌ Failed to fetch file.")
+                            else:
+                                self._send_message(base_url, chat_id, "❌ Please reply with a JSON file.")
+                            expecting_config = False
+                            continue
+
+                    # ---------- Patient Query (any user, including groups) ----------
+                    lines = [line.strip() for line in text.split("\n") if line.strip()]
+                    if len(lines) >= 2:
+                        query_id = lines[0]
+                        query_name = lines[1].lower()
+
+                        self.log_message(f"🔍 Searching pdf_index for patient ID: {query_id}, name prefix: {query_name[:4]}")
+                        cached_pdf = self.get_saved_pdf_for_patient(query_id, query_name)
+                        if cached_pdf:
+                            cached_path, c_id, c_name, c_acc = cached_pdf
+                            self.log_message(f"📄 PDF Found in cache: {os.path.basename(cached_path)}")
+                            try:
+                                self._send_message(base_url, chat_id, "📄 Found existing report. Sending...")
+                                ok = self.dispatch_to_telegram(cached_path, c_id, c_name, c_acc, chat_id)
+                                if ok:
+                                    self.root.after(0, lambda pi=c_id, pn=c_name, ac=c_acc, fp=cached_path:
+                                                    self.upsert_grid_record(fp, pi, pn, ac, "📤 Sent via Bot (Cached)"))
+                                    self._send_message(base_url, chat_id, "✅ Report sent successfully!")
+                                    self.log_message(f"✅ Cached PDF sent to {chat_id}")
+                                else:
+                                    self._send_message(base_url, chat_id, "❌ Failed to send PDF. Please try again later.")
+                                    self.log_message(f"⚠️ Failed to send cached PDF for {c_id} - {c_name}")
+                            except Exception as ex:
+                                self._send_message(base_url, chat_id, f"❌ Error sending cached report.")
+                                self.log_message(f"❌ Bot error (cached): {ex}")
+                            continue
+
+                        self.log_message(f"🔍 Cache miss. Searching dicom_index for patient ID: {query_id}, name prefix: {query_name[:4]}")
+                        matched_entries = self.get_patient_files_from_db(query_id, query_name)
+
+                        if matched_entries:
+                            valid_entries = []
+                            for entry in matched_entries:
+                                file_path, p_id, p_name, acc_no = entry
+                                if os.path.exists(file_path):
+                                    valid_entries.append(entry)
+                                else:
+                                    self._send_message(base_url, chat_id,
+                                        f"⚠️ File for Patient `{p_name}` (ID: {p_id}) is missing.")
+                            if not valid_entries:
+                                self._send_message(base_url, chat_id, "❌ Report Not Available")
+                                continue
+
+                            self._send_message(base_url, chat_id,
+                                f"🔍 Found **{len(valid_entries)}** available DICOM file(s). Generating combined PDF...")
+                            try:
+                                file_paths = [entry[0] for entry in valid_entries]
+                                _fp0, p_id, p_name, acc_no = valid_entries[0]
+                                study_date = ""
+                                try:
+                                    first_ds = pydicom.dcmread(file_paths[0], stop_before_pixels=True)
+                                    study_date = self._normalize_string(first_ds.get("StudyDate", ""))
+                                except Exception:
+                                    pass
+                                bot_pdf_path = os.path.join(
+                                    self.get_pdf_folder(),
+                                    self.build_pdf_filename(p_name, study_date)
+                                )
+                                self.log_message(f"📄 Generating PDF from {len(file_paths)} DICOM files...")
+                                self.generate_pdf_report_from_dicom(file_paths, bot_pdf_path)
+                                ok = self.dispatch_to_telegram(bot_pdf_path, p_id, p_name, acc_no, chat_id)
+                                if ok:
+                                    for entry in valid_entries:
+                                        file_path, e_id, e_name, e_acc = entry
+                                        self.root.after(0, lambda pi=e_id, pn=e_name, ac=e_acc, fp=file_path:
+                                                        self.upsert_grid_record(fp, pi, pn, ac, "📤 Sent via Bot (Combined)"))
+                                    self.save_pdf_index(p_id, p_name, acc_no, bot_pdf_path)
+                                    self._send_message(base_url, chat_id,
+                                        f"✅ Combined PDF with {len(valid_entries)} image(s) sent successfully!")
+                                    self.log_message(f"✅ New PDF generated and sent to {chat_id}")
+                                else:
+                                    self._send_message(base_url, chat_id, "❌ Failed to send PDF.")
+                            except Exception as ex:
+                                self._send_message(base_url, chat_id, f"❌ Error generating combined PDF.")
+                                self.log_message(f"❌ Bot error: {ex}")
+                        else:
+                            self.log_message(f"❌ No record found for patient ID: {query_id}, name: {query_name}")
+                            self._send_message(base_url, chat_id, "❌ Report Not Available")
+        except Exception as e:
+            self.log_message(f"Bot polling error: {e}")
+        time.sleep(1)
+
+    
     def _send_message(self, base_url, chat_id, text, parse_mode="Markdown"):
         try:
             requests.post(f"{base_url}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": parse_mode}, timeout=10)

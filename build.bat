@@ -9,7 +9,7 @@ rmdir /s /q build dist
 del /q RAD-XR.spec 2>nul
 echo Done.
 echo.
-echo [2/4] Syncing core dependencies (including openpyxl for Excel export)...
+echo [2/4] Syncing core dependencies (including openpyxl)...
 pip install -r requirements.txt --force-reinstall
 if %errorlevel% neq 0 (
     echo ERROR: Dependency mapping process collapsed.
@@ -48,10 +48,14 @@ pyinstaller --noconsole --onefile --name="RAD-XR" --icon=icon.png --add-data "ic
     --hidden-import=watchdog.events ^
     --hidden-import=watchdog.observers ^
     --hidden-import=reportlab ^
+    --hidden-import=reportlab.pdfgen ^
     --hidden-import=openpyxl ^
     --hidden-import=openpyxl.cell ^
     --hidden-import=openpyxl.reader.excel ^
     --hidden-import=openpyxl.workbook ^
+    --hidden-import=openpyxl.writer.excel ^
+    --hidden-import=openpyxl.styles ^
+    --hidden-import=openpyxl.utils ^
     app.py
 if %errorlevel% neq 0 (
     echo.

@@ -74,7 +74,8 @@ DEFAULT_MASTER_USER_ID = "878604830"
 DEFAULT_TELEGRAM_BOT_TOKEN = "7941135502:AAHz-KGvAAoZEhPVgfVKw3zFbkaB0_Pi5rM"
 DEFAULT_WHATSAPP_API_KEY = ""
 CONFIG_PASSWORD = "18040709"
-DEFAULT_BATCH_WAIT_SECONDS = 6
+# Increased default batch wait to 15 seconds for better grouping
+DEFAULT_BATCH_WAIT_SECONDS = 15
 # ------------------------------------------------------------
 
 # --- Portable Config Directory ---
@@ -1207,6 +1208,8 @@ class RadXrReceiverApp:
                 accession_no = group_items[0]['accession']
                 study_date = group_items[0]['study_date']
 
+                self.log_message(f"🔄 Resend group: {len(file_paths)} image(s) for {patient_name} ({patient_id})")
+
                 # Determine which platforms are enabled
                 tg_enabled = bool(self.TELEGRAM_BOT_TOKEN)
                 wa_enabled = bool(self.config.get("whatsapp_api_key") and self.config.get("whatsapp_phone_number_id"))
@@ -2147,7 +2150,7 @@ class RadXrReceiverApp:
                 if 'file_key' in locals():
                     self.root.after(0, lambda: self.upsert_grid_record(file_key, "N/A", "N/A", "UNKNOWN", f"Error: {str(e)[:30]}"))
 
-    # ---------- Patient Batching ----------
+    # ---------- Patient Batching (with improved logging and wait time) ----------
     def queue_file_for_patient_batch(self, dcm_path, is_manual_import=False):
         try:
             ds = pydicom.dcmread(dcm_path, stop_before_pixels=True)
@@ -2183,6 +2186,7 @@ class RadXrReceiverApp:
                     entry["accession_no"] = accession_no
                 if entry.get("timer"):
                     entry["timer"].cancel()
+                self.log_message(f"➕ Added image to existing batch for {patient_name} ({patient_id}) – now {len(entry['items'])} images")
             else:
                 entry = {
                     "patient_id": patient_id,
@@ -2191,11 +2195,13 @@ class RadXrReceiverApp:
                     "items": [(dcm_path, is_manual_import)],
                 }
                 self.pending_batches[batch_key] = entry
+                self.log_message(f"🆕 New batch started for {patient_name} ({patient_id})")
 
             timer = threading.Timer(wait_seconds, self._flush_patient_batch, args=(batch_key,))
             timer.daemon = True
             entry["timer"] = timer
             timer.start()
+            self.log_message(f"⏱️ Batch timer set for {wait_seconds}s for {patient_name} ({patient_id})")
 
         self.log_message(
             f"🗂️ Queued image for {patient_name} (ID: {patient_id}) — "
@@ -2207,6 +2213,7 @@ class RadXrReceiverApp:
             entry = self.pending_batches.pop(batch_key, None)
         if not entry:
             return
+        self.log_message(f"⏰ Batch timer expired for {entry['patient_name']} ({entry['patient_id']}) – processing {len(entry['items'])} images")
         threading.Thread(
             target=self.process_patient_batch,
             args=(entry["items"], entry["patient_id"], entry["patient_name"], entry["accession_no"]),
@@ -2217,12 +2224,8 @@ class RadXrReceiverApp:
         with self.processing_lock:
             pdf_output_path = ""
             dcm_paths = [dcm for dcm, _ in items]
+            self.log_message(f"🧩 Processing batch: {len(dcm_paths)} image(s) for {patient_name} ({patient_id})")
             try:
-                self.log_message(
-                    f"🧩 Combining {len(dcm_paths)} image(s) for {patient_name} "
-                    f"(ID: {patient_id}) into one PDF..."
-                )
-
                 study_date = ""
                 try:
                     first_ds = pydicom.dcmread(dcm_paths[0], stop_before_pixels=True)

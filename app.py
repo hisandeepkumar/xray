@@ -2415,9 +2415,9 @@ class RadXrReceiverApp:
         url = f"https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}/sendDocument"
         caption_text = self.build_beautiful_caption_string(p_id, p_name, acc_no, include_footer=True)
 
-        max_attempts = 5
+        max_attempts = 10
         base_delay = 1
-        timeout = 180
+        timeout = 400
 
         for attempt in range(1, max_attempts + 1):
             try:

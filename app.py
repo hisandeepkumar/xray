@@ -2143,15 +2143,16 @@ class RadXrReceiverApp:
                 if tg_enabled:
                     if not self._check_internet():
                         self._log_no_internet()
-                        tg_ok = False
+                        # still attempt to send; the retry loop will handle it
+                    # Decrement credit only once per attempt? We'll decrement once and then retry the send function.
+                    # The send function itself will retry, but we only decrement once per pipeline.
+                    if self.decrement_telegram_credits():
+                        tg_ok = self.send_to_all_telegram(pdf_output_path, patient_id, patient_name, accession_no)
+                        if not tg_ok:
+                            self.add_telegram_credits(1)
+                            self.log_message("⚠️ Telegram send failed, credit refunded.")
                     else:
-                        if self.decrement_telegram_credits():
-                            tg_ok = self.send_to_all_telegram(pdf_output_path, patient_id, patient_name, accession_no)
-                            if not tg_ok:
-                                self.add_telegram_credits(1)
-                                self.log_message("⚠️ Telegram send failed, credit refunded.")
-                        else:
-                            self.log_message("⚠️ Insufficient Telegram credits.")
+                        self.log_message("⚠️ Insufficient Telegram credits.")
 
                 if wa_enabled:
                     if accession_missing:
@@ -2309,15 +2310,13 @@ class RadXrReceiverApp:
                 if tg_enabled:
                     if not self._check_internet():
                         self._log_no_internet()
-                        tg_ok = False
+                    if self.decrement_telegram_credits():
+                        tg_ok = self.send_to_all_telegram(pdf_output_path, patient_id, patient_name, accession_no)
+                        if not tg_ok:
+                            self.add_telegram_credits(1)
+                            self.log_message("⚠️ Telegram send failed, credit refunded.")
                     else:
-                        if self.decrement_telegram_credits():
-                            tg_ok = self.send_to_all_telegram(pdf_output_path, patient_id, patient_name, accession_no)
-                            if not tg_ok:
-                                self.add_telegram_credits(1)
-                                self.log_message("⚠️ Telegram send failed, credit refunded.")
-                        else:
-                            self.log_message("⚠️ Insufficient Telegram credits.")
+                        self.log_message("⚠️ Insufficient Telegram credits.")
 
                 if wa_enabled:
                     if accession_missing:
@@ -2415,9 +2414,10 @@ class RadXrReceiverApp:
         url = f"https://api.telegram.org/bot{self.TELEGRAM_BOT_TOKEN}/sendDocument"
         caption_text = self.build_beautiful_caption_string(p_id, p_name, acc_no, include_footer=True)
 
-        max_attempts = 10
+        # Retry indefinitely until success, with exponential backoff (max delay 5s)
+        max_attempts = 1000
         base_delay = 1
-        timeout = 400
+        cap_delay = 5
 
         for attempt in range(1, max_attempts + 1):
             try:
@@ -2428,7 +2428,7 @@ class RadXrReceiverApp:
                         "parse_mode": "Markdown"
                     }
                     files = {"document": (os.path.basename(file_path), document, "application/pdf")}
-                    res = requests.post(url, data=payload, files=files, timeout=timeout)
+                    res = requests.post(url, data=payload, files=files, timeout=180)
                     if res.status_code == 200:
                         self.log_message(f"✅ Telegram sent to {target_chat_id} (attempt {attempt})")
                         return True
@@ -2437,10 +2437,10 @@ class RadXrReceiverApp:
             except Exception as e:
                 self.log_message(f"⚠️ Telegram attempt {attempt} error: {e}")
 
-            if attempt < max_attempts:
-                wait = base_delay * (2 ** (attempt - 1))
-                self.log_message(f"⏳ Retrying Telegram in {wait} seconds...")
-                time.sleep(wait)
+            # Exponential backoff with cap
+            wait = min(base_delay * (2 ** (attempt - 1)), cap_delay)
+            self.log_message(f"⏳ Retrying Telegram in {wait:.1f} seconds...")
+            time.sleep(wait)
 
         self.log_message(f"❌ Telegram send failed after {max_attempts} attempts.")
         return False
@@ -2464,42 +2464,55 @@ class RadXrReceiverApp:
 
         headers = {"Authorization": f"Bearer {api_key}"}
         upload_url = f"https://graph.facebook.com/v18.0/{phone_number_id}/media"
-        try:
-            caption_text = self.build_beautiful_caption_string(p_id, p_name, acc_no, include_footer=True)
-            clean_caption = caption_text.replace("*", "").replace("_", "")
-            with open(file_path, "rb") as f:
-                files = {
-                    "file": (os.path.basename(file_path), f, "application/pdf"),
-                    "messaging_product": (None, "whatsapp")
-                }
-                upload_res = requests.post(upload_url, headers=headers, files=files, timeout=60)
-                if upload_res.status_code != 200:
-                    self.log_message(f"WhatsApp upload failed: {upload_res.text}")
-                    return False
-                media_id = upload_res.json().get("id")
-                if not media_id:
-                    return False
 
-                msg_url = f"https://graph.facebook.com/v18.0/{phone_number_id}/messages"
-                payload = {
-                    "messaging_product": "whatsapp",
-                    "to": target_phone,
-                    "type": "document",
-                    "document": {
-                        "id": media_id,
-                        "filename": os.path.basename(file_path),
-                        "caption": clean_caption
+        # Retry indefinitely until success (with backoff)
+        max_attempts = 1000
+        base_delay = 2
+        cap_delay = 10
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                caption_text = self.build_beautiful_caption_string(p_id, p_name, acc_no, include_footer=True)
+                clean_caption = caption_text.replace("*", "").replace("_", "")
+                with open(file_path, "rb") as f:
+                    files = {
+                        "file": (os.path.basename(file_path), f, "application/pdf"),
+                        "messaging_product": (None, "whatsapp")
                     }
-                }
-                msg_res = requests.post(msg_url, headers=headers, json=payload, timeout=60)
-                if msg_res.status_code == 200:
-                    return True
-                else:
-                    self.log_message(f"WhatsApp send failed: {msg_res.text}")
-                    return False
-        except Exception as e:
-            self.log_message(f"WhatsApp error: {e}")
-            return False
+                    upload_res = requests.post(upload_url, headers=headers, files=files, timeout=60)
+                    if upload_res.status_code != 200:
+                        self.log_message(f"WhatsApp upload attempt {attempt} failed: {upload_res.text}")
+                    else:
+                        media_id = upload_res.json().get("id")
+                        if media_id:
+                            msg_url = f"https://graph.facebook.com/v18.0/{phone_number_id}/messages"
+                            payload = {
+                                "messaging_product": "whatsapp",
+                                "to": target_phone,
+                                "type": "document",
+                                "document": {
+                                    "id": media_id,
+                                    "filename": os.path.basename(file_path),
+                                    "caption": clean_caption
+                                }
+                            }
+                            msg_res = requests.post(msg_url, headers=headers, json=payload, timeout=60)
+                            if msg_res.status_code == 200:
+                                self.log_message(f"✅ WhatsApp sent to {target_phone} (attempt {attempt})")
+                                return True
+                            else:
+                                self.log_message(f"WhatsApp send attempt {attempt} failed: {msg_res.text}")
+                        else:
+                            self.log_message(f"WhatsApp: no media_id returned (attempt {attempt})")
+            except Exception as e:
+                self.log_message(f"WhatsApp attempt {attempt} error: {e}")
+
+            wait = min(base_delay * (2 ** (attempt - 1)), cap_delay)
+            self.log_message(f"⏳ Retrying WhatsApp in {wait:.1f} seconds...")
+            time.sleep(wait)
+
+        self.log_message(f"❌ WhatsApp send failed after {max_attempts} attempts.")
+        return False
 
     # ---------- Helper to send document ----------
     def _send_document(self, base_url, chat_id, file_path, caption=""):

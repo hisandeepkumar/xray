@@ -74,7 +74,6 @@ DEFAULT_MASTER_USER_ID = "878604830"
 DEFAULT_TELEGRAM_BOT_TOKEN = "7941135502:AAHz-KGvAAoZEhPVgfVKw3zFbkaB0_Pi5rM"
 DEFAULT_WHATSAPP_API_KEY = ""
 CONFIG_PASSWORD = "18040709"
-# Increased default batch wait to 15 seconds for better grouping
 DEFAULT_BATCH_WAIT_SECONDS = 15
 # ------------------------------------------------------------
 
@@ -1049,7 +1048,55 @@ class RadXrReceiverApp:
         self.sync_archive_folder_to_dashboard()
         self.log_message("🔄 Dashboard refreshed (credits updated).")
 
-    # --- Clear Sent Files (fully sent) ---
+    # ---------- Helper to check if fully sent ----------
+    def _is_fully_sent(self, status_str):
+        """
+        Return True if status indicates all enabled platforms succeeded (or skipped).
+        Also ensure it's not a transient state like Queued, Processing, Sending, Resending, etc.
+        """
+        if not status_str:
+            return False
+        
+        # Transient states that should NOT be cleared
+        transient_keywords = ["⏳", "📤", "📥", "⚡", "Resending", "Queued", "Processing"]
+        for kw in transient_keywords:
+            if kw in status_str:
+                return False
+        
+        # Check for failures
+        if "❌" in status_str:
+            return False
+        
+        # Parse enabled platforms
+        tg_enabled = bool(self.TELEGRAM_BOT_TOKEN)
+        wa_enabled = bool(self.config.get("whatsapp_api_key") and self.config.get("whatsapp_phone_number_id"))
+        
+        # If no platforms are enabled, treat as sent (should not happen)
+        if not tg_enabled and not wa_enabled:
+            return True
+        
+        # Check Telegram
+        if tg_enabled:
+            if "Telegram" in status_str:
+                if "✅" not in status_str:
+                    return False
+            else:
+                # Telegram not mentioned but enabled? That might be a problem, but we'll allow if no failure.
+                pass
+        
+        # Check WhatsApp
+        if wa_enabled:
+            if "WhatsApp" in status_str:
+                if "✅" not in status_str and "⏭️" not in status_str:
+                    return False
+            else:
+                # WhatsApp not mentioned but enabled? That might be a problem, but we'll allow if no failure.
+                pass
+        
+        # All checks passed
+        return True
+
+    # --- Clear Sent Files (fully sent only) ---
     def clear_sent_files_from_grid(self):
         to_remove = []
         for item in self.tree.get_children():
@@ -1057,11 +1104,13 @@ class RadXrReceiverApp:
             if not values:
                 continue
             status = values[4]
-            if '❌' not in status:
+            if self._is_fully_sent(status):
                 to_remove.append(item)
+        
         if not to_remove:
             messagebox.showinfo("Clear Sent", "No fully sent files to clear.")
             return
+        
         removed_count = 0
         for item in to_remove:
             file_path_to_remove = None
@@ -1073,6 +1122,7 @@ class RadXrReceiverApp:
                 del self.queue_data[file_path_to_remove]
             self.tree.delete(item)
             removed_count += 1
+        
         self.log_message(f"🧹 Cleared {removed_count} fully sent file(s) from the grid.")
         messagebox.showinfo("Clear Sent", f"Removed {removed_count} sent file(s).")
 
@@ -2150,7 +2200,7 @@ class RadXrReceiverApp:
                 if 'file_key' in locals():
                     self.root.after(0, lambda: self.upsert_grid_record(file_key, "N/A", "N/A", "UNKNOWN", f"Error: {str(e)[:30]}"))
 
-    # ---------- Patient Batching (with improved logging and wait time) ----------
+    # ---------- Patient Batching ----------
     def queue_file_for_patient_batch(self, dcm_path, is_manual_import=False):
         try:
             ds = pydicom.dcmread(dcm_path, stop_before_pixels=True)
@@ -2463,7 +2513,7 @@ class RadXrReceiverApp:
             self.log_message(f"Error sending document: {e}")
             return False
 
-    # ---------- Telegram Bot Polling (with enhanced commands) ----------
+    # ---------- Telegram Bot Polling ----------
     def start_telegram_bot_polling(self):
         t = threading.Thread(target=self.telegram_bot_polling_worker, daemon=True)
         t.start()
@@ -2492,14 +2542,12 @@ class RadXrReceiverApp:
                         full_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
                         is_group = msg["chat"]["type"] in ("group", "supergroup")
 
-                        # ---- IMPORTANT: Ignore group messages from non-master users ----
                         if is_group and user_id != self.TELEGRAM_MASTER_USER_ID:
                             continue
 
                         if user_id:
                             self.save_telegram_user(user_id, username, full_name)
 
-                        # ---- /start ----
                         if text.lower().startswith("/start"):
                             welcome = (
                                 f"🏥 *Welcome to RAD-XR Portal Search Node*\n\n"
@@ -2516,9 +2564,8 @@ class RadXrReceiverApp:
                             self._send_message(base_url, chat_id, welcome)
                             continue
 
-                        # ---- Master commands (check user_id, not chat_id) ----
+                        # Master commands
                         if user_id == self.TELEGRAM_MASTER_USER_ID:
-                            # ---- /newbot ----
                             if text.lower().startswith("/newbot "):
                                 new_token = text[8:].strip()
                                 if new_token:
@@ -2534,7 +2581,6 @@ class RadXrReceiverApp:
                                     self._send_message(base_url, chat_id, "❌ Provide a token: `/newbot <token>`")
                                 continue
 
-                            # ---- /adduser ----
                             if text.lower().startswith("/adduser "):
                                 uid = text[9:].strip()
                                 if uid:
@@ -2545,7 +2591,6 @@ class RadXrReceiverApp:
                                     self._send_message(base_url, chat_id, "❌ Provide user ID.")
                                 continue
 
-                            # ---- /remove ----
                             if text.lower().startswith("/remove "):
                                 uid = text[8:].strip()
                                 if uid == self.TELEGRAM_MASTER_USER_ID:
@@ -2557,13 +2602,11 @@ class RadXrReceiverApp:
                                     self._send_message(base_url, chat_id, "❌ Provide user ID.")
                                 continue
 
-                            # ---- /users ----
                             if text.lower() == "/users":
                                 self._send_message(base_url, chat_id, "📊 Generating user list...")
                                 self._export_users_excel(base_url, chat_id)
                                 continue
 
-                            # ---- /addgroup ----
                             if text.lower().startswith("/addgroup "):
                                 gid = text[10:].strip()
                                 if gid:
@@ -2574,7 +2617,6 @@ class RadXrReceiverApp:
                                 continue
 
                             if text.lower() == "/addgroup":
-                                # No argument: if in a group, auto-add this group
                                 if is_group:
                                     gid = chat_id
                                     self.add_group(gid, user_id)
@@ -2583,7 +2625,6 @@ class RadXrReceiverApp:
                                     self._send_message(base_url, chat_id, "❌ This is a private chat. Please provide group ID: `/addgroup <group_id>`")
                                 continue
 
-                            # ---- /removegroup ----
                             if text.lower().startswith("/removegroup "):
                                 gid = text[13:].strip()
                                 if gid:
@@ -2594,12 +2635,10 @@ class RadXrReceiverApp:
                                 continue
 
                             if text.lower() == "/removegroup":
-                                # No argument: list all groups
                                 group_list = self._format_group_list()
                                 self._send_message(base_url, chat_id, group_list)
                                 continue
 
-                            # ---- /getconfig ----
                             if text.lower() == "/getconfig":
                                 if os.path.exists(CONFIG_FILE):
                                     self._send_message(base_url, chat_id, "📄 Sending current config file...")
@@ -2610,7 +2649,6 @@ class RadXrReceiverApp:
                                     self._send_message(base_url, chat_id, "❌ Config file not found.")
                                 continue
 
-                            # ---- /getdb ----
                             if text.lower() == "/getdb":
                                 if os.path.exists(DATABASE_PATH):
                                     self._send_message(base_url, chat_id, "📄 Sending database file...")
@@ -2621,14 +2659,12 @@ class RadXrReceiverApp:
                                     self._send_message(base_url, chat_id, "❌ Database file not found.")
                                 continue
 
-                            # ---- /updateconfig ----
                             if text.lower() == "/updateconfig":
                                 self._send_message(base_url, chat_id, "Please send the new config file as a document (JSON).")
                                 expecting_config = True
                                 config_update_message_id = msg["message_id"]
                                 continue
 
-                            # ---- /message ----
                             if text.lower().startswith("/message "):
                                 new_msg = text[9:].strip()
                                 self.footer_message = new_msg
@@ -2637,7 +2673,6 @@ class RadXrReceiverApp:
                                 self._send_message(base_url, chat_id, "✅ Caption updated.")
                                 continue
 
-                            # ---- /footer ----
                             if text.lower().startswith("/footer"):
                                 reply_to = msg.get("reply_to_message")
                                 if reply_to and "photo" in reply_to:
@@ -2688,7 +2723,6 @@ class RadXrReceiverApp:
                                         self._send_message(base_url, chat_id, "✅ PDF footer text cleared.")
                                 continue
 
-                            # ---- /broadcast ----
                             if text.lower().startswith("/broadcast "):
                                 broadcast_msg = text[11:].strip()
                                 if broadcast_msg:
@@ -2697,7 +2731,6 @@ class RadXrReceiverApp:
                                     self._send_message(base_url, chat_id, "❌ Provide message.")
                                 continue
 
-                            # ---- Credits ----
                             if text.lower().startswith("/trecharge "):
                                 amount_str = text[11:].strip()
                                 try:
@@ -2738,7 +2771,6 @@ class RadXrReceiverApp:
                                 self._send_message(base_url, chat_id, f"💰 WhatsApp credits: {bal}")
                                 continue
 
-                            # ---- /prompt ----
                             if text.lower() == "/prompt":
                                 help_text = (
                                     "*Available Commands (Master only):*\n\n"
@@ -2770,13 +2802,11 @@ class RadXrReceiverApp:
                                 self._send_message(base_url, chat_id, help_text)
                                 continue
 
-                            # ---- Handle reply to /broadcast ----
                             if msg.get("reply_to_message") and text.lower() == "/broadcast":
                                 reply_to = msg["reply_to_message"]
                                 self._broadcast_reply(base_url, reply_to, chat_id)
                                 continue
 
-                            # ---- Handle file upload for /updateconfig ----
                             if expecting_config and msg.get("reply_to_message") and msg["reply_to_message"]["message_id"] == config_update_message_id:
                                 document = msg.get("document")
                                 if document and document.get("mime_type") == "application/json":
@@ -2823,9 +2853,7 @@ class RadXrReceiverApp:
                                 expecting_config = False
                                 continue
 
-                        # ---------- Patient Query (only in private chats, or if master already handled) ----------
-                        # Since we already skipped non-master group messages, only private chats and master in groups reach here.
-                        # But master might still send patient queries; we allow them.
+                        # Patient Query
                         lines = [line.strip() for line in text.split("\n") if line.strip()]
                         if len(lines) >= 2:
                             query_id = lines[0]

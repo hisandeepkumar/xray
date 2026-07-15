@@ -2489,6 +2489,10 @@ class RadXrReceiverApp:
                         full_name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip()
                         is_group = msg["chat"]["type"] in ("group", "supergroup")
 
+                        # ---- IMPORTANT: Ignore group messages from non-master users ----
+                        if is_group and user_id != self.TELEGRAM_MASTER_USER_ID:
+                            continue
+
                         if user_id:
                             self.save_telegram_user(user_id, username, full_name)
 
@@ -2816,7 +2820,9 @@ class RadXrReceiverApp:
                                 expecting_config = False
                                 continue
 
-                        # ---------- Patient Query (any user, including groups) ----------
+                        # ---------- Patient Query (only in private chats, or if master already handled) ----------
+                        # Since we already skipped non-master group messages, only private chats and master in groups reach here.
+                        # But master might still send patient queries; we allow them.
                         lines = [line.strip() for line in text.split("\n") if line.strip()]
                         if len(lines) >= 2:
                             query_id = lines[0]
